@@ -1,0 +1,35 @@
+{
+  "name": "orm",
+  "version": "1.0.0",
+  "description": "",
+  "main": "package.js",
+  "dependencies": {
+    "is-string": "^1.0.4",
+    "lodash": "^4.17.10"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.0.0-beta.51",
+    "@babel/preset-env": "^7.0.0-beta.51",
+    "@babel/preset-stage-3": "^7.0.0-beta.51",
+    "babel-core": "^7.0.0-0",
+    "babel-jest": "^23.0.1",
+    "jest": "^21.3.0-beta.15",
+    "regenerator-runtime": "^0.11.1"
+  },
+  "scripts": {
+    "test": "yarn jest"
+  },
+  "author": "",
+  "license": "ISC",
+  "babel": {
+    "presets": [
+      "@babel/preset-env",
+      [
+        "@babel/preset-stage-3"
+      ]
+    ]
+  },
+  "jest": {
+    "collectCoverageFrom": ["src/**/*.js"]
+  }
+}
