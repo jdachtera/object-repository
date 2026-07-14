@@ -143,12 +143,19 @@ describe("MongoBackend against a real mongod", () => {
       ]
     });
 
-    // poll until the fire-and-forget createIndex calls land
+    // poll until the fire-and-forget createIndex calls land. Until the first index is created the
+    // collection has no namespace, and mongod 8.x throws "ns does not exist" from listIndexes
+    // (older releases returned []); treat that as "not ready yet" and keep polling.
     const collection = db.collection("doc_a");
+    const wanted = ["ab", "ttl", "search", "partial"];
     let names: string[] = [];
-    for (let i = 0; i < 40 && !["ab", "ttl", "search", "partial"].every((n) => names.includes(n)); i++) {
-      names = (await collection.listIndexes().toArray()).map((ix) => ix.name as string);
-      if (!["ab", "ttl", "search", "partial"].every((n) => names.includes(n))) await new Promise((r) => setTimeout(r, 50));
+    for (let i = 0; i < 40 && !wanted.every((n) => names.includes(n)); i++) {
+      names = await collection
+        .listIndexes()
+        .toArray()
+        .then((ix) => ix.map((x) => x.name as string))
+        .catch(() => []);
+      if (!wanted.every((n) => names.includes(n))) await new Promise((r) => setTimeout(r, 50));
     }
     expect(names).toEqual(expect.arrayContaining(["ab", "ttl", "search", "partial"]));
 

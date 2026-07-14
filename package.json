@@ -1,6 +1,6 @@
 {
   "name": "object-repository",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "description": "Composable, isomorphic ORM with pluggable storage backends, query compilation and offline sync.",
   "type": "module",
   "license": "MIT",
