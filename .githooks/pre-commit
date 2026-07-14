@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+#
+# Coverage gate: block a commit if the test suite fails or coverage falls below the thresholds in
+# vitest.config.ts. Bypass with `git commit --no-verify` when you genuinely need to.
+#
+# The live-DB integration tests (Mongo, Postgres, MySQL) are excluded here: they only run when a
+# server is reachable (otherwise they skip and contribute no coverage), and shouldn't gate a commit.
+set -e
+
+if [ ! -d node_modules ]; then
+  echo "pre-commit: node_modules missing — run 'pnpm install' first (coverage gate skipped)." >&2
+  exit 0
+fi
+
+echo "pre-commit: type-checking…"
+# vitest transpiles with esbuild (which does NOT type-check), so without this a type error can
+# reach a commit even with every test green — it has, twice.
+pnpm exec tsc --noEmit
+
+echo "pre-commit: checking tests + coverage thresholds…"
+pnpm exec vitest run --coverage --coverage.reporter=text --exclude '**/mongoIntegration.test.ts' --exclude '**/sqlIntegration.test.ts'

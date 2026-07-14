@@ -1,0 +1,132 @@
+{
+  "name": "object-repository",
+  "version": "0.1.0",
+  "description": "Composable, isomorphic ORM with pluggable storage backends, query compilation and offline sync.",
+  "type": "module",
+  "license": "MIT",
+  "author": "jdachtera",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jdachtera/object-repository.git"
+  },
+  "homepage": "https://github.com/jdachtera/object-repository#readme",
+  "bugs": {
+    "url": "https://github.com/jdachtera/object-repository/issues"
+  },
+  "keywords": [
+    "orm",
+    "isomorphic",
+    "offline-first",
+    "sync",
+    "reactive",
+    "indexeddb",
+    "sqlite",
+    "query-builder",
+    "typescript"
+  ],
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./indexeddb": {
+      "types": "./dist/backends/indexeddb/index.d.ts",
+      "import": "./dist/backends/indexeddb/index.js"
+    },
+    "./sqlite": {
+      "types": "./dist/backends/sqlite/index.d.ts",
+      "import": "./dist/backends/sqlite/index.js"
+    },
+    "./sql": {
+      "types": "./dist/backends/sql/index.d.ts",
+      "import": "./dist/backends/sql/index.js"
+    },
+    "./postgres": {
+      "types": "./dist/backends/sql/PostgresBackend.d.ts",
+      "import": "./dist/backends/sql/PostgresBackend.js"
+    },
+    "./mysql": {
+      "types": "./dist/backends/sql/MySqlBackend.d.ts",
+      "import": "./dist/backends/sql/MySqlBackend.js"
+    },
+    "./mongo": {
+      "types": "./dist/backends/mongo/index.d.ts",
+      "import": "./dist/backends/mongo/index.js"
+    },
+    "./decorators": {
+      "types": "./dist/backends/decorators/index.d.ts",
+      "import": "./dist/backends/decorators/index.js"
+    },
+    "./sync": {
+      "types": "./dist/sync/index.d.ts",
+      "import": "./dist/sync/index.js"
+    },
+    "./transport": {
+      "types": "./dist/transport/index.d.ts",
+      "import": "./dist/transport/index.js"
+    },
+    "./compat/mongo": {
+      "types": "./dist/compat/mongo.d.ts",
+      "import": "./dist/compat/mongo.js"
+    },
+    "./embedded": {
+      "types": "./dist/embedded.d.ts",
+      "import": "./dist/embedded.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "prepare": "git config core.hooksPath .githooks || true",
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "docs:api": "typedoc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "demo": "pnpm run build && node examples/multi-backend.ts",
+    "demo:chat": "pnpm run build && node examples/realtime-chat.ts",
+    "demo:stats": "pnpm run build && node examples/stats-aggregation.ts",
+    "demo:web": "pnpm run build && node examples/web/server.mjs",
+    "demo:web:verify": "pnpm run build && node examples/web/verify.mjs"
+  },
+  "peerDependencies": {
+    "zod": "^3.24.0"
+  },
+  "peerDependenciesMeta": {
+    "zod": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.20.0",
+    "@types/ws": "^8.18.1",
+    "@vitest/coverage-v8": "2.1.9",
+    "fake-indexeddb": "^6.2.5",
+    "mongodb": "^7.4.0",
+    "mongodb-memory-server": "^11.2.0",
+    "mysql2": "^3.22.5",
+    "pg": "^8.22.0",
+    "pg-mem": "^3.0.14",
+    "playwright-core": "^1.49.1",
+    "tsup": "^8.3.0",
+    "typedoc": "^0.28.19",
+    "typedoc-plugin-markdown": "^4.12.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0",
+    "ws": "^8.21.0",
+    "zod": "^3.24.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

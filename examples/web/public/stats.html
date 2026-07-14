@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ORM · Live Stats</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="stats">
+    <header>
+      <div class="brand">
+        <a class="home" href="/" title="All demos">◆</a>
+        <div>
+          <h1>Live Stats <span class="tag">aggregate push-down</span></h1>
+          <p class="sub" id="datasetSub">querying a server-side SQLite table through a RemoteBackend</p>
+        </div>
+      </div>
+    </header>
+
+    <section class="bar">
+      <label>Group by
+        <select id="dim">
+          <option value="country">country</option>
+          <option value="year">release year</option>
+        </select>
+      </label>
+      <label>min amount
+        <input type="range" id="minAmount" min="0" max="900" step="50" value="0" />
+        <span class="pill" id="minLabel">$0</span>
+      </label>
+      <div class="spacer"></div>
+      <button id="naiveBtn" class="ghost">Compare vs fetch-all ↓</button>
+    </section>
+
+    <main>
+      <div class="col">
+        <h2 id="chartTitle">Revenue by country</h2>
+        <div id="chart" class="chart"></div>
+      </div>
+
+      <div class="col">
+        <h2>What crossed the network</h2>
+        <div class="meter">
+          <div class="meter-row">
+            <span class="meter-k">push-down (groupBy)</span>
+            <span class="meter-v" id="pdRows">— rows</span>
+            <span class="meter-v" id="pdBytes">— KB</span>
+            <span class="meter-v" id="pdMs">— ms</span>
+          </div>
+          <div class="meter-row naive">
+            <span class="meter-k">naive (fetch + reduce)</span>
+            <span class="meter-v" id="nvRows">— rows</span>
+            <span class="meter-v" id="nvBytes">— KB</span>
+            <span class="meter-v" id="nvMs">— ms</span>
+          </div>
+          <div class="meter-ratio" id="ratio">Run “Compare vs fetch-all” to see the difference.</div>
+        </div>
+
+        <h2 class="mt">Overall</h2>
+        <div id="totals" class="totals">…</div>
+
+        <p class="note">
+          The <code>groupBy</code> travels as one <code>aggregate</code> request; the server runs the SQL
+          <code>GROUP BY</code> and returns only the bars you see. The naive path drags every matching row
+          to the browser and reduces here — same answer, vastly more bytes.
+        </p>
+      </div>
+    </main>
+
+    <script type="module" src="/stats.js"></script>
+  </body>
+</html>

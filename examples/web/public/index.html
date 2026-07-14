@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ORM · Web Demos</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="hub">
+    <header>
+      <div class="brand">
+        <span class="logo">◆</span>
+        <div>
+          <h1>ORM — Web Demos</h1>
+          <p class="sub">One isomorphic ORM. The browser is just another backend.</p>
+        </div>
+      </div>
+    </header>
+
+    <main class="cards">
+      <a class="card" href="/sync.html">
+        <div class="card-icon">⤓⤒</div>
+        <h2>Offline Sync</h2>
+        <p>Each tab is a device with its own IndexedDB store, reconciling through one server.
+          Edit offline, converge across devices, watch last-write-wins resolve conflicts.</p>
+        <span class="card-tech">IndexedDB · SyncBackend · HLC</span>
+      </a>
+
+      <a class="card" href="/stats.html">
+        <div class="card-icon">▦</div>
+        <h2>Live Stats</h2>
+        <p>The browser queries a server-side SQLite table through a <code>RemoteBackend</code>.
+          <code>groupBy</code> pushes down to SQL — only summary rows cross the wire, metered live.</p>
+        <span class="card-tech">HttpTransport · aggregate push-down</span>
+      </a>
+
+      <a class="card" href="/chat.html">
+        <div class="card-icon">◇◆</div>
+        <h2>Realtime Chat</h2>
+        <p>Browser clients over a <code>WebSocketTransport</code> sharing one server store.
+          Messages fan out live through the server's change feed — open two tabs.</p>
+        <span class="card-tech">WebSocketTransport · change feed</span>
+      </a>
+    </main>
+
+    <footer class="hub-foot">
+      Same model code, same query language — embedded, client/server, and offline-sync are backend swaps.
+    </footer>
+  </body>
+</html>

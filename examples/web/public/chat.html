@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ORM · Realtime Chat</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="chat">
+    <header>
+      <div class="brand">
+        <a class="home" href="/" title="All demos">◆</a>
+        <div>
+          <h1>Realtime Chat <span class="tag">WebSocket change feed</span></h1>
+          <p class="sub">Browser clients over a WebSocketTransport · one shared server store</p>
+        </div>
+      </div>
+      <div class="conn" id="conn"><span class="dot"></span> connecting…</div>
+    </header>
+
+    <main class="chat-main">
+      <div id="messages" class="messages"></div>
+      <form id="sendForm" class="composer">
+        <input id="author" class="author" autocomplete="off" title="your name" />
+        <input id="body" class="body" placeholder="Message #general…" autocomplete="off" required />
+        <button type="submit">Send</button>
+      </form>
+      <p class="note">
+        Open this page in another tab (or send the link to a friend on the same server): every message
+        is saved once on the server and pushed to all connected clients through the change feed — no
+        polling. Same ORM model as everywhere else; only the transport differs.
+      </p>
+    </main>
+
+    <script type="module" src="/chat.js"></script>
+  </body>
+</html>

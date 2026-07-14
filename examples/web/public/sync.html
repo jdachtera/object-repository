@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ORM · Offline-Sync Demo</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <a class="home" href="/" title="All demos">◆</a>
+        <div>
+          <h1>Team Tasks <span class="tag">offline sync</span></h1>
+          <p class="sub">One ORM model · IndexedDB on each device · syncing through one server</p>
+        </div>
+      </div>
+      <div class="device-chip" id="deviceChip">Device A</div>
+    </header>
+
+    <section class="bar">
+      <label class="switch">
+        <input type="checkbox" id="onlineToggle" checked />
+        <span class="slider"></span>
+        <span class="switch-label" id="onlineLabel">Online</span>
+      </label>
+      <button id="syncBtn" class="ghost">Sync now</button>
+      <span class="pill" id="outboxPill">outbox: 0</span>
+      <span class="pill muted" id="lastSync">never synced</span>
+      <div class="spacer"></div>
+      <button id="deviceBBtn" class="ghost">Open Device B ↗</button>
+      <button id="resetBtn" class="ghost danger">Reset all</button>
+    </section>
+
+    <main>
+      <div class="col">
+        <h2>This device <span class="hint" id="localName"></span></h2>
+        <form id="addForm" class="add">
+          <input id="title" placeholder="Add a task…" autocomplete="off" required />
+          <button type="submit">Add</button>
+        </form>
+        <ul id="list" class="list"></ul>
+      </div>
+
+      <div class="col">
+        <h2>☁ Server <span class="hint">shared changelog</span></h2>
+        <ul id="cloud" class="list cloud"></ul>
+
+        <h2 class="mt">Sync log</h2>
+        <div id="log" class="log"></div>
+      </div>
+    </main>
+
+    <section class="scenarios">
+      <h2>Try these</h2>
+      <ol>
+        <li><b>Offline editing.</b> Flip <i>Online → Offline</i>, add and check off tasks. They save instantly to this
+          device's IndexedDB and queue in the <i>outbox</i>. Flip back to <i>Online</i> — they push to the server.</li>
+        <li><b>Two devices.</b> Click <i>Open Device B</i> (a separate IndexedDB store). Add a task on A, watch it
+          appear on B after a sync, and vice-versa — both converge to the server's state.</li>
+        <li><b>Conflict (last-write-wins).</b> Take <i>both</i> devices offline. Rename the same task differently on
+          each. Bring both online: the edit with the later hybrid-logical-clock stamp wins on every replica.</li>
+      </ol>
+    </section>
+
+    <script type="module" src="/sync.js"></script>
+  </body>
+</html>
