@@ -1,0 +1,23 @@
+{
+  "name": "@jdachtera/object-repository",
+  "version": "2.0.0",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./indexeddb": "./src/backends/indexeddb/index.ts",
+    "./sqlite": "./src/backends/sqlite/index.ts",
+    "./sql": "./src/backends/sql/index.ts",
+    "./postgres": "./src/backends/sql/PostgresBackend.ts",
+    "./mysql": "./src/backends/sql/MySqlBackend.ts",
+    "./mongo": "./src/backends/mongo/index.ts",
+    "./decorators": "./src/backends/decorators/index.ts",
+    "./sync": "./src/sync/index.ts",
+    "./transport": "./src/transport/index.ts",
+    "./compat/mongo": "./src/compat/mongo.ts",
+    "./embedded": "./src/embedded.ts"
+  },
+  "publish": {
+    "include": ["src", "README.md", "LICENSE", "jsr.json"],
+    "exclude": ["src/**/*.test.ts", "src/fixtures", "src/**/__tests__"]
+  }
+}
