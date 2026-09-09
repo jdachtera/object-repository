@@ -14,11 +14,10 @@
  * zero-downtime cutover: copy the existing data, dual-write new data, then flip the primary.
  */
 import type { Backend } from "../../core/Backend.ts";
-import type { Context, JsonObject, SortKey } from "../../core/types.ts";
-import type { ExpressionNode, QueryPlan } from "../../core/QueryPlan.ts";
+import type { Context, JsonObject } from "../../core/types.ts";
+import type { ExpressionNode } from "../../core/QueryPlan.ts";
 import { SYSTEM_CONTEXT } from "../../core/types.ts";
-import { all, and, gt } from "../../expressions/builders.ts";
-import { parse } from "../../expressions/parse.ts";
+import { everything, pageByUuid } from "../../migrations/paging.ts";
 
 export interface CopyOptions {
   /** Models to copy. A backend can't list its own models, so name them (order = copy order). */
@@ -42,6 +41,8 @@ export interface CopyProgress {
   copied: number;
   /** Rows written in the batch just flushed. */
   batch: number;
+  /** The last `uuid` read — the keyset position, so a long or interrupted copy can be resumed. */
+  cursor: string;
 }
 
 /** What a copy moved. */
@@ -51,9 +52,6 @@ export interface CopyReport {
   /** Grand total across all models. */
   total: number;
 }
-
-/** Stable, deterministic page order — the same key every store can sort by. */
-const BY_UUID: SortKey[] = [{ property: "uuid", descending: false }];
 
 /**
  * Copy the named models from `source` into `target` in batches. Resolves with the per-model and total
@@ -71,20 +69,11 @@ export async function copyBackend(source: Backend, target: Backend, options: Cop
   let total = 0;
 
   for (const model of options.models) {
-    const baseWhere = options.where?.(model) ?? all().serialize();
+    const baseWhere: ExpressionNode = options.where?.(model) ?? everything();
     let copied = 0;
-    let after: string | null = null;
-    for (;;) {
-      // Seek past the last uuid we read. uuid is compared lexicographically, matching the `BY_UUID`
-      // sort on every backend, so the window never skips or repeats a row even as rows are written.
-      const where: ExpressionNode = after === null ? baseWhere : and(parse(baseWhere), gt("uuid", after)).serialize();
-      const plan: QueryPlan = { model, where, order: BY_UUID, paging: { start: 0, end: batchSize } };
-      const rows = await source.query(plan, ctx);
-      if (rows.length === 0) break;
-      after = String(rows[rows.length - 1]!.uuid);
-
+    for await (const page of pageByUuid(source, model, baseWhere, batchSize, ctx)) {
       let written = 0;
-      for (const row of rows) {
+      for (const row of page.rows) {
         const record = options.transform ? options.transform(row, model) : row;
         if (record === null) continue;
         target.save(model, record, ctx);
@@ -93,10 +82,8 @@ export async function copyBackend(source: Backend, target: Backend, options: Cop
       if (written > 0) {
         await target.persist(ctx);
         copied += written;
-        options.onBatch?.({ model, copied, batch: written });
+        options.onBatch?.({ model, copied, batch: written, cursor: page.cursor });
       }
-
-      if (rows.length < batchSize) break; // a short page means the model is drained
     }
     perModel[model] = copied;
     total += copied;

@@ -1,5 +1,6 @@
 import type { Capabilities, Context, JsonObject, JsonValue, Uuid } from "./types.ts";
 import type { QueryPlan, AggregatePlan, AggregateResultRow, WindowPlan, ExpressionNode, ValueNode } from "./QueryPlan.ts";
+import type { MigrationOp } from "../migrations/types.ts";
 
 /**
  * The spine of the whole library (ARCHITECTURE.md §2).
@@ -122,6 +123,41 @@ export interface SchemaAwareBackend {
 /** Narrow a backend to the schema-aware interface. */
 export function isSchemaAware(backend: object): backend is SchemaAwareBackend {
   return typeof (backend as Partial<SchemaAwareBackend>).registerModel === "function";
+}
+
+/**
+ * Optional capability: realize a migration operation natively instead of through the portable
+ * reference executor (ARCHITECTURE.md §11).
+ *
+ * The same relationship as every other pushdown here: the shared executor in `src/migrations/execute.ts`
+ * defines what an operation *means* using nothing but `query`/`save`/`persist`, and a backend that can
+ * do better implements this. SQL turns a rename into an O(1) `ALTER TABLE ... RENAME COLUMN` rather
+ * than rewriting every row. **A backend changes a migration's cost, never its effect on the record
+ * set** — which is what lets one migration run truthfully on a columnar table, a document collection
+ * and a browser object store alike.
+ *
+ * Declining is first-class and expected: resolve `null` for any operation this backend has no better
+ * answer for (or cannot express at all) and the reference executor runs it instead.
+ */
+export interface MigrationLoweringBackend {
+  /** Realize `op` natively, or resolve `null` to decline and let the reference executor handle it. */
+  lowerMigrationOp(op: MigrationOp, ctx: Context): Promise<{ rows: number } | null>;
+  /** Render the native form for a plan preview. Never executes. */
+  previewMigrationOp?(op: MigrationOp): string[];
+  /**
+   * Apply structural operations inside whatever exclusive window this store requires.
+   *
+   * Deliberately a *batch* rather than a callback the runner drives: IndexedDB's structural changes
+   * are legal only inside `onupgradeneeded`, and that transaction goes inactive on the first non-IDB
+   * await, so per-op dispatch from outside is impossible. Reserved now so the client-side migration
+   * stage is additive rather than a breaking change to a published capability.
+   */
+  applySchemaOps?(ops: MigrationOp[], ctx: Context): Promise<void>;
+}
+
+/** Narrow a backend to the migration-lowering interface. */
+export function isMigrationLowering(backend: object): backend is MigrationLoweringBackend {
+  return typeof (backend as Partial<MigrationLoweringBackend>).lowerMigrationOp === "function";
 }
 
 /**
