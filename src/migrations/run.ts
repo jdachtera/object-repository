@@ -62,7 +62,7 @@ export async function runMigrations(
   const journal = options.journal ?? new BackendJournal(backend, ctx);
   const state = await resolveVersions(journal, options);
 
-  const rows = indexRows(await journal.load());
+  const rows = indexRows(await adoptLegacyHistory(backend, journal, now));
   const report: MigrationReport = {
     applied: [],
     skipped: [],
@@ -204,6 +204,55 @@ export async function rollbackMigrations(
   }
 
   return report;
+}
+
+/**
+ * Adopt an earlier mechanism's history into the journal, once, before anything is planned.
+ *
+ * A database migrated under the original SQL-only tracking table has a populated
+ * `_object_repository_migrations` the portable journal has never seen. Left alone, the first run under
+ * the new mechanism would consider every historical migration pending and re-apply it — against live
+ * data. Each adopted name is recorded as **both** phases applied, because it ran under pre-gate
+ * semantics where `up()` executed in full, and with an empty hash so it is exempt from drift checks
+ * (there is no record of what its ops were).
+ */
+async function adoptLegacyHistory(
+  backend: Backend,
+  journal: MigrationJournal,
+  now: () => number
+): Promise<JournalRow[]> {
+  const existing = await journal.load();
+  if (existing.length > 0) return existing;
+
+  const lowering = backend as Partial<{ legacyMigrationNames(): Promise<string[]> }>;
+  if (typeof lowering.legacyMigrationNames !== "function") return existing;
+
+  let names: string[];
+  try {
+    names = await lowering.legacyMigrationNames();
+  } catch {
+    return existing; // no legacy table, or it isn't readable — a greenfield store, then
+  }
+  if (!names.length) return existing;
+
+  const adopted: JournalRow[] = [];
+  for (const name of names) {
+    for (const phase of ["expand", "contract"] as const) {
+      const entry: JournalRow = {
+        name,
+        phase,
+        status: "applied",
+        version: 0, // predates gating
+        ops: [],
+        opsHash: "", // unknown, so never reported as drift
+        cursor: null,
+        appliedAt: now()
+      };
+      await journal.write(entry);
+      adopted.push(entry);
+    }
+  }
+  return adopted;
 }
 
 /** Run one phase's ops, preferring a backend's native lowering and falling back to the reference. */

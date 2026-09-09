@@ -49,3 +49,4 @@ export {
   type MigrationJournal,
   type SchemaState
 } from "./journal.ts";
+export { planMigrations, formatPlan } from "./plan.ts";

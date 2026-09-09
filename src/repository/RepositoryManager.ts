@@ -1,10 +1,12 @@
 import type { Backend, IndexSpec, IndexField, FieldSpec } from "../core/Backend.ts";
 import { isRawQueryable, isSchemaAware, isTransactional } from "../core/Backend.ts";
-import { isMigratable, type Migration, type MigrationReport } from "../backends/sql/migrate.ts";
+import { runMigrations, rollbackMigrations, type RunnerOptions } from "../migrations/run.ts";
+import { planMigrations } from "../migrations/plan.ts";
+import type { MigrateOptions, Migration, MigrationPlan, MigrationReport } from "../migrations/types.ts";
 import { commandClient, isChangeDeliverable, type CommandClient, type CommandMap } from "../transport/command.ts";
 import type { Transport } from "../core/Transport.ts";
 import type { Expression } from "../expressions/Expression.ts";
-import type { Context } from "../core/types.ts";
+import type { Context, SchemaVersioning } from "../core/types.ts";
 import { SYSTEM_CONTEXT } from "../core/types.ts";
 import type { AnyProperty, PropertyMap } from "../properties/infer.ts";
 import type { ScalarProperty } from "../properties/ScalarProperty.ts";
@@ -37,6 +39,11 @@ export interface RepositoryManagerOptions {
    * — e.g. `() => new ObjectId().toString()` alongside a Mongo `objectIdIdentity`.
    */
   generateId?: () => string;
+  /**
+   * The schema versions this build declares (ARCHITECTURE.md §13). Omitting it means ungated — every
+   * migration operation applies immediately, the behaviour that predates the gate.
+   */
+  schema?: SchemaVersioning;
 }
 
 export interface DefineConfig<P extends PropertyMap> {
@@ -97,12 +104,19 @@ export class RepositoryManager {
   private readonly backend: Backend;
   private readonly ctx: Context;
   private readonly generateId: (() => string) | undefined;
+  private readonly schema: SchemaVersioning | undefined;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly registry = new Map<string, Repository<any>>();
   /** Enough of each model's definition to rebuild it over a tx-scoped backend (interactive transactions). */
   private readonly defs = new Map<
     string,
-    { properties: PropertyMap; timestamps: TimestampFields | null; softDelete: SoftDeleteConfig | null }
+    {
+      properties: PropertyMap;
+      timestamps: TimestampFields | null;
+      softDelete: SoftDeleteConfig | null;
+      /** Retained because a migration's generic pass needs to re-register the model's full layout. */
+      indexes: IndexDecl[] | undefined;
+    }
   >();
   /** Shared with every repository so an immediately-persisting write can refuse to escape a transaction. */
   private readonly txState: TransactionState = { mode: "none" };
@@ -111,6 +125,7 @@ export class RepositoryManager {
     this.backend = options.backend ?? new InMemoryBackend();
     this.ctx = options.context ?? SYSTEM_CONTEXT;
     this.generateId = options.generateId;
+    this.schema = options.schema;
   }
 
   /** Define a model and get back a repository typed by its property map. */
@@ -138,7 +153,12 @@ export class RepositoryManager {
     );
     // Registered by name so relations resolve their target regardless of definition order.
     this.registry.set(config.name, repository);
-    this.defs.set(config.name, { properties: typed, timestamps: config.timestamps ? TIMESTAMP_FIELDS : null, softDelete });
+    this.defs.set(config.name, {
+      properties: typed,
+      timestamps: config.timestamps ? TIMESTAMP_FIELDS : null,
+      softDelete,
+      indexes: config.indexes
+    });
 
     // Let schema-aware backends (IndexedDB, SQL) provision stores/indexes/columns from the metadata.
     if (isSchemaAware(this.backend)) {
@@ -249,30 +269,65 @@ export class RepositoryManager {
   }
 
   /**
-   * Apply a versioned migration set for non-additive schema changes the auto-provisioner can't do —
-   * rename/drop columns, type changes, index DDL, and raw data backfills. Each migration runs once
-   * (tracked in `_object_repository_migrations`) inside a transaction where the engine supports transactional DDL.
-   * Run at deploy/startup, before defining models against the new shape. Throws if the backend has no
-   * migration support (in-memory / IndexedDB).
+   * Apply a versioned migration set — renames, drops, type changes, index changes and data rewrites
+   * the additive auto-provisioner can't do (ARCHITECTURE.md §13).
+   *
+   * Works on **every** backend, not just SQL: operations are portable, and a backend that can realize
+   * one natively does, while the rest fall back to a shared record-rewriting reference. Run at
+   * deploy/startup, before defining models against the new shape.
    *
    *   await orm.migrate([
-   *     { name: "0001_add_status", up: (m) => m.addColumn("User", "status", "text") },
-   *     { name: "0002_backfill",   up: (m) => m.sql(`UPDATE "User" SET "status" = 'active'`) }
+   *     { name: "0001_add_status", up: (m) => m.addField("User", "status", "text", { fill: "active" }) },
+   *     { name: "0012_fullname", schemaVersion: 7, up: (m) => m.renameField("User", "name", "fullName", "text") }
    *   ]);
+   *
+   * **This never destroys anything on its own.** A migration carrying a `schemaVersion` has its
+   * destructive half withheld until `minSupportedSchemaVersion` reaches that number *and* the caller
+   * passes `applyContracts` — until then those operations come back in the report's `deferred` and
+   * `releasable` lists rather than running.
    */
-  async migrate(migrations: Migration[]): Promise<MigrationReport> {
-    if (!isMigratable(this.backend)) {
-      throw new Error("The configured backend does not support migrations.");
-    }
-    return this.backend.migrate(migrations);
+  async migrate(migrations: Migration[], options: MigrateOptions = {}): Promise<MigrationReport> {
+    return runMigrations(this.backend, migrations, this.runnerOptions(options));
   }
 
-  /** Revert the `count` most-recently-applied migrations that declare a `down` (default 1). */
-  async rollback(migrations: Migration[], count = 1): Promise<MigrationReport> {
-    if (!isMigratable(this.backend)) {
-      throw new Error("The configured backend does not support migrations.");
+  /**
+   * Revert the `count` most-recently-applied migrations that declare a `down` (default 1).
+   *
+   * Walks the order migrations were actually applied in, and refuses one whose applied operations
+   * destroyed data a `down` cannot restore — re-creating a dropped column hands back an empty one.
+   */
+  async rollback(migrations: Migration[], count = 1, options: MigrateOptions = {}): Promise<MigrationReport> {
+    return rollbackMigrations(this.backend, migrations, count, this.runnerOptions(options));
+  }
+
+  /**
+   * What `migrate` *would* do: the operations pending, what the gate is withholding, and what
+   * `applyContracts` would destroy right now. Reads the store and writes nothing, so it is safe in
+   * production and belongs in CI as the "what does this deploy touch?" check.
+   */
+  async plan(migrations: Migration[], options: MigrateOptions = {}): Promise<MigrationPlan> {
+    return planMigrations(this.backend, migrations, this.runnerOptions(options));
+  }
+
+  /**
+   * Fill in what the runner needs from this manager: the declared schema versions, and every defined
+   * model's field/index layout — without which a generic rewrite through a schema-aware backend would
+   * refuse (it can't write a columnar table whose columns it hasn't been told about).
+   */
+  private runnerOptions(options: MigrateOptions): RunnerOptions {
+    const models: Record<string, { fields: FieldSpec[]; indexes: IndexSpec[] }> = {};
+    for (const [name, def] of this.defs) {
+      models[name] = { fields: fieldSpecs(def.properties), indexes: indexSpecs(def.properties, def.indexes) };
     }
-    return this.backend.rollback(migrations, count);
+    return {
+      ctx: this.ctx,
+      ...(this.schema ? { schemaVersion: this.schema.schemaVersion } : {}),
+      ...(this.schema?.minSupportedSchemaVersion !== undefined
+        ? { minSupportedSchemaVersion: this.schema.minSupportedSchemaVersion }
+        : {}),
+      ...options,
+      models: { ...models, ...(options.models ?? {}) }
+    };
   }
 
   /**

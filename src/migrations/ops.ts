@@ -74,7 +74,9 @@ export class OpRecorder implements MigrationBuilder {
     this.renameField(model, from, to, "scalar");
   }
   alterColumnType(model: string, name: string, type: string): void {
-    this.ops.push({ kind: "retypeField", model, field: name, from: "scalar", to: asStoredType(type) });
+    // No `from`: this alias never knew the original type, and claiming one would either fabricate a
+    // widening check or fail every legacy migration that used it.
+    this.ops.push({ kind: "retypeField", model, field: name, to: asStoredType(type) });
   }
   createIndex(model: string, name: string, columns: string[], unique = false, columnTypes?: Record<string, string>): void {
     this.ops.push({
@@ -141,7 +143,9 @@ export function classify(op: MigrationOp): Phase {
     case "transform":
       return "expand";
     case "retypeField":
-      return isWidening(op.from, op.to) ? "expand" : "contract";
+      // An unstated `from` (the legacy alias) can't be judged, so it keeps its historical behaviour
+      // of simply applying rather than being withheld as destructive.
+      return op.from === undefined || isWidening(op.from, op.to) ? "expand" : "contract";
     case "addIndex":
       return op.index.unique ? "contract" : "expand";
     case "dropField":
@@ -226,7 +230,7 @@ function desugar(ops: MigrationOp[]): PhasedOps {
 export function assertNoNarrowingRetype(migration: string, ops: MigrationOp[]): void {
   const blockers: MigrationBlocker[] = [];
   for (const op of ops) {
-    if (op.kind !== "retypeField" || isWidening(op.from, op.to)) continue;
+    if (op.kind !== "retypeField" || op.from === undefined || isWidening(op.from, op.to)) continue;
     blockers.push({
       code: "NARROWING_RETYPE",
       migration,

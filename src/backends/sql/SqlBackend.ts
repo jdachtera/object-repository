@@ -28,13 +28,15 @@ import type {
   Unsubscribe
 } from "../../core/Backend.ts";
 import type { Capabilities, Context, JsonObject, JsonValue, Uuid } from "../../core/types.ts";
+import type { MigrationOp } from "../../migrations/types.ts";
+import { changesColumns, lowerToSql } from "./lower.ts";
 import type { AggregatePlan, AggregateResultRow, QueryPlan, WindowPlan } from "../../core/QueryPlan.ts";
 import { generateUuid } from "../../core/uuid.ts";
 import { reduceAggregatePlan } from "../../expressions/aggregateReduce.ts";
 import { scan } from "../util/scan.ts";
 import { compileAggregate, compileWhere, compileWindow } from "./compile.ts";
 import { OVERFLOW_COLUMN, type SqlDialect } from "./dialect.ts";
-import { runMigrations, rollbackMigrations } from "./migrate.ts";
+import { runMigrations, rollbackMigrations, MIGRATIONS_TABLE } from "./migrate.ts";
 import type { MigratableBackend, Migration, MigrationReport } from "./migrate.ts";
 import { UniqueConstraintError, uniqueKey, uniqueKeySets, sameBatchConflict } from "../util/unique.ts";
 
@@ -110,6 +112,8 @@ export class SqlBackend
   private readonly schemas = new Map<string, FieldSpec[]>();
   private readonly indexes = new Map<string, IndexSpec[]>();
   private readonly provisioned = new Map<string, Promise<unknown>>();
+  /** Live column sets, read once per model per migration run and invalidated by any DDL that moves them. */
+  private readonly liveColumnCache = new Map<string, Set<string>>();
   private readonly uniquePreCheck: boolean;
   private saveQueue: PersistedChange[] = [];
   private removeQueue: PersistedChange[] = [];
@@ -133,6 +137,73 @@ export class SqlBackend
     this.schemas.set(model, fields);
     this.indexes.set(model, indexes);
     await this.ensure(model);
+  }
+
+  /**
+   * Realize a migration operation as DDL, or decline so the portable executor rewrites rows instead
+   * (ARCHITECTURE.md §11). Declining is routine, not a failure: a field held in the `_extra` JSON
+   * overflow — a relation, or anything the model never declared as a scalar — has no column to alter,
+   * and emitting DDL against one would simply throw.
+   */
+  async lowerMigrationOp(op: MigrationOp, _ctx: Context): Promise<{ rows: number } | null> {
+    const present = "model" in op ? await this.liveColumns(op.model) : new Set<string>();
+    const statements = lowerToSql(op, this.dialect, present);
+    if (!statements) return null;
+
+    let rows = 0;
+    for (const statement of statements) {
+      const result = await this.exec.run(statement.sql, statement.params);
+      rows += Array.isArray(result) ? result.length : 0;
+    }
+    if ("model" in op && changesColumns(op)) this.refreshModel(op.model);
+    return { rows };
+  }
+
+  /**
+   * Migration names recorded in the original SQL-only tracking table.
+   *
+   * An already-deployed database has a populated `_object_repository_migrations` that the portable
+   * journal knows nothing about. Without adopting those names, the first run under the new mechanism
+   * would consider every historical migration pending and re-apply it against live data.
+   */
+  async legacyMigrationNames(): Promise<string[]> {
+    const probe = this.dialect.columnsQuery(MIGRATIONS_TABLE);
+    const columns = await this.exec.run(probe.sql, probe.params);
+    if (columns.length === 0) return [];
+    const rows = await this.exec.run(
+      `SELECT ${this.dialect.column("name")} AS name FROM ${this.dialect.ref(MIGRATIONS_TABLE)}`,
+      []
+    );
+    return rows.map((row) => String(row.name));
+  }
+
+  /** The rendered SQL for a plan preview. Never executed. */
+  previewMigrationOp(op: MigrationOp): string[] {
+    const present = "model" in op ? (this.liveColumnCache.get(op.model) ?? new Set<string>()) : new Set<string>();
+    return (lowerToSql(op, this.dialect, present) ?? []).map((statement) => statement.sql);
+  }
+
+  /** Read (and cache for this run) the columns a table actually has. */
+  private async liveColumns(model: string): Promise<Set<string>> {
+    const cached = this.liveColumnCache.get(model);
+    if (cached) return cached;
+    const probe = this.dialect.columnsQuery(model);
+    const rows = await this.exec.run(probe.sql, probe.params);
+    const columns = new Set(rows.map((row) => String(row.column_name)));
+    this.liveColumnCache.set(model, columns);
+    return columns;
+  }
+
+  /**
+   * Forget what we knew about a model's shape after DDL changed it.
+   *
+   * Without this the next write would still name a column that has just been dropped, or miss one that
+   * has just been added — the provisioning memo and the cached column set both go stale the instant a
+   * migration runs.
+   */
+  private refreshModel(model: string): void {
+    this.liveColumnCache.delete(model);
+    this.provisioned.delete(model);
   }
 
   async query(plan: QueryPlan, _ctx: Context): Promise<JsonObject[]> {

@@ -153,6 +153,12 @@ export interface MigrationLoweringBackend {
    * stage is additive rather than a breaking change to a published capability.
    */
   applySchemaOps?(ops: MigrationOp[], ctx: Context): Promise<void>;
+  /**
+   * Names recorded by a *previous* migration mechanism this backend used, so an existing deployment
+   * isn't told it has run nothing and asked to re-apply its entire history against a populated store.
+   * Returns an empty list on a greenfield database.
+   */
+  legacyMigrationNames?(): Promise<string[]>;
 }
 
 /** Narrow a backend to the migration-lowering interface. */

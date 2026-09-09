@@ -58,7 +58,10 @@ export type MigrationOp =
   | { kind: "dropField"; model: string; field: string; closes?: { renamedTo: string } }
   | { kind: "copyField"; model: string; from: string; to: string; type: StoredType; overwrite: boolean }
   | { kind: "renameField"; model: string; from: string; to: string; type: StoredType }
-  | { kind: "retypeField"; model: string; field: string; from: StoredType; to: StoredType }
+  // `from` is optional because the legacy `alterColumnType` alias cannot state it — it only ever knew
+  // the target type. Without it the widening check can't run, so such a retype keeps the legacy
+  // behaviour of simply applying; the modern `retypeField` requires `from` and is checked.
+  | { kind: "retypeField"; model: string; field: string; from?: StoredType; to: StoredType }
   | { kind: "transform"; model: string; transform: string; fields: string[]; where?: ExpressionNode }
   // `columnTypes` rides alongside rather than inside `IndexSpec`: it exists only so MySQL can add a
   // key-length prefix to a TEXT-backed column, which no other store has an opinion about.

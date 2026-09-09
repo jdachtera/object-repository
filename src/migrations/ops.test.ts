@@ -40,6 +40,11 @@ describe("classification", () => {
     it(`${label} is ${expected}`, () => expect(classify(op)).toBe(expected));
   }
 
+  it("applies a retype whose original type is unstated, rather than withholding it", () => {
+    // The legacy `alterColumnType` alias can't say what the column was, so there is nothing to judge.
+    expect(classify({ kind: "retypeField", model: "M", field: "a", to: "integer" })).toBe("expand");
+  });
+
   it("treats an unrecognised op as destructive", () => {
     // Withholding something harmless is recoverable; running something destructive is not.
     expect(classify({ kind: "somethingNew" } as unknown as MigrationOp)).toBe("contract");
@@ -103,7 +108,9 @@ describe("the legacy builder aliases", () => {
       { kind: "createModel", model: "User", fields: [{ name: "name", type: "text" }] },
       { kind: "addField", model: "User", field: "age", type: "integer" },
       { kind: "dropField", model: "User", field: "old" },
-      { kind: "retypeField", model: "User", field: "age", from: "scalar", to: "float" },
+      // No `from`: the legacy alias never knew the original type, so the widening check can't run
+      // and it keeps its historical behaviour of simply applying.
+      { kind: "retypeField", model: "User", field: "age", to: "float" },
       { kind: "addIndex", model: "User", index: { name: "by_name", fields: [{ path: "name" }], unique: true } },
       { kind: "dropModel", model: "Stale" }
     ]);
