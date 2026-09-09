@@ -358,8 +358,15 @@ export class MongoBackend
         ? Object.fromEntries(change.dirty.filter((f) => f in change.record).map((f) => [f, change.record[f]]))
         : change.record;
       const removed = change.dirty?.filter((f) => change.record[f] === undefined) ?? [];
-      const update: Record<string, object> = { $set: toStoredFields(fields, change.model, this.identity) };
+      // Mongo rejects an empty `$set` (`FailedToParse: '$set' is empty`) and that failure takes the
+      // whole `bulkWrite` — every unrelated write batched with it — down. A dirty hint naming only
+      // deleted fields produces exactly that shape, so include each operator only when it has work,
+      // and skip the op entirely when neither does.
+      const stored = toStoredFields(fields, change.model, this.identity);
+      const update: Record<string, object> = {};
+      if (Object.keys(stored).length) update.$set = stored;
       if (removed.length) update.$unset = Object.fromEntries(removed.map((f) => [f, ""]));
+      if (!Object.keys(update).length) continue;
       push(change.model, {
         updateOne: { filter: keyFilter(id, this.identity), update, upsert: true }
       });

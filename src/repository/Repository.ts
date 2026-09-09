@@ -6,6 +6,7 @@ import { neededFields, allScalarsSelection, type Selection } from "./projection.
 import { isValueExpr } from "../expressions/values.ts";
 import { eq } from "../expressions/builders.ts";
 import type { Context, JsonObject, JsonValue, SortKey, Uuid } from "../core/types.ts";
+import { RESERVED_RECORD_FIELDS } from "../core/types.ts";
 import type { QueryPlan, AggregatePlan, AggregateResultRow, WindowPlan } from "../core/QueryPlan.ts";
 import { generateUuid } from "../core/uuid.ts";
 import type { AnyProperty, InferModel, PropertyMap } from "../properties/infer.ts";
@@ -902,8 +903,35 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     }
   }
 
+  /**
+   * Encode an instance to its stored form.
+   *
+   * Fields this model doesn't declare are carried forward verbatim from the write baseline (§12)
+   * rather than dropped. Without that, a build with a narrower property map silently *deletes* every
+   * field it doesn't know about on each read-modify-write, because the stores replace whole records
+   * (`InMemoryBackend.persist`, `IndexedDBBackend.put`). Two builds sharing one store is not an edge
+   * case — it's the steady state during a rolling deploy, and the premise of an expand/contract
+   * migration window. Under field-level sync the drop is worse still: the vanished key diffs as
+   * dirty, its field-version bumps, and the deletion replicates to every peer as though intended.
+   *
+   * Reserved fields (`RESERVED_RECORD_FIELDS`) are deliberately not carried forward — the sync layer
+   * below rewrites them on every write, so re-emitting a stale `_version` or a cleared `_deleted`
+   * would fight their owner.
+   *
+   * The limit: preservation needs a baseline, so it covers exactly the records this repository has
+   * *seen* — loaded, persisted, or observed on the change feed. A blind `createInstance()` + `save()`
+   * against a uuid it has never seen (a fresh process writing an existing record without reading it)
+   * still replaces the stored record wholesale.
+   */
   private serialize(instance: Record_): JsonObject {
     const json: JsonObject = { uuid: instance.uuid as JsonValue };
+    const baseline = this.cache.getBaseline(instance.uuid as Uuid);
+    if (baseline) {
+      for (const key of Object.keys(baseline)) {
+        if (key === "uuid" || key in this.properties || RESERVED_RECORD_FIELDS.has(key)) continue;
+        json[key] = baseline[key] as JsonValue;
+      }
+    }
     for (const name of Object.keys(this.properties)) {
       const property = this.properties[name] as AnyProperty;
       if (property.kind === "computed") {

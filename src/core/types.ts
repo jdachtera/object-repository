@@ -44,6 +44,28 @@ export interface Identity {
 /** A system context with no principal — used for migrations, sync internals, tests. */
 export const SYSTEM_CONTEXT: Context = { identity: null };
 
+/** Stamped onto stored records to carry their HLC version (ARCHITECTURE.md §9). */
+export const VERSION_FIELD = "_version";
+/** Marks a soft-deleted (tombstoned) record so a remove can carry a comparable version. */
+export const TOMBSTONE_FIELD = "_deleted";
+/** Carries the per-field HLC versions in field-level sync (field name → version). */
+export const FIELD_VERSIONS_FIELD = "_fieldVersions";
+
+/**
+ * Fields a *lower* layer stamps onto a stored record for its own bookkeeping — never model data.
+ *
+ * They live here, in core, rather than in the sync layer that writes them because the layer above
+ * also has to know about them: `Repository.serialize` carries undeclared stored fields forward so a
+ * build that doesn't declare a field can't delete it, and these are precisely the fields it must
+ * *not* carry forward — their owner rewrites them on every write, so re-emitting a stale one would
+ * resurrect a superseded version or a cleared tombstone.
+ */
+export const RESERVED_RECORD_FIELDS: ReadonlySet<string> = new Set([
+  VERSION_FIELD,
+  TOMBSTONE_FIELD,
+  FIELD_VERSIONS_FIELD
+]);
+
 /**
  * What a backend can do natively. The query planner targets the *intersection* of these
  * for the public API and uses the descriptor to *optimize* — pushing predicates down where
