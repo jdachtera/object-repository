@@ -36,3 +36,16 @@ export { OpRecorder, classify, isWidening, splitPhases, phaseOps, downOps, opsHa
 export { coerce } from "./coerce.ts";
 export { applyOp, type ExecuteOptions, type OpResult } from "./execute.ts";
 export { pageByUuid, everything, BY_UUID, type Page } from "./paging.ts";
+
+export { runMigrations, rollbackMigrations, gateOpen, type RunnerOptions } from "./run.ts";
+export {
+  BackendJournal,
+  MIGRATION_LOG_MODEL,
+  SCHEMA_STATE_MODEL,
+  SCHEMA_STATE_ID,
+  indexRows,
+  rowId,
+  type JournalRow,
+  type MigrationJournal,
+  type SchemaState
+} from "./journal.ts";
