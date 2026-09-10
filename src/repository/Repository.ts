@@ -17,6 +17,7 @@ import { inList, contains, or, not, isNull } from "../expressions/builders.ts";
 import { parse } from "../expressions/parse.ts";
 import { QueryCache } from "./QueryCache.ts";
 import { QueryCollection, type Queryable, type ReadOptions } from "./QueryCollection.ts";
+import { substitutePlan, substituteAggregate, substituteWindow, type Mirrors } from "./mirror.ts";
 
 /** Resolves a model name to its repository (the RepositoryManager registry). */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -83,6 +84,12 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
   private readonly softDelete: SoftDeleteConfig | null;
   /** Names of computed/virtual fields — never stored, so filtering/sorting by one is rejected early. */
   private readonly computedFields: ReadonlySet<string>;
+  /**
+   * Canonical field → the legacy field holding its value while a rename's compatibility window is
+   * open (see `mirror.ts`). Empty in the overwhelmingly common case, and every path that consults it
+   * opens with a size check so nothing pays for a window that isn't there.
+   */
+  private readonly mirrors: Mirrors;
 
   constructor(
     modelName: string,
@@ -108,6 +115,12 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     this.computedFields = new Set(
       Object.keys(properties).filter((name) => (properties[name] as AnyProperty).kind === "computed")
     );
+    const mirrors = new Map<string, string>();
+    for (const name of Object.keys(properties)) {
+      const property = properties[name] as AnyProperty;
+      if (property.kind === "scalar" && property.mirrors) mirrors.set(property.mirrors, name);
+    }
+    this.mirrors = mirrors;
 
     // Reactive cache invalidation from the change feed (§7) — also catches writes flushed by a
     // sibling repository sharing this backend (e.g. cascaded relation saves). The same event
@@ -507,14 +520,14 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     plan = { ...plan, where: this.liveWhere(plan.where, options?.includeDeleted) };
     const pre = await this.preprocessWhere(plan.where);
     if (pre.rewritten) {
-      return this.execute({ ...plan, where: pre.node }); // relational query: not result-cached
+      return this.execute(substitutePlan({ ...plan, where: pre.node }, this.mirrors)); // relational: not result-cached
     }
 
     const hash = planHash(plan);
     const cached = this.cache.getResult(hash);
     if (cached) return cached;
 
-    const typed = await this.execute(plan);
+    const typed = await this.execute(substitutePlan(plan, this.mirrors));
     this.cache.setResult(hash, typed);
     return typed;
   }
@@ -541,7 +554,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     if (!isAggregating(this.backend)) return null;
     plan = { ...plan, where: this.liveWhere(plan.where, options?.includeDeleted) };
     const pre = await this.preprocessWhere(plan.where);
-    const effective = pre.rewritten ? { ...plan, where: pre.node } : plan;
+    const effective = substituteAggregate(pre.rewritten ? { ...plan, where: pre.node } : plan, this.mirrors);
     return this.backend.aggregate(effective, this.ctx);
   }
 
@@ -555,7 +568,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     if (!isWindowing(this.backend)) return null;
     plan = { ...plan, where: this.liveWhere(plan.where, options?.includeDeleted) };
     const pre = await this.preprocessWhere(plan.where);
-    const effective = pre.rewritten ? { ...plan, where: pre.node } : plan;
+    const effective = substituteWindow(pre.rewritten ? { ...plan, where: pre.node } : plan, this.mirrors);
     const rows = await this.backend.window(effective, this.ctx);
     if (!rows) return null;
     return rows.map((row) => {
@@ -584,7 +597,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
 
   private async effectivePlan(plan: QueryPlan): Promise<QueryPlan> {
     const pre = await this.preprocessWhere(plan.where);
-    return pre.rewritten ? { ...plan, where: pre.node } : plan;
+    return substitutePlan(pre.rewritten ? { ...plan, where: pre.node } : plan, this.mirrors);
   }
 
   // --- projection-driven loading (for select) ------------------------------------------------
@@ -596,7 +609,11 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
   async runProject(plan: QueryPlan, selection: Selection, options?: ReadOptions): Promise<unknown[]> {
     plan = { ...plan, where: this.liveWhere(plan.where, options?.includeDeleted) };
     const effective = await this.effectivePlan(plan);
-    const rows = await this.backend.query({ ...effective, project: neededFields(selection) }, this.ctx);
+    // The projection is derived from the selection here, *after* `effectivePlan` substituted, so it
+    // has to be mapped through the mirror too — otherwise a windowed field would be projected under
+    // the name the store doesn't hold it under and come back empty.
+    const project = neededFields(selection).map((field) => this.mirrors.get(field) ?? field);
+    const rows = await this.backend.query({ ...effective, project }, this.ctx);
     return this.loadProjectedBatch(rows, selection);
   }
 
@@ -789,7 +806,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     for (const name of Object.keys(this.properties)) {
       const property = this.properties[name] as AnyProperty;
       if (property.kind === "scalar") {
-        const value = row[name];
+        const value = this.storedValue(row, name);
         if (value !== undefined) instance[name] = property.decode(value);
       } else if (property.kind === "computed") {
         continue; // derived below, after all scalars are decoded
@@ -819,11 +836,27 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     for (const name of Object.keys(this.properties)) {
       const property = this.properties[name] as AnyProperty;
       if (property.kind === "scalar") {
-        const value = row[name];
+        const value = this.storedValue(row, name);
         if (value !== undefined) instance[name] = property.decode(value);
       }
     }
     return instance;
+  }
+
+  /**
+   * The stored value backing a declared field.
+   *
+   * Normally just `row[name]`. For the canonical half of an open compatibility window it is the
+   * legacy field that actually holds the value — reading the canonical key directly would return
+   * whatever this build last mirrored there, which an older build's more recent write would not have
+   * updated.
+   */
+  private storedValue(row: JsonObject, name: string): JsonValue | undefined {
+    if (this.mirrors.size > 0) {
+      const legacy = this.mirrors.get(name);
+      if (legacy !== undefined && row[legacy] !== undefined) return row[legacy];
+    }
+    return row[name];
   }
 
   /**
@@ -955,6 +988,12 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
           json[name] = related.map((item) => item.uuid as JsonValue);
         }
       }
+    }
+    // Write through to the legacy half of an open compatibility window. It stays authoritative for as
+    // long as an older build might still be writing it, so this keeps the two in step from our side —
+    // and because the key is genuinely in the record, `computeDirty` diffs it without special-casing.
+    for (const [canonical, legacy] of this.mirrors) {
+      if (canonical in json) json[legacy] = json[canonical] as JsonValue;
     }
     return json;
   }

@@ -140,6 +140,7 @@ export class RepositoryManager {
     let properties = config.timestamps ? withTimestamps(config.properties) : config.properties;
     if (softDelete) properties = withSoftDelete(properties, softDelete.field);
     const typed = properties as P;
+    assertMirrorsAreSound(config.name, typed);
     const repository = new Repository<P>(
       config.name,
       typed,
@@ -162,7 +163,11 @@ export class RepositoryManager {
 
     // Let schema-aware backends (IndexedDB, SQL) provision stores/indexes/columns from the metadata.
     if (isSchemaAware(this.backend)) {
-      void this.backend.registerModel(config.name, indexSpecs(typed, config.indexes), fieldSpecs(typed));
+      void this.backend.registerModel(
+        config.name,
+        indexSpecs(typed, config.indexes),
+        fieldSpecs(typed, this.schema?.minSupportedSchemaVersion ?? 0)
+      );
     }
 
     return repository;
@@ -317,7 +322,10 @@ export class RepositoryManager {
   private runnerOptions(options: MigrateOptions): RunnerOptions {
     const models: Record<string, { fields: FieldSpec[]; indexes: IndexSpec[] }> = {};
     for (const [name, def] of this.defs) {
-      models[name] = { fields: fieldSpecs(def.properties), indexes: indexSpecs(def.properties, def.indexes) };
+      models[name] = {
+        fields: fieldSpecs(def.properties, this.schema?.minSupportedSchemaVersion ?? 0),
+        indexes: indexSpecs(def.properties, def.indexes)
+      };
     }
     return {
       ctx: this.ctx,
@@ -377,13 +385,62 @@ function withSoftDelete(properties: PropertyMap, field: string): PropertyMap {
 }
 
 /** The scalar columns of a model (name + stored-type tag), in declaration order — for columnar backends. */
-function fieldSpecs(properties: PropertyMap): FieldSpec[] {
+/**
+ * The scalar columns a backend should provision.
+ *
+ * A property whose `deprecatedSince` the floor has already passed is omitted. That is what stops the
+ * additive auto-provisioner from re-creating a column a contract operation just dropped — the two
+ * would otherwise fight, with provisioning winning on the next `define()` and quietly resurrecting
+ * the field as an empty column.
+ */
+function fieldSpecs(properties: PropertyMap, minSupported = 0): FieldSpec[] {
   const fields: FieldSpec[] = [];
   for (const name of Object.keys(properties)) {
     const property = properties[name] as AnyProperty;
-    if (property.kind === "scalar") fields.push({ name, type: property.type });
+    if (property.kind !== "scalar") continue;
+    if (property.deprecatedSince !== undefined && property.deprecatedSince <= minSupported) continue;
+    fields.push({ name, type: property.type });
   }
   return fields;
+}
+
+/**
+ * Reject compatibility-window declarations that can't hold.
+ *
+ * Each of these is a case where mirroring would appear to work and then quietly produce wrong data,
+ * so they're refused at definition time rather than discovered in production.
+ */
+function assertMirrorsAreSound(model: string, properties: PropertyMap): void {
+  const scalars = new Set(
+    Object.keys(properties).filter((name) => (properties[name] as AnyProperty).kind === "scalar")
+  );
+  for (const name of Object.keys(properties)) {
+    const property = properties[name] as AnyProperty;
+    if (property.kind !== "scalar" || !property.mirrors) continue;
+    const canonical = property.mirrors;
+
+    if (!scalars.has(canonical)) {
+      throw new Error(
+        `"${model}.${name}" mirrors "${canonical}", which is not a declared scalar property on this model.`
+      );
+    }
+    if (property.deprecatedSince === undefined) {
+      throw new Error(`"${model}.${name}" declares \`mirrors\` without \`deprecatedSince\`, so its window has no gate to close.`);
+    }
+    const target = properties[canonical] as AnyProperty;
+    if (target.kind === "scalar" && target.unique) {
+      // Two unique constraints over one logical value double-report in the uniqueness pre-check, and
+      // the legacy half already carries the constraint until the contract runs.
+      throw new Error(
+        `"${model}.${canonical}" cannot be \`unique\` while "${name}" mirrors it — the legacy field carries the constraint until the window closes.`
+      );
+    }
+    if (target.kind === "scalar" && target.mirrors) {
+      throw new Error(
+        `"${model}.${name}" mirrors "${canonical}", which mirrors "${target.mirrors}". Chained windows are not supported — close one before opening the next.`
+      );
+    }
+  }
 }
 
 /** Index specs from per-scalar `index`/`unique` hints plus the model-level `indexes` declarations. */
