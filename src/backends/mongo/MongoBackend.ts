@@ -25,6 +25,11 @@ import type { ArithOp } from "../../core/QueryPlan.ts";
 import { parse } from "../../expressions/parse.ts";
 import { parseValue } from "../../expressions/values.ts";
 import { UniqueConstraintError, uniqueKey, uniqueKeySets, sameBatchConflict } from "../util/unique.ts";
+import type { MigrationOp } from "../../migrations/types.ts";
+import { all } from "../../expressions/builders.ts";
+
+/** The unfiltered predicate, for a migration operation that touches every record. */
+const ALL_RECORDS: ExpressionNode = all().serialize();
 
 /** Backend-level options for `MongoBackend`. */
 export interface MongoBackendOptions {
@@ -192,23 +197,36 @@ export class MongoBackend
     return compileMongoFilter(where, this.identity, model);
   }
 
-  registerModel(model: string, indexes: IndexSpec[]): void {
+  async registerModel(model: string, indexes: IndexSpec[]): Promise<void> {
     if (this.uniquePreCheck) this.uniqueKeys.set(model, uniqueKeySets(indexes));
+    await this.provisionIndexes(model, indexes);
+  }
+
+  /**
+   * Build the indexes for a model. Awaited rather than fire-and-forget: a `createIndex` that fails —
+   * a unique index over already-duplicate data, most often — used to surface as an unhandled rejection
+   * with nothing tying it back to the model that caused it.
+   */
+  private async provisionIndexes(model: string, indexes: IndexSpec[]): Promise<void> {
     const collection = this.db.collection(model);
-    for (const index of indexes) {
-      const keys = Object.fromEntries(
-        index.fields.map((f) => [
-          f.path === "uuid" ? this.identity.field : f.path,
-          index.text ? "text" : f.descending ? -1 : 1
-        ])
-      );
-      const options: Record<string, unknown> = { name: index.name };
-      if (index.unique) options.unique = true;
-      if (index.sparse) options.sparse = true;
-      if (index.ttlSeconds !== undefined) options.expireAfterSeconds = index.ttlSeconds;
-      if (index.where) options.partialFilterExpression = this.filter(model, index.where);
-      void collection.createIndex(keys, options); // provisioning; fire-and-forget
-    }
+    // Every request is issued before the first is awaited: they're independent, and deferring the
+    // later ones behind each other would make provisioning observably incomplete mid-flight.
+    await Promise.all(
+      indexes.map((index) => {
+        const keys = Object.fromEntries(
+          index.fields.map((f) => [
+            f.path === "uuid" ? this.identity.field : f.path,
+            index.text ? "text" : f.descending ? -1 : 1
+          ])
+        );
+        const options: Record<string, unknown> = { name: index.name };
+        if (index.unique) options.unique = true;
+        if (index.sparse) options.sparse = true;
+        if (index.ttlSeconds !== undefined) options.expireAfterSeconds = index.ttlSeconds;
+        if (index.where) options.partialFilterExpression = this.filter(model, index.where);
+        return collection.createIndex(keys, options);
+      })
+    );
   }
 
   async query(plan: QueryPlan, _ctx: Context): Promise<JsonObject[]> {
@@ -262,6 +280,28 @@ export class MongoBackend
 
   async patch(model: string, uuid: string, ops: Record<string, PatchOp>, _ctx: Context): Promise<void> {
     await this.db.collection(model).updateOne(keyFilter(uuid, this.identity), compileMongoUpdate(ops));
+  }
+
+  /**
+   * Realize a migration operation server-side where Mongo can do better than rewriting every record
+   * (ARCHITECTURE.md §11); resolve `null` to let the portable executor handle the rest.
+   *
+   * `dropField` is the one that matters. It is the operation that used to silently do nothing here —
+   * and as a single `updateMany` with `$unset` it costs one round-trip instead of paging the whole
+   * collection through the client.
+   */
+  async lowerMigrationOp(op: MigrationOp, ctx: Context): Promise<{ rows: number } | null> {
+    if (op.kind === "dropField") {
+      const rows = await this.patchMany(op.model, ALL_RECORDS, { [op.field]: { kind: "unset" } }, ctx);
+      return { rows };
+    }
+    if (op.kind === "addIndex") {
+      await this.provisionIndexes(op.model, [op.index]);
+      return { rows: 0 };
+    }
+    // Everything else — including `dropModel` and `dropIndex`, which would need `drop`/`dropIndex` on
+    // the injected driver interface that callers are not required to provide — falls to the reference.
+    return null;
   }
 
   async patchMany(model: string, where: ExpressionNode, ops: Record<string, PatchOp>, _ctx: Context): Promise<number> {
@@ -358,8 +398,15 @@ export class MongoBackend
         ? Object.fromEntries(change.dirty.filter((f) => f in change.record).map((f) => [f, change.record[f]]))
         : change.record;
       const removed = change.dirty?.filter((f) => change.record[f] === undefined) ?? [];
-      const update: Record<string, object> = { $set: toStoredFields(fields, change.model, this.identity) };
+      // Mongo rejects an empty `$set` (`FailedToParse: '$set' is empty`) and that failure takes the
+      // whole `bulkWrite` — every unrelated write batched with it — down. A dirty hint naming only
+      // deleted fields produces exactly that shape, so include each operator only when it has work,
+      // and skip the op entirely when neither does.
+      const stored = toStoredFields(fields, change.model, this.identity);
+      const update: Record<string, object> = {};
+      if (Object.keys(stored).length) update.$set = stored;
       if (removed.length) update.$unset = Object.fromEntries(removed.map((f) => [f, ""]));
+      if (!Object.keys(update).length) continue;
       push(change.model, {
         updateOne: { filter: keyFilter(id, this.identity), update, upsert: true }
       });

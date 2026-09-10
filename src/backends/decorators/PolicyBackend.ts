@@ -10,7 +10,7 @@ import type {
   Unsubscribe
 } from "../../core/Backend.ts";
 import { isCounting, isRawQueryable, isSchemaAware } from "../../core/Backend.ts";
-import { isMigratable, type MigratableBackend, type Migration, type MigrationReport } from "../sql/migrate.ts";
+import { isMigratable, type Migration, type MigrationReport } from "../sql/migrate.ts";
 import type { Capabilities, Context, JsonObject, Uuid } from "../../core/types.ts";
 import type { QueryPlan } from "../../core/QueryPlan.ts";
 import type { Expression } from "../../expressions/Expression.ts";
@@ -51,14 +51,29 @@ export interface AccessPolicy {
  * can't see are not forwarded (preventing cross-tenant leakage). `removed` events carry no record
  * and pass through.
  */
-export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBackend, RawQueryable, MigratableBackend {
+export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBackend, RawQueryable {
   readonly capabilities: Capabilities;
+
+  /**
+   * Schema migration is a deploy-time operation, not a per-request one, so it forwards to the inner
+   * store untouched. Attached in the constructor **only when the inner store is migratable**, so
+   * `isMigratable(policyBackend)` answers for the stack it actually wraps — a method declared
+   * unconditionally that throws inside would make the capability probe report a hatch that isn't
+   * there, moving a checkable boolean into a runtime failure.
+   */
+  migrate?: (migrations: Migration[]) => Promise<MigrationReport>;
+  rollback?: (migrations: Migration[], count: number) => Promise<MigrationReport>;
 
   constructor(
     private readonly inner: Backend,
     private readonly policy: AccessPolicy
   ) {
     this.capabilities = inner.capabilities;
+    if (isMigratable(inner)) {
+      const migratable = inner;
+      this.migrate = (migrations) => migratable.migrate(migrations);
+      this.rollback = (migrations, count) => migratable.rollback(migrations, count);
+    }
   }
 
   registerModel(model: string, indexes: IndexSpec[], fields?: FieldSpec[]): void | Promise<void> {
@@ -72,17 +87,6 @@ export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBacke
   async raw(query: unknown, ctx: Context): Promise<Record<string, unknown>[]> {
     if (!isRawQueryable(this.inner)) throw new Error("The wrapped backend does not support raw queries.");
     return this.inner.raw(query, ctx);
-  }
-
-  /** Schema migration is a deploy-time operation, not a per-request one — forward it to the inner store. */
-  migrate(migrations: Migration[]): Promise<MigrationReport> {
-    if (!isMigratable(this.inner)) throw new Error("The wrapped backend does not support migrations.");
-    return this.inner.migrate(migrations);
-  }
-
-  rollback(migrations: Migration[], count: number): Promise<MigrationReport> {
-    if (!isMigratable(this.inner)) throw new Error("The wrapped backend does not support migrations.");
-    return this.inner.rollback(migrations, count);
   }
 
   query(plan: QueryPlan, ctx: Context): Promise<JsonObject[]> {

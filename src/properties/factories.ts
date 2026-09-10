@@ -61,6 +61,8 @@ export function text(options: TextOptions = {}): ScalarProperty<string, string> 
     index: options.index,
     required: options.required,
     default: options.default,
+    deprecatedSince: options.deprecatedSince,
+    mirrors: options.mirrors,
     length: options.length ?? 1000,
     type: "text"
   });
@@ -82,6 +84,8 @@ export function integer(options: NumberOptions = {}): ScalarProperty<number, num
     index: options.index,
     required: options.required,
     default: options.default,
+    deprecatedSince: options.deprecatedSince,
+    mirrors: options.mirrors,
     type: "integer"
   });
 }
@@ -98,6 +102,8 @@ export function float(options: NumberOptions = {}): ScalarProperty<number, numbe
     index: options.index,
     required: options.required,
     default: options.default,
+    deprecatedSince: options.deprecatedSince,
+    mirrors: options.mirrors,
     type: "float"
   });
 }
@@ -118,6 +124,8 @@ export function boolean(options: BooleanOptions = {}): ScalarProperty<boolean, b
     index: options.index,
     required: options.required,
     default: options.default,
+    deprecatedSince: options.deprecatedSince,
+    mirrors: options.mirrors,
     type: "boolean"
   });
 }
@@ -134,6 +142,8 @@ export function date(options: DateOptions = {}): ScalarProperty<Date, number> {
     index: options.index,
     required: options.required,
     default: options.default,
+    deprecatedSince: options.deprecatedSince,
+    mirrors: options.mirrors,
     type: "date"
   });
 }
@@ -205,6 +215,8 @@ export function json(
     index: options.index,
     required: options.required,
     default: options.default,
+    deprecatedSince: options.deprecatedSince,
+    mirrors: options.mirrors,
     type: "json"
   });
 }
@@ -225,6 +237,8 @@ export function array<T extends JsonValue = JsonValue>(options: ArrayOptions<T> 
     index: options.index,
     required: options.required,
     default: options.default,
+    deprecatedSince: options.deprecatedSince,
+    mirrors: options.mirrors,
     type: "array"
   });
 }
@@ -262,6 +276,8 @@ export function embedded(
     index: options.index,
     required: options.required,
     default: options.default,
+    deprecatedSince: options.deprecatedSince,
+    mirrors: options.mirrors,
     type: "embedded"
   });
 }

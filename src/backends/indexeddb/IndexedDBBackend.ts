@@ -27,6 +27,30 @@ const CAPABILITIES: Capabilities = {
   changeFeed: true
 };
 
+/** `DOMStringList` predates the iteration protocol and isn't spreadable under this package's lib set. */
+function nameList(list: DOMStringList): string[] {
+  const names: string[] = [];
+  for (let i = 0; i < list.length; i++) names.push(list.item(i)!);
+  return names;
+}
+
+/**
+ * Thrown when a schema upgrade can't proceed because another connection (typically a second tab) still
+ * holds the database open at the previous version. IndexedDB fires `blocked` and then simply waits, so
+ * without this the open request never settles and every awaiting read/write hangs forever.
+ */
+export class SchemaUpgradeBlockedError extends Error {
+  constructor(
+    readonly database: string,
+    readonly version: number | undefined
+  ) {
+    super(
+      `Upgrading IndexedDB database "${database}"${version === undefined ? "" : ` to version ${version}`} is blocked by another open connection. Close other tabs using this database and retry.`
+    );
+    this.name = "SchemaUpgradeBlockedError";
+  }
+}
+
 export interface IndexedDBBackendOptions {
   /** Database name. */
   name?: string;
@@ -55,6 +79,8 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
 
   private db: IDBDatabase | null = null;
   private openingPromise: Promise<IDBDatabase> | null = null;
+  /** Index names per object store in the currently-open database (see `snapshotIndexes`). */
+  private presentIndexes = new Map<string, Set<string>>();
 
   private saveQueue: PersistedChange[] = [];
   private removeQueue: PersistedChange[] = [];
@@ -66,11 +92,23 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
     this.keyRange = options.keyRange ?? globalThis.IDBKeyRange;
   }
 
-  /** Provision an object store (and its indexes) for a model. Idempotent. */
+  /**
+   * Provision an object store (and its indexes) for a model. Idempotent, and order-independent: a
+   * write can land before `define()` does, and `save`/`remove` register the model with an empty index
+   * list to guarantee the store exists. First-registration-wins would let that bare call freeze the
+   * model at zero indexes and silently discard the real specs `define()` supplies moments later, so
+   * later registrations merge by index name and an empty list never downgrades a populated one.
+   */
   registerModel(model: string, indexes: IndexSpec[]): void {
-    if (!this.models.has(model)) {
+    const existing = this.models.get(model);
+    if (!existing) {
       this.models.set(model, indexes);
+      return;
     }
+    if (!indexes.length) return;
+    const byName = new Map(existing.map((index) => [index.name, index]));
+    for (const index of indexes) byName.set(index.name, index);
+    this.models.set(model, [...byName.values()]);
   }
 
   async query(plan: QueryPlan, _ctx: Context): Promise<JsonObject[]> {
@@ -231,8 +269,35 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
     return this.openingPromise;
   }
 
+  /**
+   * Is the open database already provisioned for everything declared? Stores *and* indexes: comparing
+   * store names alone means an index added to an existing model never triggers a version bump, so it
+   * is never created and every query that would have used it silently falls back to a full scan.
+   *
+   * Compares against `presentIndexes`, snapshotted at open time, so this hot-path check needs no
+   * transaction of its own.
+   */
   private hasAllStores(db: IDBDatabase): boolean {
-    return [...this.models.keys()].every((model) => db.objectStoreNames.contains(model));
+    for (const [model, indexes] of this.models) {
+      if (!db.objectStoreNames.contains(model)) return false;
+      const present = this.presentIndexes.get(model);
+      for (const index of indexes) {
+        if (index.text || index.ttlSeconds !== undefined) continue; // not expressible in IndexedDB
+        if (!present?.has(index.name)) return false;
+      }
+    }
+    return true;
+  }
+
+  /** Record which indexes each store actually has, so `hasAllStores` can answer synchronously. */
+  private snapshotIndexes(db: IDBDatabase): void {
+    this.presentIndexes = new Map();
+    const stores = nameList(db.objectStoreNames);
+    if (!stores.length) return;
+    const tx = db.transaction(stores, "readonly");
+    for (const store of stores) {
+      this.presentIndexes.set(store, new Set(nameList(tx.objectStore(store).indexNames)));
+    }
   }
 
   private async reopen(): Promise<IDBDatabase> {
@@ -269,7 +334,17 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
           }
         }
       };
-      request.onsuccess = () => resolve(request.result);
+      // `blocked` fires when another connection still holds the previous version. IndexedDB then just
+      // waits — so without this the request never settles and every caller awaiting it hangs.
+      request.onblocked = () => reject(new SchemaUpgradeBlockedError(this.name, version));
+      request.onsuccess = () => {
+        const db = request.result;
+        // Symmetrically: don't be the connection that blocks someone else's upgrade. A peer tab
+        // bumping the version fires `versionchange` here, and closing lets it proceed.
+        db.onversionchange = () => db.close();
+        this.snapshotIndexes(db);
+        resolve(db);
+      };
       request.onerror = () => reject(request.error ?? new Error("Failed to open IndexedDB"));
     });
   }

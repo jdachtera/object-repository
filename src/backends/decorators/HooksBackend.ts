@@ -2,6 +2,7 @@ import type {
   Backend,
   ChangeListener,
   CountingBackend,
+  FieldSpec,
   IndexSpec,
   PersistResult,
   SchemaAwareBackend,
@@ -49,8 +50,8 @@ export class HooksBackend implements Backend, SchemaAwareBackend, CountingBacken
     this.capabilities = inner.capabilities;
   }
 
-  registerModel(model: string, indexes: IndexSpec[]): void {
-    if (isSchemaAware(this.inner)) this.inner.registerModel(model, indexes);
+  registerModel(model: string, indexes: IndexSpec[], fields?: FieldSpec[]): void | Promise<void> {
+    if (isSchemaAware(this.inner)) return this.inner.registerModel(model, indexes, fields);
   }
 
   query(plan: QueryPlan, ctx: Context): Promise<JsonObject[]> {

@@ -61,6 +61,10 @@
       "types": "./dist/backends/decorators/index.d.ts",
       "import": "./dist/backends/decorators/index.js"
     },
+    "./migrations": {
+      "types": "./dist/migrations/index.d.ts",
+      "import": "./dist/migrations/index.js"
+    },
     "./sync": {
       "types": "./dist/sync/index.d.ts",
       "import": "./dist/sync/index.js"

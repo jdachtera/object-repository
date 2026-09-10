@@ -16,6 +16,10 @@ export interface ScalarPropertyConfig<Runtime, Stored extends JsonValue> {
   length?: number;
   /** A stable tag for the stored type (`text`/`integer`/…); used for introspection + schema fingerprints. */
   type?: string;
+  /** Schema version at which this field stopped being canonical (see `ScalarOptions.deprecatedSince`). */
+  deprecatedSince?: number;
+  /** The property this one shadows while a rename's compatibility window is open. */
+  mirrors?: string;
 }
 
 /**
@@ -37,6 +41,8 @@ export class ScalarProperty<Runtime, Stored extends JsonValue = JsonValue> {
   private readonly defaultSpec: Runtime | (() => Runtime) | undefined;
   readonly length: number | undefined;
   readonly type: string;
+  readonly deprecatedSince: number | undefined;
+  readonly mirrors: string | undefined;
 
   constructor(config: ScalarPropertyConfig<Runtime, Stored>) {
     this.schema = config.schema;
@@ -48,6 +54,8 @@ export class ScalarProperty<Runtime, Stored extends JsonValue = JsonValue> {
     this.hasDefault = config.default !== undefined;
     this.length = config.length;
     this.type = config.type ?? "scalar";
+    this.deprecatedSince = config.deprecatedSince;
+    this.mirrors = config.mirrors;
   }
 
   /** Produce this property's default (calling the factory if it is one) and validate it. */

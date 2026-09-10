@@ -28,13 +28,15 @@ import type {
   Unsubscribe
 } from "../../core/Backend.ts";
 import type { Capabilities, Context, JsonObject, JsonValue, Uuid } from "../../core/types.ts";
+import type { MigrationOp } from "../../migrations/types.ts";
+import { changesColumns, lowerToSql } from "./lower.ts";
 import type { AggregatePlan, AggregateResultRow, QueryPlan, WindowPlan } from "../../core/QueryPlan.ts";
 import { generateUuid } from "../../core/uuid.ts";
 import { reduceAggregatePlan } from "../../expressions/aggregateReduce.ts";
 import { scan } from "../util/scan.ts";
 import { compileAggregate, compileWhere, compileWindow } from "./compile.ts";
 import { OVERFLOW_COLUMN, type SqlDialect } from "./dialect.ts";
-import { runMigrations, rollbackMigrations } from "./migrate.ts";
+import { runMigrations, rollbackMigrations, MIGRATIONS_TABLE } from "./migrate.ts";
 import type { MigratableBackend, Migration, MigrationReport } from "./migrate.ts";
 import { UniqueConstraintError, uniqueKey, uniqueKeySets, sameBatchConflict } from "../util/unique.ts";
 
@@ -61,6 +63,13 @@ const TOP = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** Rows per multi-row statement — bounded so `rows × columns` params stay well under driver limits. */
 const MAX_BATCH_ROWS = 500;
+
+/** Do two declared field sets describe the same columns? */
+function sameFields(a: FieldSpec[], b: FieldSpec[]): boolean {
+  if (a.length !== b.length) return false;
+  const byName = new Map(a.map((field) => [field.name, field.type]));
+  return b.every((field) => byName.get(field.name) === field.type);
+}
 
 /** Group persisted changes by model, preserving first-seen order. */
 function groupByModel(changes: PersistedChange[]): Map<string, PersistedChange[]> {
@@ -110,6 +119,8 @@ export class SqlBackend
   private readonly schemas = new Map<string, FieldSpec[]>();
   private readonly indexes = new Map<string, IndexSpec[]>();
   private readonly provisioned = new Map<string, Promise<unknown>>();
+  /** Live column sets, read once per model per migration run and invalidated by any DDL that moves them. */
+  private readonly liveColumnCache = new Map<string, Set<string>>();
   private readonly uniquePreCheck: boolean;
   private saveQueue: PersistedChange[] = [];
   private removeQueue: PersistedChange[] = [];
@@ -130,9 +141,118 @@ export class SqlBackend
   }
 
   async registerModel(model: string, indexes: IndexSpec[], fields: FieldSpec[] = []): Promise<void> {
+    // Provisioning is memoized per model, so a *re-registration* that widens the declared field set
+    // would otherwise update the field list without ever creating the columns — and every subsequent
+    // query would then name a column that isn't there. Drop the memo when the shape actually changes.
+    const previous = this.schemas.get(model);
+    if (previous && !sameFields(previous, fields)) this.provisioned.delete(model);
     this.schemas.set(model, fields);
     this.indexes.set(model, indexes);
     await this.ensure(model);
+  }
+
+  /**
+   * Realize a migration operation as DDL, or decline so the portable executor rewrites rows instead
+   * (ARCHITECTURE.md §11). Declining is routine, not a failure: a field held in the `_extra` JSON
+   * overflow — a relation, or anything the model never declared as a scalar — has no column to alter,
+   * and emitting DDL against one would simply throw.
+   */
+  async lowerMigrationOp(op: MigrationOp, _ctx: Context): Promise<{ rows: number } | null> {
+    const present = "model" in op ? await this.liveColumns(op.model) : new Set<string>();
+    const statements = lowerToSql(op, this.dialect, present);
+    if (!statements) return null;
+
+    let rows = 0;
+    for (const statement of statements) {
+      const result = await this.exec.run(statement.sql, statement.params);
+      rows += Array.isArray(result) ? result.length : 0;
+    }
+    if ("model" in op && changesColumns(op)) this.refreshModel(op);
+    return { rows };
+  }
+
+  /**
+   * Migration names recorded in the original SQL-only tracking table.
+   *
+   * An already-deployed database has a populated `_object_repository_migrations` that the portable
+   * journal knows nothing about. Without adopting those names, the first run under the new mechanism
+   * would consider every historical migration pending and re-apply it against live data.
+   */
+  async legacyMigrationNames(): Promise<string[]> {
+    const probe = this.dialect.columnsQuery(MIGRATIONS_TABLE);
+    const columns = await this.exec.run(probe.sql, probe.params);
+    if (columns.length === 0) return [];
+    const rows = await this.exec.run(
+      `SELECT ${this.dialect.column("name")} AS name FROM ${this.dialect.ref(MIGRATIONS_TABLE)}`,
+      []
+    );
+    return rows.map((row) => String(row.name));
+  }
+
+  /** The rendered SQL for a plan preview. Never executed. */
+  previewMigrationOp(op: MigrationOp): string[] {
+    const present = "model" in op ? (this.liveColumnCache.get(op.model) ?? new Set<string>()) : new Set<string>();
+    return (lowerToSql(op, this.dialect, present) ?? []).map((statement) => statement.sql);
+  }
+
+  /** Read (and cache for this run) the columns a table actually has. */
+  private async liveColumns(model: string): Promise<Set<string>> {
+    const cached = this.liveColumnCache.get(model);
+    if (cached) return cached;
+    const probe = this.dialect.columnsQuery(model);
+    const rows = await this.exec.run(probe.sql, probe.params);
+    const columns = new Set(rows.map((row) => String(row.column_name)));
+    this.liveColumnCache.set(model, columns);
+    return columns;
+  }
+
+  /**
+   * Track a model's shape through the DDL just applied.
+   *
+   * Both halves matter. The cached column set and provisioning memo go stale immediately — without
+   * clearing them the next write would still name a column that has just been dropped, or miss one
+   * just added. And `schemas` drives both `encodeRow` and `decodeRow`, so after an
+   * `ALTER TABLE ... RENAME COLUMN` the physical column has moved but reads would still look for the
+   * old name and silently return nothing for it.
+   */
+  private refreshModel(op: MigrationOp & { model: string }): void {
+    this.liveColumnCache.delete(op.model);
+    this.provisioned.delete(op.model);
+
+    const fields = this.schemas.get(op.model);
+    switch (op.kind) {
+      case "createModel":
+        this.schemas.set(op.model, [...op.fields]);
+        break;
+      case "dropModel":
+        this.schemas.delete(op.model);
+        this.indexes.delete(op.model);
+        break;
+      case "addField":
+        if (fields && !fields.some((field) => field.name === op.field)) {
+          this.schemas.set(op.model, [...fields, { name: op.field, type: op.type }]);
+        }
+        break;
+      case "dropField":
+        if (fields) this.schemas.set(op.model, fields.filter((field) => field.name !== op.field));
+        break;
+      case "renameField":
+        if (fields) {
+          this.schemas.set(
+            op.model,
+            fields.map((field) => (field.name === op.from ? { name: op.to, type: field.type } : field))
+          );
+        }
+        break;
+      case "retypeField":
+        if (fields) {
+          this.schemas.set(
+            op.model,
+            fields.map((field) => (field.name === op.field ? { name: field.name, type: op.to } : field))
+          );
+        }
+        break;
+    }
   }
 
   async query(plan: QueryPlan, _ctx: Context): Promise<JsonObject[]> {

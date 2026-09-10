@@ -1,4 +1,5 @@
-import type { Context } from "../core/types.ts";
+import type { Context, SchemaVersioning } from "../core/types.ts";
+import { checkSchemaCompatibility, type SchemaAdvertisement } from "../core/schema.ts";
 import type { TransportAdapter, WireRequest, WireResponse } from "../core/Transport.ts";
 import type { SyncChange, SyncCursor, SyncTarget } from "../core/SyncTarget.ts";
 
@@ -10,7 +11,17 @@ import type { SyncChange, SyncCursor, SyncTarget } from "../core/SyncTarget.ts";
  * authentication comes from the `Context` the transport supplies.
  */
 export class SyncTargetAdapter implements TransportAdapter {
-  constructor(private readonly target: SyncTarget) {}
+  constructor(
+    private readonly target: SyncTarget,
+    /**
+     * The server's declared schema versions. Supplying them lets a client discover it is too old to
+     * sync — the alternative is that it silently pulls records in a shape it cannot interpret and
+     * pushes records the server no longer understands.
+     */
+    private readonly schema?: SchemaVersioning,
+    /** The server's schema fingerprint, used when either end declares no version. */
+    private readonly fingerprint?: string
+  ) {}
 
   async handle(request: WireRequest, ctx: Context): Promise<WireResponse> {
     try {
@@ -23,10 +34,23 @@ export class SyncTargetAdapter implements TransportAdapter {
           const { changes } = (request.params ?? {}) as { changes?: SyncChange[] };
           return { ok: true, result: await this.target.push(changes ?? [], ctx) };
         }
+        case "handshake": {
+          const client = (request.params ?? {}) as SchemaAdvertisement;
+          const server: SchemaAdvertisement = {
+            ...(this.fingerprint === undefined ? {} : { fingerprint: this.fingerprint }),
+            ...(this.schema ?? {})
+          };
+          const verdict = checkSchemaCompatibility(client, server);
+          if (!verdict.compatible) return { ok: false, error: { code: verdict.code, message: verdict.message } };
+          return { ok: true, result: { ...verdict, server } };
+        }
         default:
           return {
             ok: false,
-            error: { code: "UNSUPPORTED_METHOD", message: `SyncTargetAdapter handles pull/push, not "${request.method}".` }
+            error: {
+              code: "UNSUPPORTED_METHOD",
+              message: `SyncTargetAdapter handles pull/push/handshake, not "${request.method}".`
+            }
           };
       }
     } catch (error) {

@@ -23,6 +23,7 @@
     "src/properties/**/*.ts",
     "src/expressions/**/*.ts",
     "src/backends/**/*.ts",
+    "src/migrations/**/*.ts",
     "src/repository/**/*.ts",
     "src/transport/**/*.ts",
     "src/sync/**/*.ts",

@@ -1,6 +1,7 @@
 import type {
   Backend,
   ChangeListener,
+  FieldSpec,
   IndexSpec,
   PersistResult,
   SchemaAwareBackend,
@@ -8,7 +9,13 @@ import type {
 } from "../core/Backend.ts";
 import { isCounting, isSchemaAware } from "../core/Backend.ts";
 import type { CountingBackend } from "../core/Backend.ts";
-import type { Capabilities, Context, JsonObject, Uuid } from "../core/types.ts";
+import type { Capabilities, Context, JsonObject, SchemaVersioning, Uuid } from "../core/types.ts";
+import {
+  FIELD_VERSIONS_FIELD,
+  RESERVED_RECORD_FIELDS as RESERVED,
+  TOMBSTONE_FIELD,
+  VERSION_FIELD
+} from "../core/types.ts";
 import type { QueryPlan } from "../core/QueryPlan.ts";
 import type { ConflictPolicy, SyncChange, SyncCursor, SyncTarget } from "../core/SyncTarget.ts";
 import { generateUuid } from "../core/uuid.ts";
@@ -16,16 +23,19 @@ import { eq, neq, and, all, inList } from "../expressions/builders.ts";
 import { parse } from "../expressions/parse.ts";
 import { HybridLogicalClock } from "./hlc.ts";
 
-/** Field stamped onto stored records to carry their HLC version (invisible to model mapping). */
-const VERSION_FIELD = "_version";
-/** Field marking a soft-deleted (tombstoned) record so a remove can carry a comparable version. */
-const TOMBSTONE_FIELD = "_deleted";
-/** Field carrying the per-field HLC versions in field-level sync (field name → version). */
-const FIELD_VERSIONS_FIELD = "_fieldVersions";
 /** Reserved model the durable outbox is stored under, in the local backend. */
 const OUTBOX_MODEL = "_outbox";
-/** Reserved fields never treated as data (never merged, never per-field versioned). */
-const RESERVED = new Set([VERSION_FIELD, TOMBSTONE_FIELD, FIELD_VERSIONS_FIELD]);
+
+/** Thrown when the server declines to sync with this client's schema version. */
+export class SyncSchemaError extends Error {
+  constructor(
+    readonly code: "SCHEMA_TOO_OLD" | "SCHEMA_TOO_NEW" | "SCHEMA_MISMATCH",
+    message: string
+  ) {
+    super(message);
+    this.name = "SyncSchemaError";
+  }
+}
 
 /** Last-write-wins by HLC version — the default conflict policy (ARCHITECTURE.md §9). */
 export const lastWriteWins: ConflictPolicy = (local, remote) =>
@@ -48,6 +58,11 @@ export interface SyncBackendOptions {
    * still replays already-stamped changes, so nothing is lost.)
    */
   fieldLevel?: boolean;
+  /**
+   * The schema versions this client declares. Supplying them (on both ends) lets the server refuse a
+   * client it can no longer serve, instead of the two exchanging records neither can interpret.
+   */
+  schema?: SchemaVersioning;
 }
 
 /**
@@ -71,10 +86,13 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
   private readonly conflict: ConflictPolicy;
   private readonly hlc: HybridLogicalClock;
   private readonly fieldLevel: boolean;
+  private readonly schema: SchemaVersioning | undefined;
   /** Session-scoped cache of the last-known per-field versions, keyed `model\0uuid` (field-level mode). */
   private readonly fieldVersions = new Map<string, Record<string, string>>();
 
   private cursor: SyncCursor | null = null;
+  /** The handshake is a per-session check, not a per-reconcile one. */
+  private schemaChecked = false;
 
   constructor(options: SyncBackendOptions) {
     this.local = options.local;
@@ -82,12 +100,13 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
     this.conflict = options.conflict ?? lastWriteWins;
     this.hlc = new HybridLogicalClock(options.nodeId ?? generateUuid().slice(0, 8));
     this.fieldLevel = options.fieldLevel ?? false;
+    this.schema = options.schema;
     this.capabilities = this.local.capabilities;
     if (isSchemaAware(this.local)) this.local.registerModel(OUTBOX_MODEL, []);
   }
 
-  registerModel(model: string, indexes: IndexSpec[]): void {
-    if (isSchemaAware(this.local)) this.local.registerModel(model, indexes);
+  registerModel(model: string, indexes: IndexSpec[], fields?: FieldSpec[]): void | Promise<void> {
+    if (isSchemaAware(this.local)) return this.local.registerModel(model, indexes, fields);
   }
 
   // Reads are offline-first: always local, with tombstones filtered out by query rewriting.
@@ -112,7 +131,7 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
     const version = this.hlc.now();
 
     if (this.fieldLevel) {
-      const key = `${model} ${uuid}`;
+      const key = `${model}\0${uuid}`;
       const prior = this.fieldVersions.get(key);
       // No prior versions cached → treat as an insert and version every present field. With a prior,
       // bump only the changed fields (`dirty`; undefined = a no-op save = nothing changed), carrying
@@ -167,8 +186,26 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
 
   /** Pull remote changes (merging by conflict policy) then push the local outbox. */
   async reconcile(ctx: Context): Promise<void> {
+    await this.assertSchemaCompatible(ctx);
     await this.pull(ctx);
     await this.push(ctx);
+  }
+
+  /**
+   * Refuse to sync a client the server can no longer serve (ARCHITECTURE.md §13).
+   *
+   * Checked once per session, before the first exchange, because the alternative is silent: a client
+   * months out of date would pull records in a shape it cannot interpret and push records the server
+   * no longer understands, and nothing would say so. A target with no `handshake` — or a server too
+   * old to answer it — is treated as unchecked, so this can be deployed to either end first.
+   */
+  private async assertSchemaCompatible(ctx: Context): Promise<void> {
+    if (this.schemaChecked || !this.remote.handshake) return;
+    const verdict = await this.remote.handshake({ ...(this.schema ?? {}) }, ctx);
+    // Only a *pass* is remembered. Caching a refusal would let the very next `reconcile` skip the
+    // check and sync anyway — the refusal has to hold for the life of the session.
+    if (!verdict.compatible) throw new SyncSchemaError(verdict.code, verdict.message);
+    this.schemaChecked = true;
   }
 
   private async pull(ctx: Context): Promise<void> {
@@ -179,7 +216,7 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
     const localByKey = await this.loadLocalRecords(changes, ctx);
     let applied = 0;
     for (const incoming of changes) {
-      const local = localByKey.get(`${incoming.model} ${incoming.uuid}`) ?? null;
+      const local = localByKey.get(`${incoming.model}\0${incoming.uuid}`) ?? null;
       if (await this.applyIncoming(incoming, local, ctx)) applied += 1;
     }
     this.cursor = cursor;
@@ -200,7 +237,7 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
         { model, where: inList("uuid", [...uuids]).serialize(), order: [], paging: { start: 0 } },
         ctx
       );
-      for (const row of rows) records.set(`${model} ${String(row.uuid)}`, row);
+      for (const row of rows) records.set(`${model}\0${String(row.uuid)}`, row);
     }
     return records;
   }
@@ -242,7 +279,7 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
     if (this.fieldLevel && incoming.record && incoming.fieldVersions && localRecord && localFv && incoming.kind === "saved" && localRecord[TOMBSTONE_FIELD] !== true) {
       const merged = mergeByField(localRecord, localFv, incoming.record, incoming.fieldVersions);
       if (merged === null) return false; // merge is identical to local → nothing to apply
-      this.fieldVersions.set(`${incoming.model} ${incoming.uuid}`, merged[FIELD_VERSIONS_FIELD] as Record<string, string>);
+      this.fieldVersions.set(`${incoming.model}\0${incoming.uuid}`, merged[FIELD_VERSIONS_FIELD] as Record<string, string>);
       this.local.save(incoming.model, merged, ctx);
       return true;
     }
@@ -263,7 +300,7 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
       // conflicts compare correctly. (A versionless legacy remove falls back to a hard delete.)
       this.local.save(incoming.model, incoming.record, ctx);
       if (this.fieldLevel && incoming.fieldVersions) {
-        this.fieldVersions.set(`${incoming.model} ${incoming.uuid}`, { ...incoming.fieldVersions });
+        this.fieldVersions.set(`${incoming.model}\0${incoming.uuid}`, { ...incoming.fieldVersions });
       }
     } else if (incoming.kind === "removed") {
       this.local.remove(incoming.model, { uuid: incoming.uuid }, ctx);
