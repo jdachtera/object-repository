@@ -72,7 +72,7 @@ const adults = await users.all().filter(gt("age", 18)).sort("age").list();
 const peters = await users.all().filter(eq("name", "Peter")).list(); // peters[0] === peter
 
 // versioned migrations for non-additive schema changes (rename/drop/retype + data backfills);
-// each runs once, tracked in _orm_migrations, and rollback() reverts via down():
+// each runs once, tracked in _object_repository_migrations, and rollback() reverts via down():
 await orm.migrate([
   { name: "0001_add_status", up: (m) => m.addColumn("User", "status", "text") },
   { name: "0002_backfill", up: (m) => m.sql(`UPDATE "User" SET "status" = 'active'`) },
@@ -310,6 +310,25 @@ await device.reconcile(ctx);
 The query language and model code are identical across all of these — embedded, client/server,
 and offline-sync are backend swaps, not rewrites.
 
+### Version-gated schema migrations
+
+Migrations run on **every** backend — a rename is `ALTER TABLE … RENAME COLUMN` on Postgres and a
+record rewrite on Mongo, IndexedDB or in-memory, with the same result either way.
+
+```ts
+const orm = new RepositoryManager({ backend, schema: { schemaVersion: 7, minSupportedSchemaVersion: 5 } });
+
+const report = await orm.migrate([
+  { name: "0012_fullname", schemaVersion: 7,
+    up: (m) => m.renameField("User", "name", "fullName", "text") }
+]);
+
+report.expanded;  // ["0012_fullname"] — the new field is added and back-filled
+report.deferred;  // the drop, withheld until you raise the floor AND pass applyContracts
+```
+
+`migrate()` never destroys anything on its own. See [docs/MIGRATIONS.md](docs/MIGRATIONS.md).
+
 ### Migrating between stores
 
 Because every store is the same `Backend` contract and records cross it as plain JSON, moving data
@@ -435,6 +454,7 @@ code at all; each store lives behind its own subpath:
 | `object-repository/mysql`        | `MySqlBackend` (inject a `mysql2` client)             |
 | `object-repository/mongo`        | `MongoBackend`                                        |
 | `object-repository/decorators`   | `PolicyBackend`, `observe`, `multiWriteBackend`, `copyBackend`, … |
+| `object-repository/migrations`   | portable version-gated migrations, `formatPlan`, the operation IR |
 | `object-repository/sync`         | `SyncBackend`, `InMemorySyncTarget`                   |
 | `object-repository/transport`    | `RemoteBackend`, HTTP/WS/in-process transports        |
 | `object-repository/compat/mongo` | the Mongo query-language facade (`mongoCollection`)   |

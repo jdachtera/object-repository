@@ -17,6 +17,24 @@ access. The **command plane** (task-based RPC for non-CRUD verbs) now rides the 
 
 ## Recently done
 
+- [x] **Portable, version-gated migrations.** Migrations were SQL-only: a rename or drop silently did
+      nothing on Mongo/IndexedDB/in-memory even though the data there still needed changing. They are
+      now a serializable operation IR plus one reference executor written against
+      `Backend.query/save/persist`, with an optional `lowerMigrationOp` capability so a backend changes
+      a migration's *cost*, never its effect — pinned by `src/migrations/conformance.test.ts`, which
+      holds every backend to the in-memory reference. Operations classify `expand`/`contract`, and a
+      contract declared at schema version N is withheld until `minSupportedSchemaVersion` reaches N
+      *and* the caller passes `applyContracts`, so a bare `migrate()` can only ever add; what is
+      withheld is always reported. A gated rename gets a real compatibility window: the legacy field
+      stays authoritative, the new one is a maintained mirror, and query plans substitute canonical →
+      legacy by name (exact for every comparator, and it keeps index push-down). `orm.plan()` reads the
+      store and writes nothing, printing what would run and what a release would destroy. An existing
+      `_object_repository_migrations` table is adopted rather than re-run. See ARCHITECTURE.md §13 and
+      docs/MIGRATIONS.md.
+      *Known gaps, deliberately out of scope here:* `define()`-time provisioning still creates unique
+      indexes outside the gate; there is no lock, so two replicas migrating concurrently both act; and
+      client-side lazy migration plus sync schema-version negotiation are not built (the capability
+      reserves `applySchemaOps` as a batch so that stays additive).
 - [x] **Durable sync server + transport bridge.** The offline-first stack now runs against a real store
       end to end, not just the in-memory reference. `BackendSyncTarget` persists the append-only
       changelog / LWW protocol in an injected `Backend` (SQLite/Postgres/MySQL/Mongo), re-seeding its
@@ -89,7 +107,7 @@ access. The **command plane** (task-based RPC for non-CRUD verbs) now rides the 
 - [x] **MySQL column-type tuning.** `text` columns are now real MySQL `TEXT` (no silent `varchar(255)`
       truncation of long strings); an index over a TEXT-backed column gets a `(255)` key-length prefix
       (auto-provisioner supplies column types; the migration builder's `createIndex` gains an opt-in
-      `columnTypes` arg). The uuid / `_orm_migrations` primary keys use a bounded identifier type so they
+      `columnTypes` arg). The uuid / `_object_repository_migrations` primary keys use a bounded identifier type so they
       stay directly indexable. Verified on live MySQL 8 (a 5000-char value round-trips; an indexed TEXT
       column builds with `Sub_part` 255).
 - [x] **Field-level sync deltas (opt-in).** `new SyncBackend({ fieldLevel: true })` makes concurrent
@@ -265,7 +283,7 @@ access. The **command plane** (task-based RPC for non-CRUD verbs) now rides the 
       non-text-column, and literal-metacharacter (`%`/`_`/`\`) searches stay on the scan path so the
       result always matches the in-memory reference exactly. (Part of "Deeper query push-down".)
 - [x] **Full migrations.** `orm.migrate(migrations)` applies a versioned set once each (tracked in an
-      `_orm_migrations` table, so re-runs are no-ops), running each migration's recorded DDL inside a
+      `_object_repository_migrations` table, so re-runs are no-ops), running each migration's recorded DDL inside a
       transaction where the engine allows transactional DDL. The `SchemaBuilder` covers create/drop
       table, add/drop/rename/retype column, create/drop index, and a raw `sql()` backfill hatch;
       `orm.rollback` reverts the most recent migrations via their `down`. Field-type args use the ORM's

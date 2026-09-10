@@ -307,3 +307,45 @@ describe("the journal is stored through the plain Backend seam", () => {
     ]);
   });
 });
+
+describe("the deploy timeline documented in docs/MIGRATIONS.md", () => {
+  const migrations: Migration[] = [
+    { name: "0012_fullname", schemaVersion: 7, up: (m) => m.renameField("User", "name", "fullName", "text") }
+  ];
+
+  it("behaves exactly as the guide describes, step by step", async () => {
+    const backend = await seeded();
+
+    // 1. Ship the migration: only the expand runs, and the drop is reported as deferred.
+    const shipped = await run(backend, migrations, { schemaVersion: 7, minSupportedSchemaVersion: 5 });
+    expect(shipped.expanded).toEqual(["0012_fullname"]);
+    expect(shipped.deferred).toHaveLength(1);
+    expect(shipped.deferred[0]).toMatchObject({ migration: "0012_fullname", gate: 7, minSupported: 5 });
+    expect(shipped.deferred[0]!.reason).toContain("drops User.name");
+    expect(shipped.contracted).toEqual([]);
+
+    // 2. Both fields are in the store, so either generation can read.
+    expect(await readUsers(backend)).toEqual([
+      { uuid: "u1", name: "Ann", fullName: "Ann" },
+      { uuid: "u2", name: "Bo", fullName: "Bo" }
+    ]);
+
+    // 3. Raise the floor: permitted, still not run.
+    const raised = await run(backend, migrations, { schemaVersion: 7, minSupportedSchemaVersion: 7 });
+    expect(raised.releasable).toHaveLength(1);
+    expect(raised.contracted).toEqual([]);
+    expect((await readUsers(backend))[0]).toHaveProperty("name");
+
+    // 4. Release it deliberately.
+    const released = await run(backend, migrations, {
+      schemaVersion: 7,
+      minSupportedSchemaVersion: 7,
+      applyContracts: true
+    });
+    expect(released.contracted).toEqual(["0012_fullname"]);
+    expect(await readUsers(backend)).toEqual([
+      { uuid: "u1", fullName: "Ann" },
+      { uuid: "u2", fullName: "Bo" }
+    ]);
+  });
+});
