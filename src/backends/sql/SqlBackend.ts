@@ -155,7 +155,7 @@ export class SqlBackend
       const result = await this.exec.run(statement.sql, statement.params);
       rows += Array.isArray(result) ? result.length : 0;
     }
-    if ("model" in op && changesColumns(op)) this.refreshModel(op.model);
+    if ("model" in op && changesColumns(op)) this.refreshModel(op);
     return { rows };
   }
 
@@ -195,15 +195,52 @@ export class SqlBackend
   }
 
   /**
-   * Forget what we knew about a model's shape after DDL changed it.
+   * Track a model's shape through the DDL just applied.
    *
-   * Without this the next write would still name a column that has just been dropped, or miss one that
-   * has just been added — the provisioning memo and the cached column set both go stale the instant a
-   * migration runs.
+   * Both halves matter. The cached column set and provisioning memo go stale immediately — without
+   * clearing them the next write would still name a column that has just been dropped, or miss one
+   * just added. And `schemas` drives both `encodeRow` and `decodeRow`, so after an
+   * `ALTER TABLE ... RENAME COLUMN` the physical column has moved but reads would still look for the
+   * old name and silently return nothing for it.
    */
-  private refreshModel(model: string): void {
-    this.liveColumnCache.delete(model);
-    this.provisioned.delete(model);
+  private refreshModel(op: MigrationOp & { model: string }): void {
+    this.liveColumnCache.delete(op.model);
+    this.provisioned.delete(op.model);
+
+    const fields = this.schemas.get(op.model);
+    switch (op.kind) {
+      case "createModel":
+        this.schemas.set(op.model, [...op.fields]);
+        break;
+      case "dropModel":
+        this.schemas.delete(op.model);
+        this.indexes.delete(op.model);
+        break;
+      case "addField":
+        if (fields && !fields.some((field) => field.name === op.field)) {
+          this.schemas.set(op.model, [...fields, { name: op.field, type: op.type }]);
+        }
+        break;
+      case "dropField":
+        if (fields) this.schemas.set(op.model, fields.filter((field) => field.name !== op.field));
+        break;
+      case "renameField":
+        if (fields) {
+          this.schemas.set(
+            op.model,
+            fields.map((field) => (field.name === op.from ? { name: op.to, type: field.type } : field))
+          );
+        }
+        break;
+      case "retypeField":
+        if (fields) {
+          this.schemas.set(
+            op.model,
+            fields.map((field) => (field.name === op.field ? { name: field.name, type: op.to } : field))
+          );
+        }
+        break;
+    }
   }
 
   async query(plan: QueryPlan, _ctx: Context): Promise<JsonObject[]> {
