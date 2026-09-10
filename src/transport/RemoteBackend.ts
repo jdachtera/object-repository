@@ -1,3 +1,5 @@
+import type { SchemaVersioning } from "../core/types.ts";
+import type { SchemaAdvertisement } from "../core/schema.ts";
 import type {
   Backend,
   ChangeEvent,
@@ -37,14 +39,27 @@ export class RemoteBackend implements Backend {
   }
 
   /**
-   * Verify the server runs the same schema before issuing real requests. Pass the local fingerprint
-   * (`manager.fingerprint()`); throws `SchemaMismatchError` if the server's differs — turning silent
-   * client/server drift into a clear, immediate failure (ARCHITECTURE.md §4, §10).
+   * Check this client can talk to the server before issuing real requests (ARCHITECTURE.md §4, §10, §13).
+   *
+   * Pass the local fingerprint (`manager.fingerprint()`), and — if this build declares them — its
+   * schema versions. When **both** ends advertise a version, compatibility is judged by range and the
+   * fingerprint is advisory: during a compatibility window the two ends' model definitions differ on
+   * purpose, so equality would reject exactly the deploy the version gate exists to make safe. Without
+   * versions on both sides, fingerprint equality still rules, unchanged.
+   *
+   * Throws `SchemaMismatchError` when the shapes disagree with no versions to interpret them,
+   * `SchemaTooOldError` when this client is below the server's supported floor (upgrade the client),
+   * and `SchemaTooNewError` when it is ahead of the server (deploy the server first).
    */
-  async handshake(fingerprint: string, ctx: Context): Promise<void> {
-    const response = await this.transport.request({ method: "handshake", params: { fingerprint } }, ctx);
-    if (!response.ok && response.error?.code === "SCHEMA_MISMATCH") {
-      throw new SchemaMismatchError(response.error.message);
+  async handshake(fingerprint: string, ctx: Context, schema?: SchemaVersioning): Promise<void> {
+    const params: SchemaAdvertisement = { fingerprint, ...(schema ?? {}) };
+    const response = await this.transport.request({ method: "handshake", params: { ...params } }, ctx);
+    if (!response.ok) {
+      const code = response.error?.code;
+      const message = response.error?.message ?? "Schema handshake failed";
+      if (code === "SCHEMA_MISMATCH") throw new SchemaMismatchError(message);
+      if (code === "SCHEMA_TOO_OLD") throw new SchemaTooOldError(message);
+      if (code === "SCHEMA_TOO_NEW") throw new SchemaTooNewError(message);
     }
     expect(response);
   }
@@ -127,11 +142,31 @@ export class RemoteBackend implements Backend {
   }
 }
 
-/** Thrown when the server's schema fingerprint doesn't match the client's. */
+/** Thrown when the two ends' schema shapes disagree and there are no versions to interpret them by. */
 export class SchemaMismatchError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "SchemaMismatchError";
+  }
+}
+
+/**
+ * Thrown when this build is below the server's supported floor — the server has already released the
+ * contracts that destroyed the shape this client still expects. The client must upgrade; there is no
+ * way for the server to serve it.
+ */
+export class SchemaTooOldError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SchemaTooOldError";
+  }
+}
+
+/** Thrown when this build is *ahead* of the server — the rollout ran backwards; the server must lead. */
+export class SchemaTooNewError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SchemaTooNewError";
   }
 }
 

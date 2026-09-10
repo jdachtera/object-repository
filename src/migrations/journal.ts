@@ -146,7 +146,10 @@ const LOG_FIELDS = [
 
 const STATE_FIELDS = [
   { name: "schemaVersion", type: "integer" },
-  { name: "minSupportedSchemaVersion", type: "integer" }
+  { name: "minSupportedSchemaVersion", type: "integer" },
+  // The migration lease shares this reserved model — see `acquireLock`.
+  { name: "owner", type: "text" },
+  { name: "expiresAt", type: "integer" }
 ];
 
 /** Ops are stored as a JSON string, so the row stays flat and every backend can hold it as text. */
@@ -187,6 +190,61 @@ function parseOps(value: unknown): MigrationOp[] {
     // recoverable ops is reported as drift by the runner rather than crashing the whole run.
     return [];
   }
+}
+
+/** The lock row's id in `SCHEMA_STATE_MODEL`. */
+export const LOCK_ID = "__lock__";
+
+/** How long a held lock stays valid before another runner may assume its holder died. */
+export const LOCK_LEASE_MS = 5 * 60_000;
+
+/**
+ * A cooperative lease preventing two runners from migrating the same store at once.
+ *
+ * Two replicas booting together both read the same pending set and both act on it. For an expand
+ * that is mostly survivable — the operations are idempotent — but a contract release is a genuine
+ * race, and concurrent DDL against one table is not something to leave to luck.
+ *
+ * Deliberately a *lease*, not a lock: a process that dies mid-migration must not wedge every future
+ * deploy, so the claim expires. That makes this cooperative rather than airtight — a runner that
+ * stalls past the lease can still overlap with its successor. It converts the common accident (two
+ * replicas booting together) into a clear refusal, and does not pretend to be a distributed lock.
+ */
+export async function acquireLock(
+  backend: Backend,
+  ctx: Context,
+  now: () => number,
+  owner: string
+): Promise<{ release(): Promise<void> } | null> {
+  // Register first: the lease lives in a reserved model, and querying it before a schema-aware
+  // backend knows its shape would provision it column-less.
+  if (isSchemaAware(backend)) await backend.registerModel(SCHEMA_STATE_MODEL, [], STATE_FIELDS);
+  const rows = await backend.query(
+    { model: SCHEMA_STATE_MODEL, where: everything(), order: [], paging: { start: 0 } },
+    ctx
+  );
+  const held = rows.find((row) => String(row.uuid) === LOCK_ID);
+  const expires = held ? Number(held.expiresAt ?? 0) : 0;
+  if (held && expires > now()) return null; // someone else holds a live lease
+
+  backend.save(SCHEMA_STATE_MODEL, { uuid: LOCK_ID, owner, expiresAt: now() + LOCK_LEASE_MS }, ctx);
+  await backend.persist(ctx);
+
+  // Read back: if another runner claimed it in the same instant, the last write wins and only that
+  // owner proceeds. Cheap, and it closes the obvious both-saw-it-free window.
+  const confirm = await backend.query(
+    { model: SCHEMA_STATE_MODEL, where: everything(), order: [], paging: { start: 0 } },
+    ctx
+  );
+  const mine = confirm.find((row) => String(row.uuid) === LOCK_ID);
+  if (!mine || String(mine.owner) !== owner) return null;
+
+  return {
+    release: async () => {
+      backend.remove(SCHEMA_STATE_MODEL, { uuid: LOCK_ID }, ctx);
+      await backend.persist(ctx);
+    }
+  };
 }
 
 /** Index the journal by `(name, phase)` for the runner's state machine. */

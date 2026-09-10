@@ -87,3 +87,4 @@ export type {
   WireError,
   WireUnsubscribe
 } from "./Transport.ts";
+export { checkSchemaCompatibility, type SchemaAdvertisement, type SchemaCompatibility } from "./schema.ts";

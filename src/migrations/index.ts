@@ -37,7 +37,7 @@ export { coerce } from "./coerce.ts";
 export { applyOp, type ExecuteOptions, type OpResult } from "./execute.ts";
 export { pageByUuid, everything, BY_UUID, type Page } from "./paging.ts";
 
-export { runMigrations, rollbackMigrations, gateOpen, type RunnerOptions } from "./run.ts";
+export { runMigrations, rollbackMigrations, gateOpen, MigrationLockedError, type RunnerOptions } from "./run.ts";
 export {
   BackendJournal,
   MIGRATION_LOG_MODEL,
@@ -45,6 +45,9 @@ export {
   SCHEMA_STATE_ID,
   indexRows,
   rowId,
+  acquireLock,
+  LOCK_ID,
+  LOCK_LEASE_MS,
   type JournalRow,
   type MigrationJournal,
   type SchemaState

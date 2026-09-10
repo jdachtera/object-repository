@@ -6,8 +6,8 @@
  */
 import { describe, it, expect } from "vitest";
 import { InMemoryBackend } from "../backends/memory/InMemoryBackend.js";
-import { runMigrations, rollbackMigrations, gateOpen } from "./run.js";
-import { BackendJournal, MIGRATION_LOG_MODEL } from "./journal.js";
+import { runMigrations, rollbackMigrations, gateOpen, MigrationLockedError } from "./run.js";
+import { BackendJournal, MIGRATION_LOG_MODEL, acquireLock, LOCK_LEASE_MS } from "./journal.js";
 import { SchemaVersionError, MigrationBlockedError } from "./errors.js";
 import { everything } from "./paging.js";
 import { SYSTEM_CONTEXT } from "../core/types.js";
@@ -347,5 +347,55 @@ describe("the deploy timeline documented in docs/MIGRATIONS.md", () => {
       { uuid: "u1", fullName: "Ann" },
       { uuid: "u2", fullName: "Bo" }
     ]);
+  });
+});
+
+describe("the migration lease", () => {
+  it("refuses a second runner while the first holds it", async () => {
+    const backend = await seeded();
+    const held = await acquireLock(backend, ctx, now, "replica-a");
+    expect(held).not.toBeNull();
+
+    // The accident this exists for: two replicas booting together, both seeing the same pending set.
+    await expect(
+      runMigrations(backend, [rename()], { models, now, schemaVersion: 7, minSupportedSchemaVersion: 5 })
+    ).rejects.toThrow(MigrationLockedError);
+
+    await held!.release();
+  });
+
+  it("releases the lease afterwards, so the next deploy is not blocked", async () => {
+    const backend = await seeded();
+    await run(backend, [rename()], { schemaVersion: 7, minSupportedSchemaVersion: 5 });
+
+    // A second run proceeds normally — the lease from the first was released.
+    const second = await run(backend, [rename()], { schemaVersion: 7, minSupportedSchemaVersion: 5 });
+    expect(second.deferred).toHaveLength(1);
+  });
+
+  it("releases the lease even when a migration throws", async () => {
+    const backend = await seeded();
+    const exploding: Migration[] = [
+      { name: "boom", up: () => { throw new Error("migration failed"); } }
+    ];
+    await expect(run(backend, exploding)).rejects.toThrow("migration failed");
+
+    // A failed deploy must not wedge every future one.
+    await expect(run(backend, [rename()], { schemaVersion: 7, minSupportedSchemaVersion: 5 })).resolves.toBeDefined();
+  });
+
+  it("lets a later runner take over an expired lease, so a dead process does not wedge deploys", async () => {
+    const backend = await seeded();
+    await acquireLock(backend, ctx, () => 0, "dead-replica"); // leased at t=0, expiring at the lease length
+
+    const afterExpiry = () => LOCK_LEASE_MS + 1;
+    const taken = await acquireLock(backend, ctx, afterExpiry, "replica-b");
+    expect(taken).not.toBeNull();
+  });
+
+  it("can be skipped by a caller that already guarantees a single runner", async () => {
+    const backend = await seeded();
+    await acquireLock(backend, ctx, now, "someone-else");
+    await expect(run(backend, [rename()], { schemaVersion: 7, minSupportedSchemaVersion: 5, skipLock: true })).resolves.toBeDefined();
   });
 });

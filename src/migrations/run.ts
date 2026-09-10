@@ -14,9 +14,10 @@ import type { Backend } from "../core/Backend.ts";
 import { isMigrationLowering } from "../core/Backend.ts";
 import type { Context } from "../core/types.ts";
 import { SYSTEM_CONTEXT } from "../core/types.ts";
+import { generateUuid } from "../core/uuid.ts";
 import { applyOp, type ExecuteOptions } from "./execute.ts";
 import { MigrationBlockedError, SchemaVersionError } from "./errors.ts";
-import { BackendJournal, indexRows, rowId, type JournalRow, type MigrationJournal, type SchemaState } from "./journal.ts";
+import { acquireLock, BackendJournal, indexRows, rowId, type JournalRow, type MigrationJournal, type SchemaState } from "./journal.ts";
 import { assertNoNarrowingRetype, downOps, opsHash, splitPhases, OpRecorder } from "./ops.ts";
 import type {
   DeferredContract,
@@ -28,7 +29,22 @@ import type {
   Phase
 } from "./types.ts";
 
+/** Thrown when another runner already holds the migration lease. */
+export class MigrationLockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MigrationLockedError";
+  }
+}
+
 export interface RunnerOptions extends MigrateOptions {
+  /**
+   * Skip the cooperative lease that stops two replicas migrating at once. Only for a caller that
+   * already guarantees a single runner (a dedicated deploy step); leaving it on is the safe default.
+   */
+  skipLock?: boolean;
+  /** Identifies this runner in the lease row. Defaults to a fresh id per call. */
+  lockOwner?: string;
   /** The build's declared schema version. `0` means ungated — today's behaviour. */
   schemaVersion?: number;
   /** Supplied for tests; defaults to the wall clock. */
@@ -60,6 +76,30 @@ export async function runMigrations(
   const ctx = options.ctx ?? SYSTEM_CONTEXT;
   const now = options.now ?? Date.now;
   const journal = options.journal ?? new BackendJournal(backend, ctx);
+
+  const lock = options.skipLock
+    ? null
+    : await acquireLock(backend, ctx, now, options.lockOwner ?? generateUuid());
+  if (!options.skipLock && !lock) {
+    throw new MigrationLockedError(
+      "Another process is already migrating this store. Run migrations from one place — a deploy step, not application startup."
+    );
+  }
+
+  try {
+    return await applyAll(backend, migrations, { ...options, ctx, now, journal });
+  } finally {
+    await lock?.release();
+  }
+}
+
+/** The body of a run, once the lease is held. */
+async function applyAll(
+  backend: Backend,
+  migrations: Migration[],
+  options: RunnerOptions & { ctx: Context; now: () => number; journal: MigrationJournal }
+): Promise<MigrationReport> {
+  const { ctx, now, journal } = options;
   const state = await resolveVersions(journal, options);
 
   const rows = indexRows(await adoptLegacyHistory(backend, journal, now));

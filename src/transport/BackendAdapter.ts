@@ -5,7 +5,8 @@ import {
   type PersistedChange,
   type Unsubscribe
 } from "../core/Backend.ts";
-import type { Context } from "../core/types.ts";
+import type { Context, SchemaVersioning } from "../core/types.ts";
+import { checkSchemaCompatibility, type SchemaAdvertisement } from "../core/schema.ts";
 import type { AggregatePlan, QueryPlan } from "../core/QueryPlan.ts";
 import { reduceAggregatePlan } from "../expressions/aggregateReduce.ts";
 import type { TransportAdapter, WireRequest, WireResponse } from "../core/Transport.ts";
@@ -41,7 +42,14 @@ export class BackendAdapter implements TransportAdapter {
      * ask for an unbounded window (`paging.end` omitted) and dump a whole model in one request; when set
      * this clamps the returned window to `start + maxPageSize`. Unset = unbounded (backward-compatible).
      */
-    private readonly maxPageSize?: number
+    private readonly maxPageSize?: number,
+    /**
+     * The server's declared schema versions. When the client advertises them too, compatibility is
+     * judged by range instead of fingerprint equality — which is what lets a client mid-way through a
+     * rolling deploy connect at all, since during a compatibility window the two ends' model
+     * definitions legitimately differ.
+     */
+    private readonly schema?: SchemaVersioning
   ) {
     this.allowedModels = allowedModels ? new Set(allowedModels) : undefined;
   }
@@ -64,14 +72,14 @@ export class BackendAdapter implements TransportAdapter {
     try {
       switch (request.method) {
         case "handshake": {
-          const { fingerprint } = request.params as unknown as { fingerprint: string };
-          if (this.schemaFingerprint !== undefined && fingerprint !== this.schemaFingerprint) {
-            return err(
-              "SCHEMA_MISMATCH",
-              `Client schema ${fingerprint} does not match server schema ${this.schemaFingerprint}.`
-            );
-          }
-          return ok({ fingerprint: this.schemaFingerprint ?? null });
+          const client = request.params as unknown as SchemaAdvertisement;
+          const server: SchemaAdvertisement = {
+            ...(this.schemaFingerprint === undefined ? {} : { fingerprint: this.schemaFingerprint }),
+            ...(this.schema ?? {})
+          };
+          const verdict = checkSchemaCompatibility(client, server);
+          if (!verdict.compatible) return err(verdict.code, verdict.message);
+          return ok({ fingerprint: this.schemaFingerprint ?? null, ...(this.schema ?? {}) });
         }
         case "query": {
           const { plan } = request.params as unknown as { plan: QueryPlan };

@@ -9,7 +9,7 @@ import type {
 } from "../core/Backend.ts";
 import { isCounting, isSchemaAware } from "../core/Backend.ts";
 import type { CountingBackend } from "../core/Backend.ts";
-import type { Capabilities, Context, JsonObject, Uuid } from "../core/types.ts";
+import type { Capabilities, Context, JsonObject, SchemaVersioning, Uuid } from "../core/types.ts";
 import {
   FIELD_VERSIONS_FIELD,
   RESERVED_RECORD_FIELDS as RESERVED,
@@ -25,6 +25,17 @@ import { HybridLogicalClock } from "./hlc.ts";
 
 /** Reserved model the durable outbox is stored under, in the local backend. */
 const OUTBOX_MODEL = "_outbox";
+
+/** Thrown when the server declines to sync with this client's schema version. */
+export class SyncSchemaError extends Error {
+  constructor(
+    readonly code: "SCHEMA_TOO_OLD" | "SCHEMA_TOO_NEW" | "SCHEMA_MISMATCH",
+    message: string
+  ) {
+    super(message);
+    this.name = "SyncSchemaError";
+  }
+}
 
 /** Last-write-wins by HLC version — the default conflict policy (ARCHITECTURE.md §9). */
 export const lastWriteWins: ConflictPolicy = (local, remote) =>
@@ -47,6 +58,11 @@ export interface SyncBackendOptions {
    * still replays already-stamped changes, so nothing is lost.)
    */
   fieldLevel?: boolean;
+  /**
+   * The schema versions this client declares. Supplying them (on both ends) lets the server refuse a
+   * client it can no longer serve, instead of the two exchanging records neither can interpret.
+   */
+  schema?: SchemaVersioning;
 }
 
 /**
@@ -70,10 +86,13 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
   private readonly conflict: ConflictPolicy;
   private readonly hlc: HybridLogicalClock;
   private readonly fieldLevel: boolean;
+  private readonly schema: SchemaVersioning | undefined;
   /** Session-scoped cache of the last-known per-field versions, keyed `model\0uuid` (field-level mode). */
   private readonly fieldVersions = new Map<string, Record<string, string>>();
 
   private cursor: SyncCursor | null = null;
+  /** The handshake is a per-session check, not a per-reconcile one. */
+  private schemaChecked = false;
 
   constructor(options: SyncBackendOptions) {
     this.local = options.local;
@@ -81,6 +100,7 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
     this.conflict = options.conflict ?? lastWriteWins;
     this.hlc = new HybridLogicalClock(options.nodeId ?? generateUuid().slice(0, 8));
     this.fieldLevel = options.fieldLevel ?? false;
+    this.schema = options.schema;
     this.capabilities = this.local.capabilities;
     if (isSchemaAware(this.local)) this.local.registerModel(OUTBOX_MODEL, []);
   }
@@ -166,8 +186,26 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
 
   /** Pull remote changes (merging by conflict policy) then push the local outbox. */
   async reconcile(ctx: Context): Promise<void> {
+    await this.assertSchemaCompatible(ctx);
     await this.pull(ctx);
     await this.push(ctx);
+  }
+
+  /**
+   * Refuse to sync a client the server can no longer serve (ARCHITECTURE.md §13).
+   *
+   * Checked once per session, before the first exchange, because the alternative is silent: a client
+   * months out of date would pull records in a shape it cannot interpret and push records the server
+   * no longer understands, and nothing would say so. A target with no `handshake` — or a server too
+   * old to answer it — is treated as unchecked, so this can be deployed to either end first.
+   */
+  private async assertSchemaCompatible(ctx: Context): Promise<void> {
+    if (this.schemaChecked || !this.remote.handshake) return;
+    const verdict = await this.remote.handshake({ ...(this.schema ?? {}) }, ctx);
+    // Only a *pass* is remembered. Caching a refusal would let the very next `reconcile` skip the
+    // check and sync anyway — the refusal has to hold for the life of the session.
+    if (!verdict.compatible) throw new SyncSchemaError(verdict.code, verdict.message);
+    this.schemaChecked = true;
   }
 
   private async pull(ctx: Context): Promise<void> {

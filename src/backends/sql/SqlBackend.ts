@@ -64,6 +64,13 @@ const TOP = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** Rows per multi-row statement — bounded so `rows × columns` params stay well under driver limits. */
 const MAX_BATCH_ROWS = 500;
 
+/** Do two declared field sets describe the same columns? */
+function sameFields(a: FieldSpec[], b: FieldSpec[]): boolean {
+  if (a.length !== b.length) return false;
+  const byName = new Map(a.map((field) => [field.name, field.type]));
+  return b.every((field) => byName.get(field.name) === field.type);
+}
+
 /** Group persisted changes by model, preserving first-seen order. */
 function groupByModel(changes: PersistedChange[]): Map<string, PersistedChange[]> {
   const groups = new Map<string, PersistedChange[]>();
@@ -134,6 +141,11 @@ export class SqlBackend
   }
 
   async registerModel(model: string, indexes: IndexSpec[], fields: FieldSpec[] = []): Promise<void> {
+    // Provisioning is memoized per model, so a *re-registration* that widens the declared field set
+    // would otherwise update the field list without ever creating the columns — and every subsequent
+    // query would then name a column that isn't there. Drop the memo when the shape actually changes.
+    const previous = this.schemas.get(model);
+    if (previous && !sameFields(previous, fields)) this.provisioned.delete(model);
     this.schemas.set(model, fields);
     this.indexes.set(model, indexes);
     await this.ensure(model);

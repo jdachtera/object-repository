@@ -372,4 +372,14 @@ fresher. Queries naming the canonical field are rewritten to name the legacy one
 substitution, which is exact for every comparator and preserves index push-down, where a coalesce would
 downgrade a comparison to an opaque computed expression and lose the index.
 
+**Across a connection, versions replace fingerprint equality.** §4 compares a schema fingerprint at
+connect time to turn silent client/server drift into a clear error. Equality is the wrong test once
+windows exist, because a window is *defined by* the two ends differing — it would refuse exactly the
+deploys the gate makes safe. So when both ends advertise a version (`src/core/schema.ts`), the server
+serves any client from its floor up to its own version and the fingerprint becomes advisory; when
+either end declares none, equality still rules and nothing changes for anyone not using versions. The
+same check runs on the sync path, once per session, so a long-offline client is told to upgrade rather
+than silently exchanging records neither side can interpret. The server must lead a rollout: a client
+ahead of the server is refused.
+
 See [docs/MIGRATIONS.md](docs/MIGRATIONS.md) for the operator's guide.

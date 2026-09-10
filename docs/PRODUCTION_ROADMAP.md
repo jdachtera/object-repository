@@ -31,10 +31,16 @@ access. The **command plane** (task-based RPC for non-CRUD verbs) now rides the 
       store and writes nothing, printing what would run and what a release would destroy. An existing
       `_object_repository_migrations` table is adopted rather than re-run. See ARCHITECTURE.md §13 and
       docs/MIGRATIONS.md.
+      Client/server skew is handled: when both ends advertise a schema version the handshake judges
+      compatibility by range instead of fingerprint equality (equality refuses exactly the deploys a
+      window exists to permit), with `SCHEMA_TOO_OLD`/`SCHEMA_TOO_NEW` naming the remedy; the same
+      check runs once per session on the sync path. `migrate()` takes a cooperative lease so two
+      replicas booting together cannot both migrate.
       *Known gaps, deliberately out of scope here:* `define()`-time provisioning still creates unique
-      indexes outside the gate; there is no lock, so two replicas migrating concurrently both act; and
-      client-side lazy migration plus sync schema-version negotiation are not built (the capability
-      reserves `applySchemaOps` as a batch so that stays additive).
+      indexes outside the gate; the migration lease expires, so a runner that stalls past it can still
+      overlap with its successor; and client-side lazy migration is not built — a client cannot yet
+      migrate its own local store on open, nor rewrite outbox entries queued in a pre-migration shape
+      (the capability reserves `applySchemaOps` as a batch so that stays additive).
 - [x] **Durable sync server + transport bridge.** The offline-first stack now runs against a real store
       end to end, not just the in-memory reference. `BackendSyncTarget` persists the append-only
       changelog / LWW protocol in an injected `Backend` (SQLite/Postgres/MySQL/Mongo), re-seeding its

@@ -149,6 +149,52 @@ Every operation works everywhere. This is only about how:
 | IndexedDB | — | everything |
 | in-memory | — | everything, deliberately: it is the reference the others are compared against |
 
+## Client and server
+
+A client and server running different builds is the normal state during a rolling deploy — and the
+whole reason the gate exists. Both ends declare their versions, and the connection is checked before
+any data moves.
+
+```ts
+// server
+new BackendAdapter(backend, manager.fingerprint(), commands, allowed, maxPage,
+  { schemaVersion: 7, minSupportedSchemaVersion: 5 });
+
+// client
+await remote.handshake(manager.fingerprint(), ctx, { schemaVersion: 6 });
+```
+
+When **both** ends advertise a version, compatibility is judged by range and the schema fingerprint
+becomes advisory — during a window the two ends' model definitions differ on purpose, so equality
+would refuse precisely the deploy this mechanism makes safe. When either end declares no version, the
+fingerprint is all there is and equality still rules, exactly as before.
+
+| situation | result |
+|---|---|
+| client within `[minSupported, schemaVersion]` | connects |
+| client below the floor | `SchemaTooOldError` — the client must upgrade |
+| client ahead of the server | `SchemaTooNewError` — deploy the server first; it must lead |
+| no versions, shapes differ | `SchemaMismatchError`, as before |
+
+The same check runs on the sync path. `SyncBackend` handshakes once per session before its first
+exchange and throws `SyncSchemaError` if refused, so a long-offline client discovers it must upgrade
+instead of silently trading records neither side understands. A server too old to know the method
+answers `UNSUPPORTED_METHOD`, which reads as unchecked — so this can be deployed to either end first.
+
+**Deployment order matters: the server leads.** It must be running the new version, with the floor
+still low enough to serve the old clients, before any client updates.
+
+## Concurrency
+
+`migrate()` takes a cooperative lease so two replicas booting together cannot both migrate — the
+second gets `MigrationLockedError`. It is a *lease*, not a lock: it expires, so a process that dies
+mid-migration does not wedge every future deploy. That also means it is not airtight — a runner that
+stalls past the lease can still overlap with its successor. It converts the common accident into a
+clear refusal and does not pretend to be a distributed lock.
+
+Run migrations from **one place** — a deploy step, not application startup. Pass `skipLock: true` only
+if you already guarantee that.
+
 ## What this does not protect you from
 
 Stated plainly, because a safety mechanism you misunderstand is worse than none.
@@ -166,8 +212,8 @@ Stated plainly, because a safety mechanism you misunderstand is worse than none.
 5. **Field-level sync during a window.** `mergeByField` compares per-field versions independently, so a
    two-writer merge can briefly pick the legacy half from one replica and the canonical half from
    another. It self-heals on the next full write through the Repository, but it is not atomic.
-6. **Concurrent migration runs.** Two replicas booting at once will both see the same pending set and
-   both act on it. Run migrations from one place — a deploy step, not application startup.
+6. **A runner that stalls past its lease.** The lease expires so a dead process cannot wedge deploys,
+   which means a *very* slow one can still overlap with its successor. Run migrations from one place.
 7. **`unique` on the canonical half of a window.** Refused at `define()`: two constraints over one
    logical value double-report, and the legacy half carries the constraint until the contract runs.
 8. **Chained windows** (`a → b` and `b → c` open at once). Refused. Close one before opening the next.
