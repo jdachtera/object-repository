@@ -291,7 +291,16 @@ export function scalar<Runtime, Stored extends JsonValue>(
   codec: Codec<Runtime, Stored>,
   options: ScalarOptions<Runtime> = {}
 ): ScalarProperty<Runtime, Stored> {
-  return new ScalarProperty({ schema, codec, unique: options.unique, index: options.index, required: options.required, default: options.default });
+  return new ScalarProperty({
+    schema,
+    codec,
+    unique: options.unique,
+    index: options.index,
+    required: options.required,
+    default: options.default,
+    deprecatedSince: options.deprecatedSince,
+    mirrors: options.mirrors
+  });
 }
 
 // --- computed / virtual fields ------------------------------------------------------------

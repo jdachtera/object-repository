@@ -1,6 +1,8 @@
 import type { Backend, IndexSpec, IndexField, FieldSpec } from "../core/Backend.ts";
-import { isRawQueryable, isSchemaAware, isTransactional } from "../core/Backend.ts";
+import { isRawQueryable, isSchemaAware, isTransactional, migrationTarget } from "../core/Backend.ts";
 import { runMigrations, rollbackMigrations, type RunnerOptions } from "../migrations/run.ts";
+import { BackendJournal } from "../migrations/journal.ts";
+import { WindowState } from "./windowState.ts";
 import { planMigrations } from "../migrations/plan.ts";
 import type { MigrateOptions, Migration, MigrationPlan, MigrationReport } from "../migrations/types.ts";
 import { commandClient, isChangeDeliverable, type CommandClient, type CommandMap } from "../transport/command.ts";
@@ -120,6 +122,9 @@ export class RepositoryManager {
   >();
   /** Shared with every repository so an immediately-persisting write can refuse to escape a transaction. */
   private readonly txState: TransactionState = { mode: "none" };
+  /** Which compatibility windows the store says have closed — read once a model declares one. */
+  private readonly windows = new WindowState();
+  private windowsLoaded = false;
 
   constructor(options: RepositoryManagerOptions = {}) {
     this.backend = options.backend ?? new InMemoryBackend();
@@ -150,7 +155,8 @@ export class RepositoryManager {
       config.timestamps ? TIMESTAMP_FIELDS : null,
       softDelete,
       this.generateId,
-      { state: this.txState, scoped: false }
+      { state: this.txState, scoped: false },
+      this.windows
     );
     // Registered by name so relations resolve their target regardless of definition order.
     this.registry.set(config.name, repository);
@@ -162,12 +168,15 @@ export class RepositoryManager {
     });
 
     // Let schema-aware backends (IndexedDB, SQL) provision stores/indexes/columns from the metadata.
-    if (isSchemaAware(this.backend)) {
-      void this.backend.registerModel(
-        config.name,
-        indexSpecs(typed, config.indexes),
-        fieldSpecs(typed, this.schema?.minSupportedSchemaVersion ?? 0)
-      );
+    // Registered now, with every window open, so a write issued before the journal is read still
+    // lands in real columns; re-registered below once any window turns out to be closed.
+    this.register(config.name);
+    if (declaresWindow(typed) && !this.windowsLoaded) {
+      this.windowsLoaded = true;
+      this.windows.ready = this.refreshSchemaState().catch(() => {
+        // An unreadable journal leaves every window open: right until the contract runs, and the
+        // same state this process would have without the journal at all.
+      });
     }
 
     return repository;
@@ -239,7 +248,7 @@ export class RepositoryManager {
     for (const [name, def] of this.defs) {
       registry.set(
         name,
-        new Repository(name, def.properties, backend, this.ctx, resolve, def.timestamps, def.softDelete, this.generateId, { state: this.txState, scoped: true })
+        new Repository(name, def.properties, backend, this.ctx, resolve, def.timestamps, def.softDelete, this.generateId, { state: this.txState, scoped: true }, this.windows)
       );
     }
     const scope: TransactionScope = {
@@ -292,7 +301,37 @@ export class RepositoryManager {
    * `releasable` lists rather than running.
    */
   async migrate(migrations: Migration[], options: MigrateOptions = {}): Promise<MigrationReport> {
-    return runMigrations(this.backend, migrations, this.runnerOptions(options));
+    try {
+      return await runMigrations(this.backend, migrations, this.runnerOptions(options));
+    } finally {
+      if (this.windowsLoaded) await this.refreshSchemaState().catch(() => {});
+    }
+  }
+
+  /**
+   * Re-read which compatibility windows the store has closed (their contract has run), and stop
+   * mirroring those. `migrate()` and `rollback()` do this for their own process; a long-running
+   * process whose store was migrated by another (a deploy step releasing a contract) calls it to pick
+   * the change up, or is restarted without the retired property.
+   */
+  async refreshSchemaState(): Promise<void> {
+    const rows = await new BackendJournal(migrationTarget(this.backend), this.ctx).load();
+    const changed = this.windows.update(rows);
+    for (const model of changed) {
+      this.register(model);
+      this.registry.get(model)?.windowsChanged();
+    }
+  }
+
+  /** (Re-)register a model's layout under the current window state. */
+  private register(model: string): void {
+    const def = this.defs.get(model);
+    if (!def || !isSchemaAware(this.backend)) return;
+    void this.backend.registerModel(
+      model,
+      indexSpecs(def.properties, def.indexes),
+      fieldSpecs(def.properties, (legacy) => this.windows.isClosed(model, legacy))
+    );
   }
 
   /**
@@ -302,7 +341,11 @@ export class RepositoryManager {
    * destroyed data a `down` cannot restore — re-creating a dropped column hands back an empty one.
    */
   async rollback(migrations: Migration[], count = 1, options: MigrateOptions = {}): Promise<MigrationReport> {
-    return rollbackMigrations(this.backend, migrations, count, this.runnerOptions(options));
+    try {
+      return await rollbackMigrations(this.backend, migrations, count, this.runnerOptions(options));
+    } finally {
+      if (this.windowsLoaded) await this.refreshSchemaState().catch(() => {});
+    }
   }
 
   /**
@@ -323,7 +366,7 @@ export class RepositoryManager {
     const models: Record<string, { fields: FieldSpec[]; indexes: IndexSpec[] }> = {};
     for (const [name, def] of this.defs) {
       models[name] = {
-        fields: fieldSpecs(def.properties, this.schema?.minSupportedSchemaVersion ?? 0),
+        fields: fieldSpecs(def.properties, (legacy) => this.windows.isClosed(name, legacy)),
         indexes: indexSpecs(def.properties, def.indexes)
       };
     }
@@ -384,24 +427,27 @@ function withSoftDelete(properties: PropertyMap, field: string): PropertyMap {
   return { ...properties, [field]: softDeleteMarker() };
 }
 
-/** The scalar columns of a model (name + stored-type tag), in declaration order — for columnar backends. */
 /**
- * The scalar columns a backend should provision.
+ * The scalar columns a backend should provision, in declaration order.
  *
- * A property whose `deprecatedSince` the floor has already passed is omitted. That is what stops the
- * additive auto-provisioner from re-creating a column a contract operation just dropped — the two
- * would otherwise fight, with provisioning winning on the next `define()` and quietly resurrecting
- * the field as an empty column.
+ * The legacy half of a compatibility window is omitted once that window is `closed` — its contract
+ * has dropped the field. Not when the floor is raised: until the release re-copies it, the legacy
+ * column is the authoritative copy, and leaving it out of the layout would send every write-through
+ * to the JSON overflow while the column itself goes stale.
  */
-function fieldSpecs(properties: PropertyMap, minSupported = 0): FieldSpec[] {
+function fieldSpecs(properties: PropertyMap, closed: (legacy: string) => boolean = () => false): FieldSpec[] {
   const fields: FieldSpec[] = [];
   for (const name of Object.keys(properties)) {
     const property = properties[name] as AnyProperty;
     if (property.kind !== "scalar") continue;
-    if (property.deprecatedSince !== undefined && property.deprecatedSince <= minSupported) continue;
+    if (property.mirrors && closed(name)) continue;
     fields.push({ name, type: property.type });
   }
   return fields;
+}
+
+function declaresWindow(properties: PropertyMap): boolean {
+  return Object.values(properties).some((property) => (property as AnyProperty).kind === "scalar" && Boolean((property as ScalarProperty<unknown>).mirrors));
 }
 
 /**

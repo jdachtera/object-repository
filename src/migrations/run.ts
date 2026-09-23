@@ -78,8 +78,9 @@ export async function runMigrations(
   const now = options.now ?? Date.now;
   const journal = options.journal ?? new BackendJournal(store, ctx);
 
-  return withLease(store, ctx, now, options, (lease, registered) =>
-    applyAll(store, migrations, { ...options, ctx, now, journal, lease, registered })
+  const models = { ...(options.models ?? {}) }; // followed as ops run; the caller's copy is untouched
+  return withLease(store, ctx, now, { ...options, models }, (lease, registered) =>
+    applyAll(store, migrations, { ...options, models, ctx, now, journal, lease, registered })
   );
 }
 
@@ -232,8 +233,9 @@ export async function rollbackMigrations(
   const journal = options.journal ?? new BackendJournal(store, ctx);
   // A rollback rewrites the store exactly as a run does, so it takes the same lease: a rollback racing
   // a deploy's migrate would otherwise interleave with it.
-  return withLease(store, ctx, now, options, (lease, registered) =>
-    rollbackAll(store, migrations, count, { ...options, ctx, now, journal, lease, registered })
+  const models = { ...(options.models ?? {}) };
+  return withLease(store, ctx, now, { ...options, models }, (lease, registered) =>
+    rollbackAll(store, migrations, count, { ...options, models, ctx, now, journal, lease, registered })
   );
 }
 
@@ -468,7 +470,10 @@ async function executeOps(
   for (let index = resume?.op ?? 0; index < ops.length; index++) {
     const op = ops[index]!;
     const lowered = isMigrationLowering(backend) ? await backend.lowerMigrationOp(op, options.ctx) : null;
-    if (lowered) continue; // the backend did it natively — same effect, lower cost
+    if (lowered) {
+      followLayout(options, op);
+      continue; // the backend did it natively — same effect, lower cost
+    }
 
     const { checkpoint, heartbeat } = typeof hooks === "function" ? hooks(index) : hooks;
     let cursor = "";
@@ -493,6 +498,29 @@ async function executeOps(
       ...(heartbeat ? { heartbeat: () => heartbeat(cursor) } : {}),
       registered: options.registered
     });
+    followLayout(options, op);
+  }
+}
+
+/**
+ * Keep the run's model layouts in step with the ops it has applied. The layouts come from the
+ * application's model definitions, which still declare a field a contract has just dropped; handed
+ * to a later registration unchanged, the additive provisioner would re-create that column, empty.
+ */
+function followLayout(options: Running, op: MigrationOp): void {
+  if (!("model" in op) || !options.models?.[op.model]) return;
+  const layout = options.models[op.model]!;
+  if (op.kind === "dropModel") {
+    delete options.models[op.model];
+  } else if (op.kind === "dropField") {
+    options.models[op.model] = { ...layout, fields: layout.fields.filter((field) => field.name !== op.field) };
+  } else if (op.kind === "renameField") {
+    options.models[op.model] = {
+      ...layout,
+      fields: layout.fields
+        .filter((field) => field.name !== op.to)
+        .map((field) => (field.name === op.from ? { ...field, name: op.to } : field))
+    };
   }
 }
 

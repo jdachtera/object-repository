@@ -11,11 +11,15 @@ import { SQLiteBackend } from "../backends/sqlite/SQLiteBackend.js";
 import { RepositoryManager } from "./RepositoryManager.js";
 import { text } from "../properties/factories.js";
 import { eq, neq, and, or, field } from "../expressions/index.js";
+import { set } from "./patch.js";
 import { SYSTEM_CONTEXT } from "../core/types.js";
 import type { Backend, FieldSpec } from "../core/Backend.js";
 import type { QueryPlan, ExpressionNode } from "../core/QueryPlan.js";
 import type { Context, JsonObject } from "../core/types.js";
 import { substituteNode, substituteValue, substituteAggregate, substituteWindow, substitutePlan } from "./mirror.js";
+import { newDb } from "pg-mem";
+import { PostgresBackend } from "../backends/sql/PostgresBackend.js";
+import type { MigrationBuilder } from "../migrations/types.js";
 
 const ctx = SYSTEM_CONTEXT;
 const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
@@ -39,7 +43,14 @@ const newBuild = (backend: Backend) =>
 
 const BACKENDS: Array<[string, () => Backend]> = [
   ["InMemory", () => new InMemoryBackend()],
-  ["SQLite", () => new SQLiteBackend(new DatabaseSync(":memory:"))]
+  ["SQLite", () => new SQLiteBackend(new DatabaseSync(":memory:"))],
+  [
+    "Postgres (pg-mem)",
+    () => {
+      const { Pool } = newDb().adapters.createPg();
+      return new PostgresBackend(new Pool());
+    }
+  ]
 ];
 
 describe("both generations converge on the same value", () => {
@@ -190,37 +201,79 @@ describe("every plan-taking entry point substitutes, not just the filter", () =>
   });
 });
 
-describe("a retired field goes inert once the floor passes it", () => {
-  it("stops being provisioned, so the auto-provisioner cannot resurrect a dropped column", async () => {
-    const registered: FieldSpec[][] = [];
-    const backend = Object.assign(new InMemoryBackend(), {
-      registerModel: (_model: string, _indexes: unknown[], fields?: FieldSpec[]) => {
-        registered.push(fields ?? []);
-      }
-    }) as unknown as Backend;
-
-    // Window closed: minSupported has reached the version at which `name` was deprecated.
-    new RepositoryManager({ backend, schema: { schemaVersion: 7, minSupportedSchemaVersion: 7 } }).define({
+describe("a window closes when its contract runs — not when the floor rises", () => {
+  const rename = { name: "0012_fullname", schemaVersion: 7, up: (m: MigrationBuilder) => m.renameField("User", "name", "fullName", "text") };
+  const build = (backend: Backend, minSupportedSchemaVersion: number) => {
+    const orm = new RepositoryManager({ backend, schema: { schemaVersion: 7, minSupportedSchemaVersion } });
+    const users = orm.define({
       name: "User",
       properties: { fullName: text(), name: text({ deprecatedSince: 7, mirrors: "fullName" }) }
     });
+    return { orm, users };
+  };
+  const STORES: Array<[string, () => Backend]> = [
+    ["InMemory", () => new InMemoryBackend()],
+    ["SQLite", () => new SQLiteBackend(new DatabaseSync(":memory:"))],
+    [
+      "Postgres (pg-mem)",
+      () => {
+        const { Pool } = newDb().adapters.createPg();
+        return new PostgresBackend(new Pool());
+      }
+    ]
+  ];
 
-    expect(registered[0]!.map((field) => field.name)).toEqual(["fullName"]);
+  it.each(STORES)("follows the documented timeline without losing a write (%s)", async (_name, make) => {
+    const backend = make();
+    // 0. The old build's data.
+    const before = new RepositoryManager({ backend }).define({ name: "User", properties: { name: text() } });
+    await before.save(before.createInstance({ name: "Ann" })).persist();
+
+    // 1. Ship the migration: expand only.
+    const step1 = build(backend, 5);
+    await step1.orm.migrate([rename]);
+
+    // 3. Raise the floor. The contract is permitted but hasn't run, so the legacy field is still the
+    //    authoritative copy — a write made now must land in it, or the release re-copies over it.
+    const step3 = build(backend, 7);
+    await step3.orm.migrate([rename]);
+    const [ann] = await step3.users.all().list();
+    ann!.fullName = "Ann Lee";
+    await step3.users.save(ann!).persist();
+
+    // 4. Release it, deliberately.
+    const report = await step3.orm.migrate([rename], { applyContracts: true });
+    expect(report.contracted).toEqual(["0012_fullname"]);
+
+    // The same process now treats the window as closed: canonical reads, no resurrection.
+    expect((await step3.users.all().filter(eq("fullName", "Ann Lee")).list()).map((u) => u.fullName)).toEqual(["Ann Lee"]);
+    const [again] = await step3.users.all().list();
+    again!.fullName = "Ann Lee-Smith";
+    await step3.users.save(again!).persist();
+    const [row] = await backend.query({ model: "User", where: { type: "all" }, order: [], paging: { start: 0 } }, ctx);
+    expect(row).toMatchObject({ fullName: "Ann Lee-Smith" });
+    expect(row!.name ?? null).toBeNull(); // the dropped field stays dropped
+    if (backend instanceof PostgresBackend) {
+      const columns = await backend.raw(
+        { sql: `SELECT column_name FROM information_schema.columns WHERE table_name = $1`, params: ["User"] },
+        ctx
+      );
+      expect(columns.map((c) => c.column_name)).not.toContain("name"); // not re-provisioned, empty
+    }
+
+    // A fresh process that still declares the property learns the window is closed from the journal.
+    const restarted = build(backend, 7);
+    expect((await restarted.users.all().filter(eq("fullName", "Ann Lee-Smith")).list())).toHaveLength(1);
   });
 
-  it("still provisions it while the window is open", async () => {
+  it("provisions the legacy column while the window is open, whatever the floor", async () => {
     const registered: FieldSpec[][] = [];
     const backend = Object.assign(new InMemoryBackend(), {
       registerModel: (_model: string, _indexes: unknown[], fields?: FieldSpec[]) => {
         registered.push(fields ?? []);
       }
     }) as unknown as Backend;
-
-    new RepositoryManager({ backend, schema: { schemaVersion: 7, minSupportedSchemaVersion: 5 } }).define({
-      name: "User",
-      properties: { fullName: text(), name: text({ deprecatedSince: 7, mirrors: "fullName" }) }
-    });
-
+    build(backend, 7);
     expect(registered[0]!.map((field) => field.name).sort()).toEqual(["fullName", "name"]);
   });
 });
@@ -338,5 +391,71 @@ describe("substitution reaches every corner of a plan", () => {
     expect(substituteValue(field("fullName").serialize(), empty)).toBeDefined();
     const plan = { model: "User", where, order: [], paging: { start: 0 } };
     expect(substitutePlan(plan, empty)).toBe(plan);
+  });
+});
+
+describe("writes through either name stay in step", () => {
+  for (const [label, make] of BACKENDS) {
+    it(`${label}: an old build clearing the field is not undone by the new build's next save`, async () => {
+      const backend = make();
+      const current = newBuild(backend);
+      current.save(current.createInstance({ uuid: "u1", fullName: "Ann", ...({} as object) }));
+      await current.persist();
+
+      const legacy = oldBuild(backend);
+      const record = (await legacy.get("u1"))!;
+      record.name = null as unknown as string;
+      legacy.save(record);
+      await legacy.persist();
+
+      const reread = newBuild(backend);
+      const user = (await reread.get("u1"))!;
+      expect(user.fullName ?? null).toBeNull();
+      reread.save(user); // an unrelated save must not resurrect "Ann"
+      await reread.persist();
+      expect((await oldBuild(backend).get("u1"))!.name ?? null).toBeNull();
+    });
+
+    it(`${label}: clearing the canonical field clears the legacy one`, async () => {
+      const backend = make();
+      const current = newBuild(backend);
+      current.save(current.createInstance({ uuid: "u1", fullName: "Ann" }));
+      await current.persist();
+
+      const later = newBuild(backend); // a fresh process: the loaded instance carries both halves
+      const user = (await later.get("u1"))!;
+      delete (user as { fullName?: string }).fullName;
+      later.save(user);
+      await later.persist();
+      expect((await oldBuild(backend).get("u1"))!.name ?? null).toBeNull();
+    });
+
+    it(`${label}: patchWhere and upsert find rows by the canonical name`, async () => {
+      const backend = make();
+      const legacy = oldBuild(backend);
+      legacy.save(legacy.createInstance({ uuid: "u1", name: "Ann" }));
+      await legacy.persist();
+
+      const current = newBuild(backend);
+      expect(await current.patchWhere(eq("fullName", "Ann"), { fullName: set("Ann Lee") })).toBe(1);
+      expect((await oldBuild(backend).get("u1"))!.name).toBe("Ann Lee"); // the patch reached the legacy half
+
+      const matched = await current.upsert(eq("fullName", "Ann Lee"), { set: { fullName: "Ann Lee" } });
+      expect(matched.uuid).toBe("u1"); // matched the old build's row rather than inserting a duplicate
+      expect(await current.all().count()).toBe(1);
+
+      const inserted = await current.upsert(eq("fullName", "Cy"), { setOnInsert: { fullName: "Cy" } });
+      expect((await oldBuild(backend).get(inserted.uuid))!.name).toBe("Cy"); // written through on insert
+    });
+  }
+
+  it("a required legacy half is satisfied by a write through the canonical name", async () => {
+    const orm = new RepositoryManager({ backend: new InMemoryBackend(), schema: { schemaVersion: 7, minSupportedSchemaVersion: 5 } });
+    const users = orm.define({
+      name: "User",
+      properties: { fullName: text(), name: text({ required: true, deprecatedSince: 7, mirrors: "fullName" }) }
+    });
+    users.save(users.createInstance({ fullName: "Ann" }));
+    await expect(users.persist()).resolves.toBeDefined();
   });
 });

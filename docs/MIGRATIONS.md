@@ -100,8 +100,15 @@ report.contracted;   // [] — still nothing destroyed
 await orm.migrate(migrations, { applyContracts: true });
 ```
 
-The legacy values are re-copied and the column is dropped. Delete the deprecated property from the
-model; it has already stopped being provisioned, so the auto-provisioner will not recreate it.
+The legacy values are re-copied and the column is dropped. That, not raising the floor, is what
+closes the window. Until the release the legacy field is still the authoritative copy, so every write
+keeps going to it, and the release's re-copy picks up everything written in between.
+
+Once the contract has run, the process that ran it stops mirroring immediately: reads use the
+canonical field, writes stop writing the legacy one, and the legacy column is no longer provisioned. A
+process started later learns this from the journal when it first defines the model. A process that was
+already running when another one released the contract picks it up with `orm.refreshSchemaState()`,
+or on restart. Then delete the deprecated property from the model.
 
 A migration whose gate is open *and* whose contracts are being applied in the same run skips the
 split. It runs whole, in the order written, so SQL keeps its O(1) `RENAME COLUMN`. It is reported
@@ -276,8 +283,9 @@ Stated plainly, because a safety mechanism you misunderstand is worse than none.
 3. **Non-library readers during a window.** The *legacy* column is the source of truth while the window
    is open. BI tools, reporting replicas and hand-written SQL must read that one. `plan()` prints the
    exact field pair. This is the real cost of the design, and it is deliberate.
-4. **`patch` on a mirrored field.** Patches bypass the property codec layer, so a patch names storage
-   directly — patch the legacy field while the window is open.
+4. **A process that outlives a release it didn't run.** It keeps mirroring into the dropped legacy
+   field until it calls `orm.refreshSchemaState()` or restarts. Refresh or restart app servers after a
+   release.
 5. **Field-level sync during a window.** `mergeByField` compares per-field versions independently, so a
    two-writer merge can briefly pick the legacy half from one replica and the canonical half from
    another. It self-heals on the next full write through the Repository, but it is not atomic.

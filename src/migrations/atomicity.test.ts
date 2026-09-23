@@ -345,6 +345,28 @@ describe("a phase on a transactional store", () => {
     expect(await new BackendJournal(backend, ctx).load()).toEqual([]);
   });
 
+  it("doesn't re-provision a column a contract dropped earlier in the same run", async () => {
+    const backend = pgBackend();
+    await backend.registerModel("Person", [], personModels.Person.fields);
+    backend.save("Person", { uuid: "p1", name: "Ann", tier: "gold" }, ctx);
+    await backend.persist(ctx);
+
+    const migration: Migration = {
+      name: "0034_drop_tier",
+      transforms: { touch: (row: JsonObject) => ({ ...row, name: String(row.name).toUpperCase() }) },
+      up: (m) => {
+        m.dropField("Person", "tier"); // lowered: ALTER TABLE … DROP COLUMN
+        m.transform("Person", "touch", ["name"]); // generic: re-registers the model's layout
+      }
+    };
+    await runMigrations(backend, [migration], { models: personModels }); // the layout still lists `tier`
+    const columns = await backend.raw(
+      { sql: `SELECT column_name FROM information_schema.columns WHERE table_name = $1`, params: ["Person"] },
+      ctx
+    );
+    expect(columns.map((row) => row.column_name)).not.toContain("tier");
+  });
+
   it("adds a field that define() already provisioned", async () => {
     const backend = pgBackend();
     await backend.registerModel("Person", [], personModels.Person.fields); // auto-provisioned, tier included
