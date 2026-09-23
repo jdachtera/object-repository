@@ -43,13 +43,14 @@ export class OpRecorder implements MigrationBuilder {
   dropIndex(model: string, name: string): void {
     this.ops.push({ kind: "dropIndex", model, index: name });
   }
-  transform(model: string, transformId: string, fields: string[], where?: Expression): void {
+  transform(model: string, transformId: string, fields: string[], where?: Expression, options?: { phase?: Phase }): void {
     this.ops.push({
       kind: "transform",
       model,
       transform: transformId,
       fields,
-      ...(where ? { where: where.serialize() } : {})
+      ...(where ? { where: where.serialize() } : {}),
+      ...(options?.phase ? { phase: options.phase } : {})
     });
   }
   sql(statement: string, params: JsonValue[] = [], options?: { phase?: Phase }): void {
@@ -132,6 +133,11 @@ export function isWidening(from: StoredType, to: StoredType): boolean {
  * build is entitled to make, and on IndexedDB a unique index over already-duplicate data aborts the
  * versionchange transaction, which surfaces through the open request and bricks the local database.
  *
+ * A copy that overwrites is `contract`: it clobbers whatever the target field already holds.
+ *
+ * A transform is `contract` unless its author declared it `expand`. It can delete a record or
+ * overwrite a value, and only running it would tell which.
+ *
  * A raw statement defaults to `expand` because the documented use is a backfill; defaulting it to
  * `contract` would silently stop running every backfill in every existing migration.
  */
@@ -139,9 +145,11 @@ export function classify(op: MigrationOp): Phase {
   switch (op.kind) {
     case "createModel":
     case "addField":
-    case "copyField":
-    case "transform":
       return "expand";
+    case "copyField":
+      return op.overwrite ? "contract" : "expand";
+    case "transform":
+      return op.phase ?? "contract";
     case "retypeField":
       // An unstated `from` (the legacy alias) can't be judged, so it keeps its historical behaviour
       // of simply applying rather than being withheld as destructive.
@@ -164,18 +172,11 @@ export function classify(op: MigrationOp): Phase {
   }
 }
 
-/**
- * Record a migration's ops and split them by phase.
- *
- * `gateOpen` says whether this migration's contract may run in the same pass as its expand — i.e. no
- * compatibility window was requested. When it is open, an adjacent `copyField(overwrite:false)` +
- * `dropField` pair fuses back into a single `renameField`, so SQL keeps its O(1) metadata rename
- * rather than rewriting every row. Closing the window is what costs the fast path, and only then.
- */
-export async function phaseOps(migration: Migration, gateOpen: boolean): Promise<PhasedOps> {
+/** Record a migration's ops and split them by phase. See `splitPhases` for `whole`. */
+export async function phaseOps(migration: Migration, whole: boolean): Promise<PhasedOps> {
   const recorder = new OpRecorder();
   await migration.up(recorder);
-  return splitPhases(recorder.ops, gateOpen);
+  return splitPhases(recorder.ops, whole);
 }
 
 /**
@@ -192,12 +193,17 @@ export async function downOps(migration: Migration): Promise<MigrationOp[]> {
   return recorder.ops;
 }
 
-/** Desugar and classify, unless the whole migration runs in one pass. Exported for tests. */
-export function splitPhases(ops: MigrationOp[], gateOpen: boolean): PhasedOps {
-  // Gate already open — no compatibility window was requested, so everything runs now and a
-  // `renameField` stays whole, letting SQL do it as an O(1) metadata rename instead of rewriting
-  // every row. Closing the window is what costs that fast path, and only then.
-  if (gateOpen) return { expand: [...ops], contract: [] };
+/**
+ * Desugar and classify, unless the whole migration runs in one pass. Exported for tests.
+ *
+ * `whole` is true only when both halves are going to run right now anyway: an ungated migration, or a
+ * gated one whose gate is open *and* whose contracts the caller asked to apply. Then a `renameField`
+ * stays whole, so SQL does it as an O(1) metadata rename instead of rewriting every row, and ops run
+ * in the order they were written. An open gate alone is not enough: without `applyContracts` the
+ * destructive half must still be split off and withheld.
+ */
+export function splitPhases(ops: MigrationOp[], whole: boolean): PhasedOps {
+  if (whole) return { expand: [...ops], contract: [] };
   return desugar(ops);
 }
 
@@ -226,8 +232,8 @@ function desugar(ops: MigrationOp[]): PhasedOps {
   return { expand, contract };
 }
 
-/** Refuse a narrowing retype before anything runs — the values it would destroy are not recoverable. */
-export function assertNoNarrowingRetype(migration: string, ops: MigrationOp[]): void {
+/** Narrowing retypes, refused before anything runs — the values they would destroy are not recoverable. */
+export function narrowingRetypes(migration: string, ops: MigrationOp[]): MigrationBlocker[] {
   const blockers: MigrationBlocker[] = [];
   for (const op of ops) {
     if (op.kind !== "retypeField" || op.from === undefined || isWidening(op.from, op.to)) continue;
@@ -237,6 +243,12 @@ export function assertNoNarrowingRetype(migration: string, ops: MigrationOp[]): 
       message: `"${migration}" narrows ${op.model}.${op.field} from ${op.from} to ${op.to}, which loses values. Author it as a rename to a new field so it gets a compatibility window.`
     });
   }
+  return blockers;
+}
+
+/** Refuse a narrowing retype before anything runs. */
+export function assertNoNarrowingRetype(migration: string, ops: MigrationOp[]): void {
+  const blockers = narrowingRetypes(migration, ops);
   if (blockers.length) throw new MigrationBlockedError(blockers);
 }
 

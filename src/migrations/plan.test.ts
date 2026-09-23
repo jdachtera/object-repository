@@ -195,3 +195,55 @@ describe("formatPlan", () => {
     expect(formatPlan(plan)).toContain("rename User.a → b");
   });
 });
+
+describe("plan refuses whatever run refuses", () => {
+  it("reports a narrowing retype as a blocker", async () => {
+    const plan = await planMigrations(await seeded(), [
+      { name: "m", schemaVersion: 1, up: (m) => m.retypeField("User", "age", "float", "integer") }
+    ], { models, schemaVersion: 1 });
+    expect(plan.blockers.map((b) => b.code)).toEqual(["NARROWING_RETYPE"]);
+  });
+
+  it("reports invalid and regressed versions as blockers", async () => {
+    const backend = await seeded();
+    const invalid = await planMigrations(backend, [], { schemaVersion: 3, minSupportedSchemaVersion: 5 });
+    expect(invalid.blockers.map((b) => b.code)).toEqual(["INVALID_SCHEMA_VERSION"]);
+
+    await runMigrations(backend, [], { models, schemaVersion: 8, now });
+    const regressed = await planMigrations(backend, [], { schemaVersion: 7 });
+    expect(regressed.blockers.map((b) => b.code)).toEqual(["VERSION_REGRESSION"]);
+  });
+
+  it("doesn't list an open-gate contract as running unless applyContracts is given", async () => {
+    const backend = await seeded();
+    const bare = await planMigrations(backend, [rename()], { models, schemaVersion: 7, minSupportedSchemaVersion: 7 });
+    expect(bare.steps.filter((step) => step.status === "pending").map((step) => step.op.kind)).toEqual([
+      "addField",
+      "copyField"
+    ]);
+    expect(bare.releasable.map((item) => item.migration)).toEqual(["0012_fullname"]);
+    expect(formatPlan(bare)).not.toMatch(/dropField|drop User\.name {2}/);
+
+    const released = await planMigrations(backend, [rename()], {
+      models,
+      schemaVersion: 7,
+      minSupportedSchemaVersion: 7,
+      applyContracts: true
+    });
+    expect(released.steps.filter((step) => step.status === "pending").map((step) => step.op.kind)).toEqual(["renameField"]);
+  });
+
+  it("sees legacy history as adopted without writing it", async () => {
+    const backend = await seeded();
+    const withLegacy = Object.assign(backend, { legacyMigrationNames: async () => ["0001_old"] });
+    const plan = await planMigrations(withLegacy, [
+      { name: "0001_old", up: (m) => m.dropField("User", "name") }
+    ], { models });
+    expect(plan.steps.every((step) => step.status === "applied")).toBe(true);
+    const log = await backend.query(
+      { model: "_object_repository_migration_log", where: { type: "all" }, order: [], paging: { start: 0 } },
+      ctx
+    );
+    expect(log).toEqual([]);
+  });
+});

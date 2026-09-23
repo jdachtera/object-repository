@@ -143,18 +143,58 @@ describe("the journal owns the debt, not the source file", () => {
     await run(backend, [rename()], { schemaVersion: 7, minSupportedSchemaVersion: 5 });
 
     // Months later the migration is tidied out of the codebase — the store still owes the drop.
-    const report = await run(backend, [], {
-      schemaVersion: 7,
-      minSupportedSchemaVersion: 7,
-      applyContracts: true
-    });
+    const floorOnly = await run(backend, [], { schemaVersion: 7, minSupportedSchemaVersion: 7 });
+    // Reported, not forgotten: the journal's record is what's owed.
+    expect(floorOnly.releasable).toMatchObject([{ migration: "0012_fullname", orphaned: true }]);
+    expect(floorOnly.releasable[0]!.ops.map((op) => op.kind)).toEqual(["copyField", "dropField"]);
 
-    // Nothing in the (empty) list to act on, so the runner reports nothing...
-    expect(report.contracted).toEqual([]);
-    // ...but the debt is still recorded, rather than silently forgotten.
+    const report = await run(backend, [], { schemaVersion: 7, minSupportedSchemaVersion: 7, applyContracts: true });
+    expect(report.contracted).toEqual(["0012_fullname"]);
+    expect(await readUsers(backend)).toEqual([
+      { uuid: "u1", fullName: "Ann" },
+      { uuid: "u2", fullName: "Bo" }
+    ]);
     const journal = new BackendJournal(backend, ctx);
-    const owed = (await journal.load()).find((row) => row.phase === "contract" && row.status === "pending");
-    expect(owed?.ops).toHaveLength(2);
+    expect((await journal.load()).some((row) => row.status === "pending")).toBe(false);
+  });
+
+  it("reports a deleted migration's debt as deferred while its gate is closed", async () => {
+    const backend = await seeded();
+    await run(backend, [rename()], { schemaVersion: 7, minSupportedSchemaVersion: 5 });
+    const report = await run(backend, [], { schemaVersion: 7, minSupportedSchemaVersion: 6 });
+    expect(report.deferred).toMatchObject([{ migration: "0012_fullname", gate: 7, orphaned: true }]);
+  });
+
+  it("refuses to release a deleted migration's transform, whose code is gone", async () => {
+    const backend = await seeded();
+    const prune: Migration = {
+      name: "0013_prune",
+      schemaVersion: 7,
+      transforms: { drop: () => null },
+      up: (m) => m.transform("User", "drop", [])
+    };
+    await run(backend, [prune], { schemaVersion: 7, minSupportedSchemaVersion: 5 });
+
+    await expect(
+      run(backend, [], { schemaVersion: 7, minSupportedSchemaVersion: 7, applyContracts: true })
+    ).rejects.toMatchObject({ blockers: [{ code: "UNRECOVERABLE_CONTRACT", migration: "0013_prune" }] });
+    expect(await readUsers(backend)).toHaveLength(2);
+
+    // Restoring the migration makes the debt payable again.
+    const report = await run(backend, [prune], { schemaVersion: 7, minSupportedSchemaVersion: 7, applyContracts: true });
+    expect(report.contracted).toEqual(["0013_prune"]);
+    expect(await readUsers(backend)).toEqual([]);
+  });
+
+  it("re-derives the debt from an unchanged source when the contract row is missing", async () => {
+    const backend = await seeded();
+    await run(backend, [rename()], { schemaVersion: 7, minSupportedSchemaVersion: 5 });
+    // A crash between the expand-row and contract-row writes leaves no contract row at all.
+    const journal = new BackendJournal(backend, ctx);
+    await journal.remove("0012_fullname", "contract");
+
+    const report = await run(backend, [rename()], { schemaVersion: 7, minSupportedSchemaVersion: 7 });
+    expect(report.releasable).toMatchObject([{ migration: "0012_fullname" }]);
   });
 
   it("prefers the recorded ops over an edited migration body when releasing", async () => {
@@ -397,5 +437,138 @@ describe("the migration lease", () => {
     const backend = await seeded();
     await acquireLock(backend, ctx, now, "someone-else");
     await expect(run(backend, [rename()], { schemaVersion: 7, minSupportedSchemaVersion: 5, skipLock: true })).resolves.toBeDefined();
+  });
+});
+
+describe("a bare migrate() never destroys, even with the gate already open", () => {
+  // The realistic trigger: the floor is already 7 to release an earlier contract, and a developer
+  // adds another v7 migration. Its gate is open the moment it is first seen.
+  it("withholds a gated drop whose gate is open on first sight", async () => {
+    const backend = await seeded();
+    const report = await run(
+      backend,
+      [{ name: "0014_drop", schemaVersion: 7, up: (m) => m.dropField("User", "name") }],
+      { schemaVersion: 7, minSupportedSchemaVersion: 7 }
+    );
+    expect(report.releasable).toMatchObject([{ migration: "0014_drop" }]);
+    expect(report.contracted).toEqual([]);
+    expect((await readUsers(backend)).map((user) => user.name)).toEqual(["Ann", "Bo"]);
+  });
+
+  it("splits a gated rename whose gate is open on first sight", async () => {
+    const backend = await seeded();
+    const report = await run(backend, [rename()], { schemaVersion: 7, minSupportedSchemaVersion: 7 });
+    expect(report.releasable).toMatchObject([{ migration: "0012_fullname" }]);
+    expect(await readUsers(backend)).toEqual([
+      { uuid: "u1", name: "Ann", fullName: "Ann" },
+      { uuid: "u2", name: "Bo", fullName: "Bo" }
+    ]);
+  });
+
+  it("runs it whole, in one pass, once applyContracts is given — and reports the contract", async () => {
+    const backend = await seeded();
+    const report = await run(backend, [rename()], {
+      schemaVersion: 7,
+      minSupportedSchemaVersion: 7,
+      applyContracts: true
+    });
+    expect(report.contracted).toEqual(["0012_fullname"]);
+    expect(await readUsers(backend)).toEqual([
+      { uuid: "u1", fullName: "Ann" },
+      { uuid: "u2", fullName: "Bo" }
+    ]);
+    // Nothing left owing, and a re-run is a no-op.
+    const again = await run(backend, [rename()], { schemaVersion: 7, minSupportedSchemaVersion: 7, applyContracts: true });
+    expect(again.skipped).toEqual(["0012_fullname"]);
+  });
+
+  it("withholds a transform unless it is declared expand", async () => {
+    const backend = await seeded();
+    const prune: Migration = {
+      name: "0015_prune",
+      schemaVersion: 7,
+      transforms: { drop: () => null },
+      up: (m) => m.transform("User", "drop", [])
+    };
+    const report = await run(backend, [prune], { schemaVersion: 7, minSupportedSchemaVersion: 5 });
+    expect(report.deferred).toMatchObject([{ migration: "0015_prune" }]);
+    expect(await readUsers(backend)).toHaveLength(2);
+  });
+
+  it("runs a declared-expand backfill, but fails it rather than let it delete", async () => {
+    const backend = await seeded();
+    const backfill: Migration = {
+      name: "0016_tier",
+      schemaVersion: 7,
+      transforms: { tier: (row) => ({ ...row, tier: "free" }) },
+      up: (m) => m.transform("User", "tier", ["tier"], undefined, { phase: "expand" })
+    };
+    await run(backend, [backfill], { schemaVersion: 7, minSupportedSchemaVersion: 5 });
+    expect((await readUsers(backend)).map((user) => user.tier)).toEqual(["free", "free"]);
+
+    const liar: Migration = {
+      name: "0017_liar",
+      schemaVersion: 7,
+      transforms: { drop: () => null },
+      up: (m) => m.transform("User", "drop", [], undefined, { phase: "expand" })
+    };
+    await expect(run(backend, [liar], { schemaVersion: 7, minSupportedSchemaVersion: 5 })).rejects.toThrow(
+      /declared phase "expand" but deleted/
+    );
+    expect(await readUsers(backend)).toHaveLength(2);
+  });
+
+  it("withholds an overwriting copy", async () => {
+    const backend = await seeded();
+    backend.save("User", { uuid: "u1", name: "Ann", nick: "annie" }, ctx);
+    await backend.persist(ctx);
+    const report = await run(
+      backend,
+      [{ name: "0018_nick", schemaVersion: 7, up: (m) => m.copyField("User", "name", "nick", "text", { overwrite: true }) }],
+      { schemaVersion: 7, minSupportedSchemaVersion: 5 }
+    );
+    expect(report.deferred).toMatchObject([{ migration: "0018_nick" }]);
+    expect((await readUsers(backend))[0]!.nick).toBe("annie");
+  });
+});
+
+describe("every refusal comes before any operation", () => {
+  it("refuses a drifted migration before running the contract it guards or anything after it", async () => {
+    const backend = await seeded();
+    await run(backend, [rename()], { schemaVersion: 7, minSupportedSchemaVersion: 5 });
+
+    const edited: Migration = { ...rename(), up: (m) => m.renameField("User", "name", "displayName", "text") };
+    const later: Migration = { name: "0020_later", up: (m) => m.addField("User", "later", "text", { fill: "x" }) };
+    await expect(
+      run(backend, [edited, later], { schemaVersion: 7, minSupportedSchemaVersion: 7, applyContracts: true })
+    ).rejects.toMatchObject({ blockers: [{ code: "CHECKSUM_DRIFT" }] });
+
+    // Neither the drifted contract nor the later migration ran.
+    expect(await readUsers(backend)).toEqual([
+      { uuid: "u1", name: "Ann", fullName: "Ann" },
+      { uuid: "u2", name: "Bo", fullName: "Bo" }
+    ]);
+    const log = await new BackendJournal(backend, ctx).load();
+    expect(log.some((row) => row.name === "0020_later")).toBe(false);
+  });
+
+  it("refuses a narrowing retype late in the list before an earlier migration runs", async () => {
+    const backend = await seeded();
+    await expect(
+      run(backend, [
+        { name: "a", up: (m) => m.addField("User", "tier", "text", { fill: "free" }) },
+        { name: "b", up: (m) => m.retypeField("User", "age", "float", "integer") }
+      ])
+    ).rejects.toMatchObject({ blockers: [{ code: "NARROWING_RETYPE" }] });
+    expect((await readUsers(backend))[0]).not.toHaveProperty("tier");
+  });
+
+  it("reports an inconsistent journal as a blocker", async () => {
+    const backend = await seeded();
+    await run(backend, [rename()], { schemaVersion: 7, minSupportedSchemaVersion: 7, applyContracts: true });
+    await new BackendJournal(backend, ctx).remove("0012_fullname", "expand");
+    await expect(run(backend, [rename()], { schemaVersion: 7 })).rejects.toMatchObject({
+      blockers: [{ code: "JOURNAL_INCONSISTENT" }]
+    });
   });
 });

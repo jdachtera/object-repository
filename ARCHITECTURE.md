@@ -350,8 +350,10 @@ so a deferred destructive step survives the migration being rewritten or deleted
 pre-existing is disturbed) or `contract` (destroys the old shape). Expands apply immediately. A
 contract declared at schema version N applies only once the deployment raises
 `minSupportedSchemaVersion` to N — and even then only when the caller passes `applyContracts`, so a
-bare `migrate()` in a deploy script can never destroy anything. Deferred contracts are always reported,
-never silently skipped, since a silent skip is the failure this exists to prevent.
+bare `migrate()` in a deploy script can never destroy anything a versioned migration declares.
+Deferred contracts are always reported, never silently skipped, since a silent skip is the failure this
+exists to prevent. Every refusal (drift, a narrowing retype, a bad version, an unpayable debt) is
+decided in a pre-flight pass before any operation runs, and `plan()` runs that same pass.
 
 The two version numbers move independently on purpose: a developer bumps `schemaVersion` when adding a
 migration; an operator bumps `minSupportedSchemaVersion` once they know no still-running build and no

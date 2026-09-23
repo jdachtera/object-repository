@@ -154,6 +154,13 @@ async function rewrite(
       const next = change(row);
       if (next === null) {
         if (!removeOnNull) continue; // unchanged — skip, which is what makes a re-run free
+        if (op.kind === "transform" && op.phase === "expand") {
+          // Declared expand is a promise that nothing pre-existing is disturbed; deleting a record
+          // breaks it, and the gate that should have held it back was bypassed on that promise.
+          throw new Error(
+            `Transform "${op.transform}" on "${op.model}" is declared phase "expand" but deleted record ${JSON.stringify(row.uuid)}. A transform that deletes must be a contract.`
+          );
+        }
         backend.remove(op.model, row, options.ctx);
         written += 1;
         continue;

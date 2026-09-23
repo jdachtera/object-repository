@@ -19,7 +19,10 @@ describe("classification", () => {
     ["createModel", { kind: "createModel", model: "M", fields: [] }, "expand"],
     ["addField", { kind: "addField", model: "M", field: "a", type: "text" }, "expand"],
     ["copyField", { kind: "copyField", model: "M", from: "a", to: "b", type: "text", overwrite: false }, "expand"],
-    ["transform", { kind: "transform", model: "M", transform: "t", fields: ["a"] }, "expand"],
+    ["transform (declared expand)", { kind: "transform", model: "M", transform: "t", fields: ["a"], phase: "expand" }, "expand"],
+    // Undeclared, a transform may delete or overwrite — nothing short of running it can tell.
+    ["transform (default)", { kind: "transform", model: "M", transform: "t", fields: ["a"] }, "contract"],
+    ["copyField (overwrite)", { kind: "copyField", model: "M", from: "a", to: "b", type: "text", overwrite: true }, "contract"],
     ["addIndex (plain)", { kind: "addIndex", model: "M", index: { name: "i", fields: [{ path: "a" }] } }, "expand"],
     ["retype (widening)", { kind: "retypeField", model: "M", field: "a", from: "integer", to: "float" }, "expand"],
     ["rawSql (default)", { kind: "rawSql", dialect: "*", statement: "", params: [], phase: "expand" }, "expand"],
@@ -139,6 +142,7 @@ describe("the recorder covers every op kind", () => {
       m.addIndex("M", { name: "by_a", fields: [{ path: "a" }] });
       m.dropIndex("M", "by_a");
       m.transform("M", "t", ["a"], eq("a", 1));
+      m.transform("M", "t", ["a"], undefined, { phase: "expand" });
       m.sql("UPDATE x SET y = 1", [], { phase: "contract" });
     });
 
@@ -152,6 +156,7 @@ describe("the recorder covers every op kind", () => {
       { kind: "addIndex", model: "M", index: { name: "by_a", fields: [{ path: "a" }] } },
       { kind: "dropIndex", model: "M", index: "by_a" },
       { kind: "transform", model: "M", transform: "t", fields: ["a"], where: eq("a", 1).serialize() },
+      { kind: "transform", model: "M", transform: "t", fields: ["a"], phase: "expand" },
       { kind: "rawSql", dialect: "*", statement: "UPDATE x SET y = 1", params: [], phase: "contract" }
     ]);
   });

@@ -62,7 +62,9 @@ export type MigrationOp =
   // the target type. Without it the widening check can't run, so such a retype keeps the legacy
   // behaviour of simply applying; the modern `retypeField` requires `from` and is checked.
   | { kind: "retypeField"; model: string; field: string; from?: StoredType; to: StoredType }
-  | { kind: "transform"; model: string; transform: string; fields: string[]; where?: ExpressionNode }
+  // `phase` is the author's claim about what the transform does. Absent means `contract`: a transform
+  // can delete a record or overwrite a value, and nothing short of running it can tell which it does.
+  | { kind: "transform"; model: string; transform: string; fields: string[]; where?: ExpressionNode; phase?: Phase }
   // `columnTypes` rides alongside rather than inside `IndexSpec`: it exists only so MySQL can add a
   // key-length prefix to a TEXT-backed column, which no other store has an opinion about.
   | { kind: "addIndex"; model: string; index: IndexSpec; columnTypes?: Record<string, string> }
@@ -95,8 +97,14 @@ export interface MigrationBuilder {
   copyField(model: string, from: string, to: string, type: StoredType, options?: { overwrite?: boolean }): void;
   addIndex(model: string, index: IndexSpec): void;
   dropIndex(model: string, name: string): void;
-  /** Portable record rewrite. `transformId` keys into `Migration.transforms`; `fields` is the dirty hint. */
-  transform(model: string, transformId: string, fields: string[], where?: Expression): void;
+  /**
+   * Portable record rewrite. `transformId` keys into `Migration.transforms`; `fields` is the dirty hint.
+   *
+   * A transform is a **contract** unless declared `{ phase: "expand" }`, since it can delete records or
+   * overwrite values. Declare `expand` only for a pure backfill that fills in new fields; an expand
+   * transform that returns `null` (delete) fails the run instead of deleting.
+   */
+  transform(model: string, transformId: string, fields: string[], where?: Expression, options?: { phase?: Phase }): void;
   /** Engine-specific escape hatch. Runs where it can, throws elsewhere. Defaults to the expand phase. */
   sql(statement: string, params?: JsonValue[], options?: { phase?: Phase }): void;
 
@@ -182,6 +190,11 @@ export interface DeferredContract {
   ops: MigrationOp[];
   /** Human-readable, e.g. `"0012_fullname" drops User.name at schema version 7; minSupported is 5.` */
   reason: string;
+  /**
+   * The migration that owes this is no longer in the array passed to `migrate()`. What is owed comes
+   * from the journal, which recorded it when the expand ran.
+   */
+  orphaned?: boolean;
 }
 
 export type MigrationWarningCode =
@@ -196,7 +209,10 @@ export type MigrationBlockerCode =
   | "CHECKSUM_DRIFT"
   | "VERSION_REGRESSION"
   | "SCHEMA_UNKNOWN"
-  | "NARROWING_RETYPE";
+  | "NARROWING_RETYPE"
+  | "INVALID_SCHEMA_VERSION"
+  | "JOURNAL_INCONSISTENT"
+  | "UNRECOVERABLE_CONTRACT";
 
 export interface MigrationWarning {
   code: MigrationWarningCode;

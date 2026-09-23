@@ -9,8 +9,8 @@ import type { Backend } from "../core/Backend.ts";
 import { isMigrationLowering } from "../core/Backend.ts";
 import { SYSTEM_CONTEXT } from "../core/types.ts";
 import { BackendJournal, indexRows, rowId } from "./journal.ts";
-import { OpRecorder, opsHash, splitPhases } from "./ops.ts";
-import { assertUniqueNames, gateOpen, type RunnerOptions } from "./run.ts";
+import { evaluateMigrations } from "./evaluate.ts";
+import { assertUniqueNames, checkVersions, readHistory, type RunnerOptions } from "./run.ts";
 import type {
   DeferredContract,
   Migration,
@@ -29,88 +29,65 @@ export async function planMigrations(
   const ctx = options.ctx ?? SYSTEM_CONTEXT;
   const journal = options.journal ?? new BackendJournal(backend, ctx);
   const stored = await journal.readSchemaState();
-  const schemaVersion = options.schemaVersion ?? 0;
-  const minSupported = options.minSupportedSchemaVersion ?? Math.max(0, schemaVersion - 1);
-  const rows = indexRows(await journal.load());
+  const versions = checkVersions(stored, options);
+  const minSupported = versions.minSupportedSchemaVersion;
+  const { rows } = await readHistory(backend, journal, options.now ?? Date.now);
+
+  // The very evaluation a run performs, so a clean plan is a run that won't be refused.
+  const evaluation = await evaluateMigrations(migrations, indexRows(rows), minSupported, options.applyContracts ?? false);
+  const blockers: MigrationBlocker[] = [...evaluation.blockers];
+  if (versions.error) blockers.unshift({ code: versions.code!, message: versions.error.message });
 
   const steps: PlanStep[] = [];
   const deferred: DeferredContract[] = [];
   const releasable: DeferredContract[] = [];
   const warnings: MigrationWarning[] = [];
-  const blockers: MigrationBlocker[] = [];
 
-  for (const migration of migrations) {
-    const open = gateOpen(migration, minSupported);
-    const recorder = new OpRecorder();
-    await migration.up(recorder);
-    const phases = splitPhases(recorder.ops, open);
-    const bodyHash = opsHash(recorder.ops);
-
-    const expandRow = rows.get(rowId(migration.name, "expand"));
-    const contractRow = rows.get(rowId(migration.name, "contract"));
-    const expandApplied = expandRow?.status === "applied";
-
-    if (expandApplied && expandRow.opsHash && expandRow.opsHash !== bodyHash) {
-      blockers.push({
-        code: "CHECKSUM_DRIFT",
-        migration: migration.name,
-        message: `"${migration.name}" has already been applied, but its operations have changed since.`
-      });
-    }
-
-    for (const op of phases.expand) {
+  for (const decision of evaluation.decisions) {
+    const name = decision.migration.name;
+    const expandRow = indexRows(rows).get(rowId(name, "expand"));
+    const expandOps = decision.expand ?? (decision.orphaned ? [] : (expandRow?.ops ?? []));
+    for (const op of expandOps) {
       steps.push({
-        migration: migration.name,
+        migration: name,
         phase: "expand",
         op,
-        status: expandApplied ? "applied" : "pending",
+        status: decision.expand ? "pending" : "applied",
         ...describeLowering(backend, op)
       });
     }
 
-    // Prefer what the journal recorded: the source may have been edited since the expand ran.
-    const owed = contractRow?.status === "pending" && contractRow.ops.length ? contractRow.ops : phases.contract;
-    const contractApplied = contractRow?.status === "applied";
-
-    for (const op of owed) {
+    for (const op of decision.owed) {
       steps.push({
-        migration: migration.name,
+        migration: name,
         phase: "contract",
         op,
-        status: contractApplied ? "applied" : open ? "pending" : "deferred",
+        status: decision.contract === "run" ? "pending" : "deferred",
         ...describeLowering(backend, op)
       });
     }
 
-    if (!owed.length || contractApplied) continue;
+    if (decision.contract === "deferred") deferred.push(decision.outstanding!);
+    if (decision.contract === "releasable" || decision.contract === "run") releasable.push(decision.outstanding!);
 
-    const outstanding: DeferredContract = {
-      migration: migration.name,
-      gate: migration.schemaVersion ?? 0,
-      minSupported,
-      ops: owed,
-      reason: `"${migration.name}" has ${owed.length} destructive operation(s) at schema version ${migration.schemaVersion ?? 0}; minSupportedSchemaVersion is ${minSupported}.`
-    };
-    (open ? releasable : deferred).push(outstanding);
-
-    if (!open && expandApplied) {
+    if (decision.contract === "deferred" && !decision.expand) {
       warnings.push({
         code: "COMPAT_WINDOW_OPEN",
-        migration: migration.name,
-        message: `"${migration.name}" is mid-window: both the old and new shapes are live. Raise minSupportedSchemaVersion to ${migration.schemaVersion ?? 0} once no older reader remains.`
+        migration: name,
+        message: `"${name}" is mid-window: both the old and new shapes are live. Raise minSupportedSchemaVersion to ${decision.migration.schemaVersion ?? 0} once no older reader remains.`
       });
     }
-    if (owed.some((op) => op.kind === "rawSql")) {
+    if (decision.owed.some((op) => op.kind === "rawSql")) {
       warnings.push({
         code: "RAW_SQL_NOT_PORTABLE",
-        migration: migration.name,
-        message: `"${migration.name}" contains raw SQL, which only runs on a SQL backend.`
+        migration: name,
+        message: `"${name}" contains raw SQL, which only runs on a SQL backend.`
       });
     }
   }
 
   return {
-    schema: { schemaVersion, minSupportedSchemaVersion: minSupported },
+    schema: { schemaVersion: versions.schemaVersion, minSupportedSchemaVersion: minSupported },
     stored,
     steps,
     deferred,

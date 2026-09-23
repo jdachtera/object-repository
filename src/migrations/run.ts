@@ -18,12 +18,11 @@ import { generateUuid } from "../core/uuid.ts";
 import { applyOp, type ExecuteOptions } from "./execute.ts";
 import { MigrationBlockedError, SchemaVersionError } from "./errors.ts";
 import { acquireLock, BackendJournal, indexRows, rowId, validateMigrationNames, type JournalRow, type MigrationJournal, type SchemaState } from "./journal.ts";
-import { assertNoNarrowingRetype, downOps, opsHash, splitPhases, OpRecorder } from "./ops.ts";
+import { downOps } from "./ops.ts";
+import { destroysInWholePass, evaluateMigrations } from "./evaluate.ts";
 import type {
-  DeferredContract,
   MigrateOptions,
   Migration,
-  MigrationBlocker,
   MigrationOp,
   MigrationReport,
   Phase
@@ -55,10 +54,7 @@ export interface RunnerOptions extends MigrateOptions {
 
 const DEFAULT_BATCH = 500;
 
-/** Is this migration's contract half permitted to run? */
-export function gateOpen(migration: Migration, minSupported: number): boolean {
-  return migration.schemaVersion === undefined || minSupported >= migration.schemaVersion;
-}
+export { gateOpen } from "./evaluate.ts";
 
 /**
  * Apply every migration that hasn't run yet.
@@ -93,16 +89,30 @@ export async function runMigrations(
   }
 }
 
-/** The body of a run, once the lease is held. */
+/**
+ * The body of a run, once the lease is held.
+ *
+ * Two passes. The first decides everything and collects every refusal; only if there are none does the
+ * second touch the store. A refusal found halfway through would arrive after the migrations before it
+ * had already run — including, possibly, the very contract it was meant to stop.
+ */
 async function applyAll(
   backend: Backend,
   migrations: Migration[],
   options: RunnerOptions & { ctx: Context; now: () => number; journal: MigrationJournal }
 ): Promise<MigrationReport> {
-  const { ctx, now, journal } = options;
+  const { now, journal } = options;
   const state = await resolveVersions(journal, options);
 
   const rows = indexRows(await adoptLegacyHistory(backend, journal, now));
+  const { decisions, blockers } = await evaluateMigrations(
+    migrations,
+    rows,
+    state.minSupportedSchemaVersion,
+    options.applyContracts ?? false
+  );
+  if (blockers.length) throw new MigrationBlockedError(blockers);
+
   const report: MigrationReport = {
     applied: [],
     skipped: [],
@@ -111,78 +121,44 @@ async function applyAll(
     deferred: [],
     releasable: []
   };
-  const blockers: MigrationBlocker[] = [];
 
-  for (const migration of migrations) {
-    const open = gateOpen(migration, state.minSupportedSchemaVersion);
-    const recorder = new OpRecorder();
-    await migration.up(recorder);
-    assertNoNarrowingRetype(migration.name, recorder.ops);
-    const phases = splitPhases(recorder.ops, open);
-    const bodyHash = opsHash(recorder.ops);
+  for (const decision of decisions) {
+    const { migration, bodyHash } = decision;
 
-    const expandRow = rows.get(rowId(migration.name, "expand"));
-    const contractRow = rows.get(rowId(migration.name, "contract"));
-
-    if (expandRow?.status !== "applied" && contractRow?.status === "applied") {
-      throw new Error(
-        `Journal for "${migration.name}" records a contract with no expand. The store's migration log is inconsistent.`
-      );
-    }
-
-    // --- expand -------------------------------------------------------------------------------
-    if (expandRow?.status !== "applied") {
-      await runPhase(backend, migration, phases.expand, "expand", { ...options, ctx, now, journal });
-      await journal.write(row(migration, "expand", "applied", phases.expand, bodyHash, now()));
+    if (decision.expand) {
+      await runPhase(backend, migration, decision.expand, "expand", options);
+      await journal.write(row(migration, "expand", "applied", decision.expand, bodyHash, now()));
       report.expanded.push(migration.name);
       report.applied.push(migration.name);
+      if (decision.whole && destroysInWholePass(decision.expand)) report.contracted.push(migration.name);
       // Record what the contract half owes *now*, while the migration is in front of us — that debt
       // has to outlive this source file being edited, reordered or deleted.
       await journal.write(
-        phases.contract.length
-          ? row(migration, "contract", "pending", phases.contract, bodyHash, now())
+        decision.owed.length
+          ? row(migration, "contract", "pending", decision.owed, bodyHash, now())
           : row(migration, "contract", "applied", [], bodyHash, now())
       );
-      if (!phases.contract.length) continue;
-    } else {
-      const drift = driftBlocker(migration, expandRow, bodyHash);
-      if (drift) blockers.push(drift);
-      if (contractRow?.status === "applied") {
-        report.skipped.push(migration.name);
-        continue;
-      }
+    } else if (decision.contract === "none" && !decision.orphaned) {
+      report.skipped.push(migration.name);
     }
 
-    // --- contract -----------------------------------------------------------------------------
-    // Prefer the ops the journal recorded when the expand ran: the migration in front of us may have
-    // been edited or deleted since, and the store's debt is what actually has to be settled.
-    const owed = contractRow?.status === "pending" && contractRow.ops.length ? contractRow.ops : phases.contract;
-    if (!owed.length) continue;
-
-    const outstanding: DeferredContract = {
-      migration: migration.name,
-      gate: migration.schemaVersion ?? 0,
-      minSupported: state.minSupportedSchemaVersion,
-      ops: owed,
-      reason: describe(migration, owed, state.minSupportedSchemaVersion)
-    };
-
-    if (!gateOpen(migration, state.minSupportedSchemaVersion)) {
-      report.deferred.push(outstanding);
-      continue;
+    switch (decision.contract) {
+      case "none":
+        break;
+      case "deferred":
+        report.deferred.push(decision.outstanding!);
+        break;
+      case "releasable":
+        report.releasable.push(decision.outstanding!);
+        break;
+      case "run":
+        await runPhase(backend, migration, decision.owed, "contract", options);
+        await journal.write(row(migration, "contract", "applied", decision.owed, bodyHash, now()));
+        report.contracted.push(migration.name);
+        if (!report.applied.includes(migration.name)) report.applied.push(migration.name);
+        break;
     }
-    if (!options.applyContracts) {
-      report.releasable.push(outstanding);
-      continue;
-    }
-
-    await runPhase(backend, migration, owed, "contract", { ...options, ctx, now, journal });
-    await journal.write(row(migration, "contract", "applied", owed, bodyHash, now()));
-    report.contracted.push(migration.name);
-    if (!report.applied.includes(migration.name)) report.applied.push(migration.name);
   }
-
-  if (blockers.length) throw new MigrationBlockedError(blockers);
 
   // The declared version is always recorded — it's what catches an older build being run against a
   // newer store. The *floor*, though, only rises when contracts have actually been released against
@@ -261,24 +237,38 @@ async function adoptLegacyHistory(
   journal: MigrationJournal,
   now: () => number
 ): Promise<JournalRow[]> {
+  const { rows, adopted } = await readHistory(backend, journal, now);
+  if (adopted) for (const entry of rows) await journal.write(entry);
+  return rows;
+}
+
+/**
+ * The journal's rows, or — for a store that has none yet — the rows adopting its legacy history
+ * would write. Reads only, so `plan()` sees exactly what a run would.
+ */
+export async function readHistory(
+  backend: Backend,
+  journal: MigrationJournal,
+  now: () => number
+): Promise<{ rows: JournalRow[]; adopted: boolean }> {
   const existing = await journal.load();
-  if (existing.length > 0) return existing;
+  if (existing.length > 0) return { rows: existing, adopted: false };
 
   const lowering = backend as Partial<{ legacyMigrationNames(): Promise<string[]> }>;
-  if (typeof lowering.legacyMigrationNames !== "function") return existing;
+  if (typeof lowering.legacyMigrationNames !== "function") return { rows: existing, adopted: false };
 
   let names: string[];
   try {
     names = await lowering.legacyMigrationNames();
   } catch {
-    return existing; // no legacy table, or it isn't readable — a greenfield store, then
+    return { rows: existing, adopted: false }; // no legacy table, or it isn't readable — a greenfield store, then
   }
-  if (!names.length) return existing;
+  if (!names.length) return { rows: existing, adopted: false };
 
   const adopted: JournalRow[] = [];
   for (const name of names) {
     for (const phase of ["expand", "contract"] as const) {
-      const entry: JournalRow = {
+      adopted.push({
         name,
         phase,
         status: "applied",
@@ -287,12 +277,10 @@ async function adoptLegacyHistory(
         opsHash: "", // unknown, so never reported as drift
         cursor: null,
         appliedAt: now()
-      };
-      await journal.write(entry);
-      adopted.push(entry);
+      });
     }
   }
-  return adopted;
+  return { rows: adopted, adopted: true };
 }
 
 /** Run one phase's ops, preferring a backend's native lowering and falling back to the reference. */
@@ -332,29 +320,41 @@ interface ResolvedVersions extends SchemaState {
  * destroys anything on the same deploy — releasing a contract always takes a second, explicit step.
  */
 async function resolveVersions(journal: MigrationJournal, options: RunnerOptions): Promise<ResolvedVersions> {
-  const stored = await journal.readSchemaState();
+  const resolved = checkVersions(await journal.readSchemaState(), options);
+  if (resolved.error) throw resolved.error;
+  return resolved;
+}
+
+/** The declared versions, reconciled against the store's; `error` says why a run must refuse them. */
+export function checkVersions(
+  stored: SchemaState | null,
+  options: Pick<RunnerOptions, "schemaVersion" | "minSupportedSchemaVersion">
+): ResolvedVersions & { error: SchemaVersionError | null; code: "INVALID_SCHEMA_VERSION" | "VERSION_REGRESSION" | null } {
   const schemaVersion = options.schemaVersion ?? 0;
   const minSupported = options.minSupportedSchemaVersion ?? Math.max(0, schemaVersion - 1);
+  const resolved = { schemaVersion, minSupportedSchemaVersion: minSupported, stored };
+  const fail = (code: "INVALID_SCHEMA_VERSION" | "VERSION_REGRESSION", message: string) => ({
+    ...resolved,
+    error: new SchemaVersionError(schemaVersion, minSupported, message),
+    code
+  });
 
   if (!Number.isInteger(schemaVersion) || !Number.isInteger(minSupported)) {
-    throw new SchemaVersionError(schemaVersion, minSupported, "Schema versions must be integers.");
+    return fail("INVALID_SCHEMA_VERSION", "Schema versions must be integers.");
   }
   if (minSupported > schemaVersion) {
-    throw new SchemaVersionError(
-      schemaVersion,
-      minSupported,
+    return fail(
+      "INVALID_SCHEMA_VERSION",
       `minSupportedSchemaVersion (${minSupported}) cannot exceed schemaVersion (${schemaVersion}).`
     );
   }
   if (stored && schemaVersion < stored.schemaVersion) {
-    throw new SchemaVersionError(
-      schemaVersion,
-      minSupported,
+    return fail(
+      "VERSION_REGRESSION",
       `This build declares schema version ${schemaVersion} but the store is already at ${stored.schemaVersion}. Running an older build against a newer store would re-apply migrations it has no record of.`
     );
   }
-
-  return { schemaVersion, minSupportedSchemaVersion: minSupported, stored };
+  return { ...resolved, error: null, code: null };
 }
 
 /**
@@ -384,17 +384,6 @@ function row(
   };
 }
 
-/** An already-applied migration whose authored body no longer hashes the same was edited after the fact. */
-function driftBlocker(migration: Migration, applied: JournalRow, bodyHash: string): MigrationBlocker | null {
-  if (!applied.opsHash) return null; // seeded from a legacy tracking table — no hash to compare against
-  if (applied.opsHash === bodyHash) return null;
-  return {
-    code: "CHECKSUM_DRIFT",
-    migration: migration.name,
-    message: `"${migration.name}" has already been applied, but its operations have changed since. Add a new migration instead of editing an applied one.`
-  };
-}
-
 /**
  * Did these ops destroy data a `down` cannot bring back?
  *
@@ -403,20 +392,6 @@ function driftBlocker(migration: Migration, applied: JournalRow, bodyHash: strin
  */
 function destroysData(ops: MigrationOp[]): boolean {
   return ops.some((op) => (op.kind === "dropField" && !op.closes) || op.kind === "dropModel");
-}
-
-function describe(migration: Migration, ops: MigrationOp[], minSupported: number): string {
-  const what = ops
-    .map((op) => {
-      if (op.kind === "dropField") return `drops ${op.model}.${op.field}`;
-      if (op.kind === "dropModel") return `drops ${op.model}`;
-      if (op.kind === "dropIndex") return `drops index ${op.index} on ${op.model}`;
-      if (op.kind === "addIndex") return `adds unique index ${op.index.name} on ${op.model}`;
-      return op.kind;
-    })
-    .join(", ");
-  const gate = migration.schemaVersion ?? 0;
-  return `"${migration.name}" ${what} at schema version ${gate}; minSupportedSchemaVersion is ${minSupported}.`;
 }
 
 export function assertUniqueNames(migrations: Migration[]): void {

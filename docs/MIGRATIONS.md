@@ -10,8 +10,10 @@ Two properties are worth stating up front, because everything else follows from 
   Mongo collection, a browser IndexedDB store and the in-memory reference alike. A backend that can do
   better does — SQL turns a rename into an O(1) `ALTER TABLE … RENAME COLUMN` rather than rewriting
   every row. A backend changes a migration's *cost*, never its effect on your records.
-- **`migrate()` only ever adds.** Destructive operations are withheld until you raise a version floor
-  *and* explicitly ask for them. They are always reported, never silently skipped.
+- **`migrate()` only ever adds.** A versioned migration's destructive operations are withheld until
+  you raise a version floor *and* explicitly ask for them, even when the floor is already high enough
+  the first time the migration is seen. They are always reported, never silently skipped. (A migration
+  with no `schemaVersion` is the exception: it runs whole, as before this mechanism existed.)
 
 ## The two numbers
 
@@ -30,8 +32,8 @@ const orm = new RepositoryManager({
 They move independently on purpose. `minSupportedSchemaVersion` defaults to `schemaVersion - 1`, so
 shipping a migration and destroying what it replaced are never the same deploy.
 
-Omit `schema` entirely and everything is ungated — every operation applies immediately, which is the
-behaviour that predates this mechanism.
+Omit `schema` entirely, or leave `schemaVersion` off a migration, and it is ungated. Every operation
+applies immediately, in the order written. That is the behaviour that predates this mechanism.
 
 ## A rename, end to end
 
@@ -101,6 +103,31 @@ await orm.migrate(migrations, { applyContracts: true });
 The legacy values are re-copied and the column is dropped. Delete the deprecated property from the
 model; it has already stopped being provisioned, so the auto-provisioner will not recreate it.
 
+A migration whose gate is open *and* whose contracts are being applied in the same run skips the
+split. It runs whole, in the order written, so SQL keeps its O(1) `RENAME COLUMN`. It is reported
+under both `expanded` and `contracted`.
+
+### Deleting a migration doesn't cancel what it owes
+
+When the expand runs, the journal records exactly what the contract half still owes. That record, not
+the source file, is what gets settled. If the migration is later removed from the array, its debt is
+still reported (with `orphaned: true`) and released by `applyContracts` like any other. The one
+exception is a debt that runs a record `transform`: its code went with the migration, so releasing it
+is refused (`UNRECOVERABLE_CONTRACT`) until the migration is restored.
+
+### Every refusal comes first
+
+Everything a run could refuse is checked before any operation touches the store:
+
+- an edited migration (`CHECKSUM_DRIFT`);
+- a narrowing retype;
+- an invalid or regressed version;
+- an inconsistent journal;
+- an unrecoverable debt.
+
+A refused run changes nothing. `plan()` performs the same checks and lists them under `blockers`, so a
+clean plan is a run that won't be refused.
+
 ## Seeing what a deploy will do
 
 `plan()` reads the store and writes nothing. Safe in production, and worth putting in CI.
@@ -126,7 +153,9 @@ Withheld by the version gate (1):
 
 | operation | phase | notes |
 |---|---|---|
-| `createModel`, `addField`, `copyField`, `transform` | expand | nothing pre-existing is disturbed |
+| `createModel`, `addField`, `copyField` | expand | nothing pre-existing is disturbed |
+| `copyField` with `overwrite: true` | **contract** | clobbers whatever the target already holds |
+| `transform` | **contract** by default | it can delete records or overwrite values. Declare `{ phase: "expand" }` for a pure backfill; an expand transform that tries to delete fails the run instead |
 | `retypeField` (widening) | expand | value-preserving by the type lattice |
 | `addIndex` | expand | …unless `unique` |
 | `addIndex` with `unique: true` | **contract** | rejects writes an older supported build may legitimately make; on IndexedDB a unique index over already-duplicate data aborts the upgrade transaction and bricks the local database |
