@@ -163,3 +163,43 @@ describe("IndexedDB connection lifecycle", () => {
     await expect(later.persist(ctx)).rejects.toThrow(); // the unique definition is in force
   });
 });
+
+describe("a persist that fails for good", () => {
+  it("doesn't poison every later persist with the failed batch", async () => {
+    const name = dbName();
+    const backend = new IndexedDBBackend({ name });
+    backend.registerModel("User", [{ name: "by_email", fields: [{ path: "email" }], unique: true }]);
+    backend.save("User", { uuid: "u1", email: "a@x" }, ctx);
+    await backend.persist(ctx);
+
+    backend.save("User", { uuid: "u2", email: "a@x" }, ctx); // violates the unique index
+    await expect(backend.persist(ctx)).rejects.toThrow();
+
+    backend.save("User", { uuid: "u3", email: "b@x" }, ctx);
+    await backend.persist(ctx); // must not carry u2 along and fail again
+    const rows = await backend.query({ model: "User", where: all().serialize(), order: [{ property: "uuid", descending: false }], paging: { start: 0 } }, ctx);
+    expect(rows.map((row) => row.uuid)).toEqual(["u1", "u3"]);
+  });
+});
+
+describe("a unique index that can't be built", () => {
+  it("fails once, then lets every other operation through instead of failing them all", async () => {
+    const name = dbName();
+    const first = new IndexedDBBackend({ name });
+    first.save("User", { uuid: "u1", email: "dup@x" }, ctx);
+    first.save("User", { uuid: "u2", email: "dup@x" }, ctx);
+    first.save("Post", { uuid: "p1" }, ctx);
+    await first.persist(ctx);
+
+    // A later release declares email unique, over data that already has duplicates.
+    const later = new IndexedDBBackend({ name });
+    later.registerModel("User", [{ name: "by_email", fields: [{ path: "email" }], unique: true }]);
+    const read = (model: string) => later.query({ model, where: all().serialize(), order: [], paging: { start: 0 } }, ctx);
+    await expect(read("User")).rejects.toThrow(/by_email/);
+
+    expect(await read("Post")).toHaveLength(1); // every other model still works
+    expect(await read("User")).toHaveLength(2);
+    later.save("Post", { uuid: "p2" }, ctx);
+    await later.persist(ctx);
+  });
+});

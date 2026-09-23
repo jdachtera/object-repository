@@ -46,6 +46,10 @@ export class QueryCache<T> {
   setBaseline(uuid: Uuid, record: JsonObject): void {
     this.baseline.set(uuid, { ...record });
   }
+  /** Apply an out-of-band change of the stored shape to every baseline (a migration dropped a field). */
+  editBaselines(edit: (record: JsonObject) => void): void {
+    for (const record of this.baseline.values()) edit(record);
+  }
   deleteBaseline(uuid: Uuid): void {
     this.baseline.delete(uuid);
   }

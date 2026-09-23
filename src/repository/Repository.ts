@@ -19,6 +19,7 @@ import { QueryCache } from "./QueryCache.ts";
 import { QueryCollection, type Queryable, type ReadOptions } from "./QueryCollection.ts";
 import { substitutePlan, substituteAggregate, substituteWindow, substituteNode, type Mirrors } from "./mirror.ts";
 import type { WindowState } from "./windowState.ts";
+import type { MigrationOp } from "../migrations/types.ts";
 
 /** Resolves a model name to its repository (the RepositoryManager registry). */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -886,6 +887,28 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     }
     if (complete) this.activeMirrors = { version, mirrors: open };
     return open;
+  }
+
+  /**
+   * A migration changed the stored shape of this model behind the repository's back — a lowered DDL
+   * statement emits no change events, and another process's migration none this process can see. The
+   * write baselines still hold the old shape, and `serialize` carries their undeclared fields forward,
+   * so a dropped field would come back with the next save. Bring the baselines up to date.
+   */
+  storeChanged(op: MigrationOp): void {
+    if (!("model" in op) || op.model !== this.modelName) return;
+    if (op.kind === "dropField") this.cache.editBaselines((record) => void delete record[op.field]);
+    else if (op.kind === "renameField") {
+      this.cache.editBaselines((record) => {
+        if (!(op.from in record)) return;
+        record[op.to] = record[op.from]!;
+        delete record[op.from];
+      });
+    } else if (op.kind === "dropModel") this.cache.editBaselines((record) => {
+      for (const key of Object.keys(record)) if (key !== "uuid") delete record[key];
+    });
+    else return;
+    this.cache.invalidateResults();
   }
 
   /** The window state changed: results cached under the old one are no longer right. */

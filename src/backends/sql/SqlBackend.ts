@@ -123,6 +123,8 @@ export class SqlBackend
   private readonly provisioned = new Map<string, Promise<unknown>>();
   /** Live column sets, read once per model per migration run and invalidated by any DDL that moves them. */
   private readonly liveColumnCache = new Map<string, Set<string>>();
+  /** Models whose layout this backend changed (registration or DDL) — what a transaction scope hands back. */
+  private readonly touched = new Set<string>();
   private readonly uniquePreCheck: boolean;
   private saveQueue: PersistedChange[] = [];
   private removeQueue: PersistedChange[] = [];
@@ -143,6 +145,7 @@ export class SqlBackend
   }
 
   async registerModel(model: string, indexes: IndexSpec[], fields: FieldSpec[] = []): Promise<void> {
+    this.touched.add(model);
     // Provisioning is memoized per model, so a *re-registration* that widens the declared field set
     // would otherwise update the field list without ever creating the columns — and every subsequent
     // query would then name a column that isn't there. Drop the memo when the shape actually changes.
@@ -300,6 +303,7 @@ export class SqlBackend
    * old name and silently return nothing for it.
    */
   private refreshModel(op: MigrationOp & { model: string }): void {
+    this.touched.add(op.model);
     this.liveColumnCache.delete(op.model);
     this.provisioned.delete(op.model);
 
@@ -605,16 +609,24 @@ export class SqlBackend
     }
   }
 
+  /**
+   * Take over what the scope changed — and only that. The scope started from a snapshot of this
+   * backend, so copying back everything would undo whatever was registered here while the
+   * transaction ran (a `define()` meanwhile, or a re-registration with new fields).
+   */
   private adoptSchema(scoped: SqlBackend): void {
-    for (const model of new Set([...this.schemas.keys(), ...scoped.schemas.keys()])) {
+    for (const model of scoped.touched) {
       const fields = scoped.schemas.get(model);
       if (fields) this.schemas.set(model, fields);
       else this.schemas.delete(model);
+      const indexes = scoped.indexes.get(model);
+      if (indexes) this.indexes.set(model, indexes);
+      else this.indexes.delete(model);
+      const provisioned = scoped.provisioned.get(model);
+      if (provisioned) this.provisioned.set(model, provisioned);
+      else this.provisioned.delete(model);
+      this.liveColumnCache.delete(model);
     }
-    scoped.indexes.forEach((specs, model) => this.indexes.set(model, specs));
-    scoped.provisioned.forEach((done, model) => this.provisioned.set(model, done));
-    for (const model of this.provisioned.keys()) if (!scoped.provisioned.has(model)) this.provisioned.delete(model);
-    this.liveColumnCache.clear();
   }
 
   /**

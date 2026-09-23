@@ -154,3 +154,28 @@ describe("MongoBackend with objectIdIdentity (ObjectId _id and FK fields)", () =
     expect(fav!.label).toBe("liked");
   });
 });
+
+describe("migrations over an ObjectId identity", () => {
+  // Like the real driver's ObjectId: anything that isn't 24 hex characters throws.
+  class StrictOid extends Oid {
+    constructor(hex: string) {
+      if (!/^[0-9a-f]{24}$/.test(hex)) throw new Error(`input must be a 24 character hex string: ${hex}`);
+      super(hex);
+    }
+  }
+
+  it("keys the library's own bookkeeping with plain strings, which an ObjectId can't encode", async () => {
+    const db = new Db();
+    const identity = objectIdIdentity(StrictOid as unknown as new (hex: string) => unknown);
+    const orm = new RepositoryManager({ backend: new MongoBackend(db, identity), generateId: () => "b".repeat(24) });
+    const users = orm.define({ name: "User", properties: { email: text() } });
+    await users.save(users.createInstance({ email: "a@x.com" })).persist();
+
+    const report = await orm.migrate([{ name: "0001_tier", up: (m) => m.addField("User", "tier", "text", { fill: "free" }) }]);
+    expect(report.applied).toEqual(["0001_tier"]);
+    const journal = db.collection("_object_repository_migration_log").docs;
+    expect(journal.length).toBeGreaterThan(0);
+    expect(journal.every((row) => typeof row.uuid === "string")).toBe(true);
+    expect(db.collection("User").docs[0]!._id).toBeInstanceOf(Oid); // application data keeps its identity
+  });
+});

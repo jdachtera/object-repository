@@ -1,7 +1,8 @@
 import type { Backend, IndexSpec, IndexField, FieldSpec } from "../core/Backend.ts";
 import { isRawQueryable, isSchemaAware, isTransactional, migrationTarget } from "../core/Backend.ts";
 import { runMigrations, rollbackMigrations, type RunnerOptions } from "../migrations/run.ts";
-import { BackendJournal } from "../migrations/journal.ts";
+import { BackendJournal, type JournalRow } from "../migrations/journal.ts";
+import { downOps } from "../migrations/ops.ts";
 import { WindowState } from "./windowState.ts";
 import { planMigrations } from "../migrations/plan.ts";
 import type { MigrateOptions, Migration, MigrationPlan, MigrationReport } from "../migrations/types.ts";
@@ -125,6 +126,8 @@ export class RepositoryManager {
   /** Which compatibility windows the store says have closed — read once a model declares one. */
   private readonly windows = new WindowState();
   private windowsLoaded = false;
+  /** The applied journal rows this process knows about; newer ones changed the store behind it. */
+  private seenApplied: Set<string> | null = null;
 
   constructor(options: RepositoryManagerOptions = {}) {
     this.backend = options.backend ?? new InMemoryBackend();
@@ -301,25 +304,47 @@ export class RepositoryManager {
    * `releasable` lists rather than running.
    */
   async migrate(migrations: Migration[], options: MigrateOptions = {}): Promise<MigrationReport> {
+    await this.snapshotJournal();
     try {
       return await runMigrations(this.backend, migrations, this.runnerOptions(options));
     } finally {
-      if (this.windowsLoaded) await this.refreshSchemaState().catch(() => {});
+      await this.refreshSchemaState().catch(() => {});
     }
   }
 
   /**
-   * Re-read which compatibility windows the store has closed (their contract has run), and stop
-   * mirroring those. `migrate()` and `rollback()` do this for their own process; a long-running
+   * Re-read the migration journal: stop mirroring compatibility windows whose contract has run, and
+   * bring the repositories' write baselines in line with any field a migration has since dropped or
+   * renamed (otherwise a save of a record loaded earlier writes the dropped field back). `migrate()` and `rollback()` do this for their own process; a long-running
    * process whose store was migrated by another (a deploy step releasing a contract) calls it to pick
    * the change up, or is restarted without the retired property.
    */
   async refreshSchemaState(): Promise<void> {
     const rows = await new BackendJournal(migrationTarget(this.backend), this.ctx).load();
+    // Journalled work this process hasn't seen yet changed the stored shape under its repositories.
+    const applied = rows.filter((row) => row.status === "applied");
+    if (this.seenApplied) {
+      for (const row of applied) {
+        if (this.seenApplied.has(journalKey(row))) continue;
+        for (const op of row.ops) if ("model" in op) this.registry.get(op.model)?.storeChanged(op);
+      }
+    }
+    this.seenApplied = new Set(applied.map(journalKey));
     const changed = this.windows.update(rows);
     for (const model of changed) {
       this.register(model);
       this.registry.get(model)?.windowsChanged();
+    }
+  }
+
+  /** Remember which journal rows exist before this process migrates, so it can tell what ran. */
+  private async snapshotJournal(): Promise<void> {
+    if (this.seenApplied) return;
+    try {
+      const rows = await new BackendJournal(migrationTarget(this.backend), this.ctx).load();
+      this.seenApplied = new Set(rows.filter((row) => row.status === "applied").map(journalKey));
+    } catch {
+      // unreadable: nothing to compare against, as for a process that never read it
     }
   }
 
@@ -342,10 +367,19 @@ export class RepositoryManager {
    * adopted from the legacy table (unless `rollbackAdopted`). See docs/MIGRATIONS.md.
    */
   async rollback(migrations: Migration[], count = 1, options: MigrateOptions = {}): Promise<MigrationReport> {
+    await this.snapshotJournal();
+    let report: MigrationReport | undefined;
     try {
-      return await rollbackMigrations(this.backend, migrations, count, this.runnerOptions(options));
+      report = await rollbackMigrations(this.backend, migrations, count, this.runnerOptions(options));
+      return report;
     } finally {
-      if (this.windowsLoaded) await this.refreshSchemaState().catch(() => {});
+      // A rollback's `down` ops aren't journalled, so apply the ones that ran to the baselines directly.
+      for (const name of report?.applied ?? []) {
+        const migration = migrations.find((candidate) => candidate.name === name);
+        if (!migration) continue;
+        for (const op of await downOps(migration)) if ("model" in op) this.registry.get(op.model)?.storeChanged(op);
+      }
+      await this.refreshSchemaState().catch(() => {});
     }
   }
 
@@ -526,4 +560,9 @@ function indexSpecs(properties: PropertyMap, declared: IndexDecl[] | undefined):
     });
   }
   return specs;
+}
+
+/** A journal row's identity across reads: re-applying a phase (after a rollback) is a new event. */
+function journalKey(row: JournalRow): string {
+  return `${row.name}\0${row.phase}\0${row.appliedAt}`;
 }

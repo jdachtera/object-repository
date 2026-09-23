@@ -130,3 +130,34 @@ describe("SQL transactions", () => {
     expect(pool.log).toEqual(["BEGIN", "SELECT", "INSERT", "ROLLBACK", "RELEASE"]);
   });
 });
+
+describe("a committed transaction hands back only what it changed", () => {
+  it("keeps a model registered, or re-registered, while the transaction was open", async () => {
+    const { newDb } = await import("pg-mem");
+    const { PostgresBackend } = await import("./sql/PostgresBackend.js");
+    const { Pool } = newDb().adapters.createPg();
+    const backend = new PostgresBackend(new Pool());
+    await backend.registerModel("Old", [], [{ name: "a", type: "text" }]);
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const tx = backend.transaction(async () => {
+      await gate;
+    }, ctx);
+    // Meanwhile, outside the transaction: a new model, and a redefinition with a new column.
+    await backend.registerModel("Late", [], [{ name: "title", type: "text" }]);
+    await backend.registerModel("Old", [], [{ name: "a", type: "text" }, { name: "b", type: "text" }]);
+    release();
+    await tx;
+
+    backend.save("Late", { uuid: "l1", title: "kept" }, ctx);
+    backend.save("Old", { uuid: "o1", a: "x", b: "y" }, ctx);
+    await backend.persist(ctx);
+    const byColumn = (model: string, field: string, value: string) =>
+      backend.query({ model, where: { type: "compare", property: field, comparator: "=", value }, order: [], paging: { start: 0 } }, ctx);
+    expect(await byColumn("Late", "title", "kept")).toHaveLength(1);
+    expect(await byColumn("Old", "b", "y")).toHaveLength(1);
+    const raw = await backend.raw({ sql: `SELECT "b" FROM "Old" WHERE uuid = $1`, params: ["o1"] }, ctx);
+    expect(raw[0]).toMatchObject({ b: "y" }); // in its column, not the JSON overflow
+  });
+});

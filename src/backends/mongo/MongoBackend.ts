@@ -16,6 +16,7 @@ import type {
   Unsubscribe,
   UpsertingBackend
 } from "../../core/Backend.ts";
+import { isReservedModel } from "../../core/Backend.ts";
 import type { Capabilities, Context, JsonObject, JsonValue, Uuid } from "../../core/types.ts";
 import type { QueryPlan, Comparator, AggregatePlan, AggregateResultRow, AggregateStage, ExpressionNode, DatePart, ValueNode, TextMode } from "../../core/QueryPlan.ts";
 import { generateUuid } from "../../core/uuid.ts";
@@ -192,6 +193,15 @@ export class MongoBackend
   private removeQueue: PersistedChange[] = [];
   private readonly listeners = new Set<ChangeListener>();
 
+  /**
+   * The identity for `model`. The library's own bookkeeping (the migration journal, schema state and
+   * lease) is keyed by fixed strings like `__lock__`, which an ObjectId identity cannot encode, so those
+   * models always use plain string keys whatever identity the application's models use.
+   */
+  private identityFor(model: string): MongoIdentity {
+    return isReservedModel(model) ? UUID_IDENTITY : this.identity;
+  }
+
   constructor(database: MongoDatabase, identity: MongoIdentity = UUID_IDENTITY, options: MongoBackendOptions = {}) {
     this.db = database;
     this.identity = identity;
@@ -199,7 +209,7 @@ export class MongoBackend
   }
 
   private filter(model: string, where: ExpressionNode): MongoFilter {
-    return compileMongoFilter(where, this.identity, model);
+    return compileMongoFilter(where, this.identityFor(model), model);
   }
 
   async registerModel(model: string, indexes: IndexSpec[]): Promise<void> {
@@ -220,7 +230,7 @@ export class MongoBackend
       indexes.map((index) => {
         const keys = Object.fromEntries(
           index.fields.map((f) => [
-            f.path === "uuid" ? this.identity.field : f.path,
+            f.path === "uuid" ? this.identityFor(model).field : f.path,
             index.text ? "text" : f.descending ? -1 : 1
           ])
         );
@@ -240,9 +250,9 @@ export class MongoBackend
     if (plan.paging.end !== undefined && plan.paging.end <= plan.paging.start) return [];
     const docs = await this.db
       .collection(plan.model)
-      .find(this.filter(plan.model, plan.where), findOptions(plan, this.identity))
+      .find(this.filter(plan.model, plan.where), findOptions(plan, this.identityFor(plan.model)))
       .toArray();
-    return docs.map((doc) => fromStored(doc, plan.model, this.identity));
+    return docs.map((doc) => fromStored(doc, plan.model, this.identityFor(plan.model)));
   }
 
   /**
@@ -287,7 +297,7 @@ export class MongoBackend
   }
 
   async patch(model: string, uuid: string, ops: Record<string, PatchOp>, _ctx: Context): Promise<void> {
-    await this.db.collection(model).updateOne(keyFilter(uuid, this.identity), compileMongoUpdate(ops));
+    await this.db.collection(model).updateOne(keyFilter(uuid, this.identityFor(model)), compileMongoUpdate(ops));
   }
 
   /**
@@ -331,8 +341,8 @@ export class MongoBackend
 
   async upsert(model: string, where: ExpressionNode, set: JsonObject, setOnInsert: JsonObject, _ctx: Context): Promise<void> {
     const update: Record<string, object> = {};
-    const mappedSet = toStoredFields(set, model, this.identity);
-    const mappedInsert = toStoredFields(setOnInsert, model, this.identity);
+    const mappedSet = toStoredFields(set, model, this.identityFor(model));
+    const mappedInsert = toStoredFields(setOnInsert, model, this.identityFor(model));
     if (Object.keys(mappedSet).length) update.$set = mappedSet;
     if (Object.keys(mappedInsert).length) update.$setOnInsert = mappedInsert;
     await this.db.collection(model).updateOne(this.filter(model, where), update, { upsert: true });
@@ -367,9 +377,10 @@ export class MongoBackend
 
       const freed = new Set(changes.map((c) => String(c.record.uuid)));
       for (const change of removed) if (change.model === model) freed.add(String(change.record.uuid));
-      const idField = this.identity.field;
+      const identity = this.identityFor(model);
+      const idField = identity.field;
       const filterField = (f: string) => (f === "uuid" ? idField : f);
-      const encodeVal = (f: string, v: unknown): unknown => (f === "uuid" ? this.identity.encode(String(v)) : v);
+      const encodeVal = (f: string, v: unknown): unknown => (f === "uuid" ? identity.encode(String(v)) : v);
 
       const collection = this.db.collection(model);
       for (const fields of keySets) {
@@ -382,7 +393,7 @@ export class MongoBackend
           fields.length === 1
             ? { [filterField(fields[0]!)]: { $in: tuples.map((t) => encodeVal(fields[0]!, t[0])) } }
             : { $or: tuples.map((t) => Object.fromEntries(fields.map((f, i) => [filterField(f), encodeVal(f, t[i])]))) };
-        const notFreed: MongoFilter = { [idField]: { $nin: [...freed].map((u) => this.identity.encode(u)) } };
+        const notFreed: MongoFilter = { [idField]: { $nin: [...freed].map((u) => identity.encode(u)) } };
         const found = await collection.find({ $and: [notFreed, keyPredicate] }, { limit: 1 }).toArray();
         if (found.length > 0) throw new UniqueConstraintError(model, fields);
       }
@@ -401,10 +412,10 @@ export class MongoBackend
    */
   async acquireLease(model: string, key: string, owner: string, now: number, ttlMs: number, _ctx: Context): Promise<boolean> {
     const collection = this.db.collection(model);
-    if (this.identity.field !== "_id") await collection.createIndex({ [this.identity.field]: 1 }, { unique: true });
+    if (this.identityFor(model).field !== "_id") await collection.createIndex({ [this.identityFor(model).field]: 1 }, { unique: true });
     try {
       await collection.updateOne(
-        { ...keyFilter(key, this.identity), $or: [{ expiresAt: { $lte: now } }, { expiresAt: null }, { owner }] },
+        { ...keyFilter(key, this.identityFor(model)), $or: [{ expiresAt: { $lte: now } }, { expiresAt: null }, { owner }] },
         { $set: { owner, expiresAt: now + ttlMs } },
         { upsert: true }
       );
@@ -416,7 +427,7 @@ export class MongoBackend
   }
 
   async releaseLease(model: string, key: string, owner: string, _ctx: Context): Promise<void> {
-    await this.db.collection(model).bulkWrite([{ deleteOne: { filter: { ...keyFilter(key, this.identity), owner } } }]);
+    await this.db.collection(model).bulkWrite([{ deleteOne: { filter: { ...keyFilter(key, this.identityFor(model)), owner } } }]);
   }
 
   async persist(_ctx: Context): Promise<PersistResult> {
@@ -452,17 +463,17 @@ export class MongoBackend
       // whole `bulkWrite` — every unrelated write batched with it — down. A dirty hint naming only
       // deleted fields produces exactly that shape, so include each operator only when it has work,
       // and skip the op entirely when neither does.
-      const stored = toStoredFields(fields, change.model, this.identity);
+      const stored = toStoredFields(fields, change.model, this.identityFor(change.model));
       const update: Record<string, object> = {};
       if (Object.keys(stored).length) update.$set = stored;
       if (removed.length) update.$unset = Object.fromEntries(removed.map((f) => [f, ""]));
       if (!Object.keys(update).length) continue;
       push(change.model, {
-        updateOne: { filter: keyFilter(id, this.identity), update, upsert: true }
+        updateOne: { filter: keyFilter(id, this.identityFor(change.model)), update, upsert: true }
       });
     }
     for (const change of removed) {
-      push(change.model, { deleteOne: { filter: keyFilter(String(change.record.uuid), this.identity) } });
+      push(change.model, { deleteOne: { filter: keyFilter(String(change.record.uuid), this.identityFor(change.model)) } });
     }
     for (const [model, ops] of byModel) {
       if (ops.length) await this.db.collection(model).bulkWrite(ops);

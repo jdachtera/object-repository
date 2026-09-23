@@ -307,9 +307,12 @@ Stated plainly, because a safety mechanism you misunderstand is worse than none.
 3. **Non-library readers during a window.** The *legacy* column is the source of truth while the window
    is open. BI tools, reporting replicas and hand-written SQL must read that one. `plan()` prints the
    exact field pair. This is the real cost of the design, and it is deliberate.
-4. **A process that outlives a release it didn't run.** It keeps mirroring into the dropped legacy
-   field until it calls `orm.refreshSchemaState()` or restarts. Refresh or restart app servers after a
-   release.
+4. **A process that outlives a migration it didn't run.** Until it calls `orm.refreshSchemaState()`
+   or restarts, it keeps mirroring into a legacy field a release dropped. Records it loaded before the
+   migration also still carry fields the migration dropped, and a save would write them back. Call
+   `refreshSchemaState()` at startup (so it knows where the journal stood) and after every deploy that
+   migrates, or restart app servers after one. A process's own `migrate()` and `rollback()` do this for
+   it.
 5. **Field-level sync during a window.** `mergeByField` compares per-field versions independently, so a
    two-writer merge can briefly pick the legacy half from one replica and the canonical half from
    another. It self-heals on the next full write through the Repository, but it is not atomic.
