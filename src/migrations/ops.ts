@@ -107,7 +107,7 @@ function asStoredType(type: string): StoredType {
 
 /**
  * The type lattice: which retypes preserve every existing value. Widening is `expand`; anything else
- * has to be authored as a rename to a new field, which gets a proper compatibility window.
+ * has to be authored as a new field of the new type, with the values converted by a transform.
  */
 const WIDER_THAN: Readonly<Record<StoredType, readonly StoredType[]>> = {
   integer: ["float", "text", "json", "scalar"],
@@ -240,7 +240,7 @@ export function narrowingRetypes(migration: string, ops: MigrationOp[]): Migrati
     blockers.push({
       code: "NARROWING_RETYPE",
       migration,
-      message: `"${migration}" narrows ${op.model}.${op.field} from ${op.from} to ${op.to}, which loses values. Author it as a rename to a new field so it gets a compatibility window.`
+      message: `"${migration}" narrows ${op.model}.${op.field} from ${op.from} to ${op.to}, which loses values. Add a new field of the new type and convert the values with a transform, then retire the old field.`
     });
   }
   return blockers;

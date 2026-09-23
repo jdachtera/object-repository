@@ -436,12 +436,18 @@ function withSoftDelete(properties: PropertyMap, field: string): PropertyMap {
  * to the JSON overflow while the column itself goes stale.
  */
 function fieldSpecs(properties: PropertyMap, closed: (legacy: string) => boolean = () => false): FieldSpec[] {
+  const heldBy = new Map<string, string>();
+  for (const name of Object.keys(properties)) {
+    const property = properties[name] as AnyProperty;
+    if (property.kind === "scalar" && property.mirrors && !closed(name)) heldBy.set(property.mirrors, name);
+  }
   const fields: FieldSpec[] = [];
   for (const name of Object.keys(properties)) {
     const property = properties[name] as AnyProperty;
     if (property.kind !== "scalar") continue;
     if (property.mirrors && closed(name)) continue;
-    fields.push({ name, type: property.type });
+    const legacy = heldBy.get(name);
+    fields.push(legacy ? { name, type: property.type, mirroredBy: legacy } : { name, type: property.type });
   }
   return fields;
 }
@@ -474,6 +480,14 @@ function assertMirrorsAreSound(model: string, properties: PropertyMap): void {
       throw new Error(`"${model}.${name}" declares \`mirrors\` without \`deprecatedSince\`, so its window has no gate to close.`);
     }
     const target = properties[canonical] as AnyProperty;
+    if (target.kind === "scalar" && (target.type !== property.type || (target.type === "scalar" && target.codec !== property.codec))) {
+      // Mirroring copies stored values between the halves as they are. Different types would hand
+      // the canonical field values in the legacy field's encoding — strings from an integer field,
+      // comparisons that never match — and write them back into a field an older build reads.
+      throw new Error(
+        `"${model}.${name}" (${property.type}) mirrors "${canonical}" (${target.type}). Both halves of a window must have the same type; change a type by adding a new field and migrating values with a transform.`
+      );
+    }
     if (target.kind === "scalar" && target.unique) {
       // Two unique constraints over one logical value double-report in the uniqueness pre-check, and
       // the legacy half already carries the constraint until the contract runs.

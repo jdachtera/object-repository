@@ -11,6 +11,7 @@ import type {
   Unsubscribe
 } from "../../core/Backend.ts";
 import { isCounting, isRawQueryable, isSchemaAware } from "../../core/Backend.ts";
+import { substituteNode } from "../../repository/mirror.ts";
 import { isMigratable, type Migration, type MigrationReport } from "../sql/migrate.ts";
 import type { Capabilities, Context, JsonObject, Uuid } from "../../core/types.ts";
 import type { QueryPlan } from "../../core/QueryPlan.ts";
@@ -66,6 +67,9 @@ export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBacke
   migrate?: (migrations: Migration[]) => Promise<MigrationReport>;
   rollback?: (migrations: Migration[], count: number) => Promise<MigrationReport>;
 
+  /** Per model, canonical field → the legacy field holding its value (open compatibility windows). */
+  private readonly mirrors = new Map<string, Map<string, string>>();
+
   constructor(
     private readonly inner: Backend,
     private readonly policy: AccessPolicy
@@ -79,7 +83,24 @@ export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBacke
   }
 
   registerModel(model: string, indexes: IndexSpec[], fields?: FieldSpec[]): void | Promise<void> {
+    const mirrors = new Map<string, string>();
+    for (const field of fields ?? []) if (field.mirroredBy) mirrors.set(field.name, field.mirroredBy);
+    if (mirrors.size) this.mirrors.set(model, mirrors);
+    else this.mirrors.delete(model);
     if (isSchemaAware(this.inner)) return this.inner.registerModel(model, indexes, fields);
+  }
+
+  /**
+   * The context's read filter for `model`, naming fields as the store holds them. A policy written
+   * against the canonical half of an open compatibility window would otherwise test the stale copy:
+   * after an older build hands a record to someone else, the previous owner could still read it and
+   * the new one couldn't.
+   */
+  private readFilter(model: string, ctx: Context): Expression | null {
+    const filter = this.policy.read?.(model, ctx) ?? null;
+    const mirrors = this.mirrors.get(model);
+    if (!filter || !mirrors) return filter;
+    return parse(substituteNode(filter.serialize(), mirrors));
   }
 
   /**
@@ -136,7 +157,7 @@ export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBacke
 
   changes(listener: ChangeListener, ctx: Context): Unsubscribe {
     return this.inner.changes((event) => {
-      const filter = this.policy.read?.(event.model, ctx) ?? null;
+      const filter = this.readFilter(event.model, ctx);
       if (!filter) return listener(event); // model fully readable → every event passes
       // A `saved` event carries the record, so match it against the read filter. A `removed` event
       // carries only model+uuid — with a read policy in force we can't prove the deleted record was
@@ -146,7 +167,7 @@ export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBacke
   }
 
   private rewrite(plan: QueryPlan, ctx: Context): QueryPlan {
-    const extra = this.policy.read?.(plan.model, ctx) ?? null;
+    const extra = this.readFilter(plan.model, ctx);
     if (!extra) return plan;
     const where = plan.where.type === "all" ? extra : and(parse(plan.where), extra);
     return { ...plan, where: where.serialize() };

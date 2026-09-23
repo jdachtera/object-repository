@@ -9,7 +9,11 @@ import { describe, it, expect } from "vitest";
 import { InMemoryBackend } from "../backends/memory/InMemoryBackend.js";
 import { SQLiteBackend } from "../backends/sqlite/SQLiteBackend.js";
 import { RepositoryManager } from "./RepositoryManager.js";
-import { text } from "../properties/factories.js";
+import { text, integer, relationToOne, scalar } from "../properties/factories.js";
+import { switchExpr, cmp } from "../expressions/values.js";
+import { any } from "../expressions/builders.js";
+import { liveQuery } from "./liveQuery.js";
+import { PolicyBackend } from "../backends/decorators/PolicyBackend.js";
 import { eq, neq, and, or, field } from "../expressions/index.js";
 import { set } from "./patch.js";
 import { SYSTEM_CONTEXT } from "../core/types.js";
@@ -457,5 +461,125 @@ describe("writes through either name stay in step", () => {
     });
     users.save(users.createInstance({ fullName: "Ann" }));
     await expect(users.persist()).resolves.toBeDefined();
+  });
+});
+
+describe("substitution reaches every place a field is named", () => {
+  const mirrors = new Map([["fullName", "name"]]);
+
+  it("rewrites inside switch branches", () => {
+    const node = switchExpr([[cmp(field("fullName"), "=", "Ann"), 1]], 0).serialize() as unknown as { branches: Array<{ when: unknown }> };
+    const out = substituteValue(node as never, mirrors) as unknown as { branches: Array<{ when: unknown }> };
+    expect(JSON.stringify(out.branches[0]!.when)).toContain('"name"');
+    expect(JSON.stringify(out.branches[0]!.when)).not.toContain("fullName");
+  });
+
+  it("leaves an any() predicate alone — it names the element's fields, not the model's", () => {
+    const node = any("aliases", eq("fullName", "x")).serialize();
+    expect(substituteNode(node, new Map([["aliases", "oldAliases"], ["fullName", "name"]]))).toEqual({
+      ...node,
+      property: "oldAliases"
+    });
+  });
+});
+
+describe("the window holds beyond plain queries", () => {
+  it("wakes a live query naming the canonical field when an old build writes the legacy one", async () => {
+    const backend = new InMemoryBackend();
+    const current = newBuild(backend);
+    current.save(current.createInstance({ uuid: "u1", fullName: "Ann" }));
+    await current.persist();
+
+    const live = liveQuery(current.all().filter(eq("fullName", "Bo")));
+    live.subscribe(() => {});
+    for (let i = 0; i < 50 && live.getSnapshot().data === undefined; i++) await Promise.resolve();
+    expect(live.getSnapshot().data).toEqual([]);
+
+    const legacy = oldBuild(backend);
+    const record = (await legacy.get("u1"))!;
+    record.name = "Bo";
+    legacy.save(record);
+    await legacy.persist();
+
+    for (let i = 0; i < 50 && live.getSnapshot().data?.length !== 1; i++) await new Promise((r) => setTimeout(r, 0));
+    expect(live.getSnapshot().data!.map((u) => u.fullName)).toEqual(["Bo"]);
+  });
+
+  it("projects a related record's canonical field from the legacy half", async () => {
+    const backend = new InMemoryBackend();
+    const orm = new RepositoryManager({ backend, schema: { schemaVersion: 7, minSupportedSchemaVersion: 5 } });
+    const users = orm.define({ name: "User", properties: { fullName: text(), name: text({ deprecatedSince: 7, mirrors: "fullName" }) } });
+    const orders = orm.define({ name: "Order", properties: { buyer: relationToOne({ model: "User" }) } });
+    const ann = users.createInstance({ uuid: "u1", fullName: "Ann" });
+    users.save(ann);
+    orders.save(orders.createInstance({ uuid: "o1", buyer: ann } as never));
+    await orm.transaction(async () => {});
+    await users.persist();
+
+    const legacy = oldBuild(backend);
+    const record = (await legacy.get("u1"))!;
+    record.name = "Ann Lee";
+    legacy.save(record);
+    await legacy.persist();
+
+    const fresh = new RepositoryManager({ backend, schema: { schemaVersion: 7, minSupportedSchemaVersion: 5 } });
+    fresh.define({ name: "User", properties: { fullName: text(), name: text({ deprecatedSince: 7, mirrors: "fullName" }) } });
+    const freshOrders = fresh.define({ name: "Order", properties: { buyer: relationToOne({ model: "User" }) } });
+    const [row] = (await freshOrders.all().select({ buyer: { fullName: true } })) as Array<{ buyer: { fullName: string } }>;
+    expect(row!.buyer.fullName).toBe("Ann Lee");
+  });
+
+  it("substitutes a dotted path into an embedded model's own window", async () => {
+    const backend = new InMemoryBackend();
+    backend.save("Order", { uuid: "o1", shipTo: { uuid: "a1", city: "Oslo", town: "stale" } }, ctx);
+    await backend.persist(ctx);
+
+    const orm = new RepositoryManager({ backend, schema: { schemaVersion: 7, minSupportedSchemaVersion: 5 } });
+    orm.define({ name: "Address", properties: { town: text(), city: text({ deprecatedSince: 7, mirrors: "town" }) } });
+    const orders = orm.define({ name: "Order", properties: { shipTo: relationToOne({ model: "Address", storage: "embed" }) } });
+    expect(await orders.all().filter(eq("shipTo.town", "Oslo")).count()).toBe(1);
+  });
+
+  it("applies a read policy naming the canonical field to the legacy half", async () => {
+    const store = new InMemoryBackend();
+    const policy = new PolicyBackend(store, {
+      read: (_model, context) => eq("owner", String((context as unknown as { user: string }).user))
+    });
+    const asUser = (user: string) =>
+      new RepositoryManager({
+        backend: policy,
+        context: { ...ctx, user } as unknown as Context,
+        schema: { schemaVersion: 7, minSupportedSchemaVersion: 5 }
+      }).define({ name: "Doc", properties: { owner: text(), ownerId: text({ deprecatedSince: 7, mirrors: "owner" }) } });
+
+    const alice = asUser("alice");
+    alice.save(alice.createInstance({ uuid: "d1", owner: "alice" }));
+    await alice.persist();
+    // An old build, beneath the policy, hands the record to bob through the only field it knows.
+    store.save("Doc", { uuid: "d1", owner: "alice", ownerId: "bob" }, ctx);
+    await store.persist(ctx);
+
+    expect(await asUser("alice").all().count()).toBe(0);
+    expect(await asUser("bob").all().count()).toBe(1);
+  });
+});
+
+describe("define() refuses a window whose halves differ in type", () => {
+  it("refuses an integer canonical over a text legacy field", () => {
+    expect(() =>
+      new RepositoryManager({ backend: new InMemoryBackend() }).define({
+        name: "Item",
+        properties: { quantity: integer(), qty: text({ deprecatedSince: 7, mirrors: "quantity" }) }
+      })
+    ).toThrow(/same type/);
+  });
+});
+
+describe("scalar() with a custom codec", () => {
+  it("keeps its window options", () => {
+    const codec = { encode: (v: string) => v, decode: (v: unknown) => String(v) };
+    const schema = text()["schema" as never];
+    const legacy = scalar(schema, codec, { deprecatedSince: 7, mirrors: "fullName" });
+    expect([legacy.deprecatedSince, legacy.mirrors]).toEqual([7, "fullName"]);
   });
 });

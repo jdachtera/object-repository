@@ -167,7 +167,7 @@ Withheld by the version gate (1):
 | `addIndex` | expand | …unless `unique` |
 | `addIndex` with `unique: true` | **contract** | rejects writes an older supported build may legitimately make; on IndexedDB a unique index over already-duplicate data aborts the upgrade transaction and bricks the local database |
 | `dropField`, `dropModel`, `dropIndex`, `renameField` | **contract** | destroys the old shape |
-| `retypeField` (narrowing) | **refused** | author it as a rename to a new field, which earns a window |
+| `retypeField` (narrowing) | **refused** | add a new field of the new type and convert values with a `transform`. A rename's window can't change a type: both halves must match |
 | `sql()` | author-declared, defaults to expand | SQL backends only |
 
 An operation kind the runtime doesn't recognise classifies as **contract**. Withholding something

@@ -98,6 +98,17 @@ function rewrite(node: unknown, mirrors: Mirrors): unknown {
   for (const [key, value] of Object.entries(source)) {
     if ((key === "property" || key === "path") && typeof value === "string") {
       out[key] = mirrors.get(value) ?? value;
+    } else if (source.type === "any" && key === "predicate") {
+      // `any(items, pred)`: the predicate names fields of each *element*, not of this model, so the
+      // model's windows don't apply inside it.
+      out[key] = value;
+    } else if (key === "branches" && Array.isArray(value)) {
+      // `switch` branches are plain `{ when, then }` pairs, not nodes — rewrite inside each.
+      out[key] = value.map((branch) =>
+        typeof branch === "object" && branch !== null
+          ? Object.fromEntries(Object.entries(branch as Record<string, unknown>).map(([k, v]) => [k, rewrite(v, mirrors)]))
+          : branch
+      );
     } else if (Array.isArray(value)) {
       out[key] = value.map((item) => (isNode(item) ? rewrite(item, mirrors) : item));
     } else if (isNode(value)) {

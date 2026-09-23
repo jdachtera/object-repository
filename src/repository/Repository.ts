@@ -184,7 +184,9 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     // can't be evaluated by `match()` on the raw stored record (the relation is a bare uuid there), so
     // fall back to "always relevant" on own-model changes rather than risk wrongly skipping one.
     const precise = where && where.type !== "all" && relatedModels.size === 0;
-    const entry = { notify: listener, matcher: precise ? parse(where!) : null };
+    // Matched against stored records, so a mirrored field has to be named as the store holds it —
+    // otherwise an old build's write to the legacy field would never look relevant.
+    const entry = { notify: listener, matcher: precise ? parse(substituteNode(where!, this.mirrors)) : null };
     this.liveListeners.add(entry);
 
     const unsubscribes: Array<() => void> = [() => this.liveListeners.delete(entry)];
@@ -675,7 +677,9 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     if (uuids.length === 0) return new Map();
     // A projected relation load excludes soft-deleted targets by default (like the eager path).
     const where = this.liveWhere(inList("uuid", uuids).serialize());
-    const plan = { model: this.modelName, where, order: [] as SortKey[], paging: { start: 0 }, project: neededFields(selection) };
+    if (this.mirrors.size > 0) await this.windows?.ready;
+    const project = neededFields(selection).map((field) => this.mirrors.get(field) ?? field);
+    const plan = { model: this.modelName, where, order: [] as SortKey[], paging: { start: 0 }, project };
     const rows = await this.backend.query(plan, this.ctx);
     const loaded = await this.loadProjectedBatch(rows, selection);
     return new Map(loaded.map((instance) => [String(instance.uuid), instance]));
@@ -695,7 +699,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
   ): Promise<{ node: ExpressionNode; rewritten: boolean }> {
     // Every read that substitutes window names passes through here: wait until this process knows
     // which windows are still open.
-    if (this.declaredMirrors.size > 0) await this.windows?.ready;
+    if (this.mirrors.size > 0) await this.windows?.ready;
     switch (node.type) {
       case "compare":
       case "in":
@@ -860,15 +864,28 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
    * onto it would find nothing.
    */
   private get mirrors(): Mirrors {
-    if (this.declaredMirrors.size === 0 || !this.windows) return this.declaredMirrors;
-    if (this.activeMirrors?.version !== this.windows.version) {
-      const open = new Map<string, string>();
-      for (const [canonical, legacy] of this.declaredMirrors) {
-        if (!this.windows.isClosed(this.modelName, legacy)) open.set(canonical, legacy);
-      }
-      this.activeMirrors = { version: this.windows.version, mirrors: open };
+    const version = this.windows?.version ?? 0;
+    if (this.activeMirrors?.version === version) return this.activeMirrors.mirrors;
+    const open = new Map<string, string>();
+    for (const [canonical, legacy] of this.declaredMirrors) {
+      if (!this.windows?.isClosed(this.modelName, legacy)) open.set(canonical, legacy);
     }
-    return this.activeMirrors.mirrors;
+    // An embedded model's own windows apply beneath its path: `address.town` → `address.city`.
+    let complete = true;
+    for (const name of Object.keys(this.properties)) {
+      const property = this.properties[name] as AnyProperty;
+      if (property.kind !== "relationToOne" && property.kind !== "relationToMany") continue;
+      if (property.storage !== "embed") continue;
+      const target = this.resolve(property.targetModel);
+      if (!target) {
+        complete = false; // not defined yet: don't cache a map that is missing its windows
+        continue;
+      }
+      if (target === this) continue;
+      for (const [canonical, legacy] of target.mirrors) open.set(`${name}.${canonical}`, `${name}.${legacy}`);
+    }
+    if (complete) this.activeMirrors = { version, mirrors: open };
+    return open;
   }
 
   /** The window state changed: results cached under the old one are no longer right. */

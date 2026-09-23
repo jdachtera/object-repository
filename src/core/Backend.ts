@@ -107,6 +107,12 @@ export interface FieldSpec {
   name: string;
   /** The stored-type tag (`text` / `integer` / `float` / `boolean` / `date` / `json` / `array` / `scalar`). */
   type: string;
+  /**
+   * While a rename's compatibility window is open, the legacy field that actually holds this field's
+   * value. A layer below the Repository that evaluates its own expressions against stored records (row
+   * policy) substitutes it, exactly as the Repository does for queries. Absent once the window closes.
+   */
+  mirroredBy?: string;
 }
 
 /**
