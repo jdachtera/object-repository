@@ -266,7 +266,8 @@ export class SqlBackend
     const columns = await this.exec.run(probe.sql, probe.params);
     if (columns.length === 0) return [];
     const rows = await this.exec.run(
-      `SELECT ${this.dialect.column("name")} AS name FROM ${this.dialect.ref(MIGRATIONS_TABLE)}`,
+      // In the order they were applied: adoption keeps that order, which is what `rollback` walks.
+      `SELECT ${this.dialect.column("name")} AS name FROM ${this.dialect.ref(MIGRATIONS_TABLE)} ORDER BY ${this.dialect.column("applied_at")}, ${this.dialect.column("name")}`,
       []
     );
     return rows.map((row) => String(row.name));

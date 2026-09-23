@@ -316,11 +316,24 @@ left untouched as your record.
 ## Rollback
 
 ```ts
-await orm.rollback(migrations);          // the most recent migration with a `down`
+await orm.rollback(migrations);          // the most recently applied migration
+await orm.rollback(migrations, 2);       // the two most recent, newest first
 ```
 
-Walks the order migrations were actually applied in, not declaration order — the array may have been
-reshuffled since. Refuses a migration whose applied operations destroyed data `down` cannot restore: a
-bare drop, but pointedly *not* a rename, whose values live on under the new name.
+The targets are exactly the `count` most recently applied migrations, by the store's own history
+rather than declaration order (the array may have been reshuffled since). Migrations applied in the
+same millisecond are ordered by declaration.
+
+If any target can't be reverted safely, the whole rollback is refused before anything runs. It never
+skips a target and reverts an older migration instead, underneath the newer one. A target is refused
+when:
+
+- it declares no `down`, or is no longer declared at all;
+- its window is still open: the contract hasn't run, and the legacy field holds the authoritative
+  values that the `down` would overwrite;
+- what it ran destroyed data `down` can't restore: a bare drop, but pointedly *not* a rename, whose
+  values live on under the new name;
+- it was adopted from the legacy tracking table, so what it did isn't recorded. Pass
+  `{ rollbackAdopted: true }` to run its `down` anyway.
 
 Prefer rolling forward in production. `down` is most useful in development.

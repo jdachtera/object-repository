@@ -335,10 +335,11 @@ export class RepositoryManager {
   }
 
   /**
-   * Revert the `count` most-recently-applied migrations that declare a `down` (default 1).
+   * Revert exactly the `count` most recently applied migrations (default 1), newest first.
    *
-   * Walks the order migrations were actually applied in, and refuses one whose applied operations
-   * destroyed data a `down` cannot restore — re-creating a dropped column hands back an empty one.
+   * Refuses the whole rollback, before anything runs, if one of them can't be reverted safely: no
+   * `down`, a compatibility window still open, data destroyed that `down` cannot restore, or history
+   * adopted from the legacy table (unless `rollbackAdopted`). See docs/MIGRATIONS.md.
    */
   async rollback(migrations: Migration[], count = 1, options: MigrateOptions = {}): Promise<MigrationReport> {
     try {

@@ -31,6 +31,7 @@ import {
 import { downOps } from "./ops.ts";
 import { destroysInWholePass, encodeResume, evaluateMigrations, type ResumePoint } from "./evaluate.ts";
 import type {
+  MigrationBlocker,
   MigrateOptions,
   Migration,
   MigrationOp,
@@ -52,6 +53,7 @@ export interface RunnerOptions extends MigrateOptions {
   schemaVersion?: number;
   /** Supplied for tests; defaults to the wall clock. */
   now?: () => number;
+
   /** Overrides the journal implementation (the SQL backends supply their own table-backed one). */
   journal?: MigrationJournal;
 }
@@ -239,36 +241,37 @@ export async function rollbackMigrations(
   );
 }
 
+/**
+ * The body of a rollback, once the lease is held.
+ *
+ * The targets are the `count` most recently applied migrations — exactly those, in that order. One
+ * that can't be reverted safely refuses the whole rollback before anything runs. Skipping past it
+ * would revert an *older* migration instead, underneath a newer one that may depend on it.
+ */
 async function rollbackAll(backend: Backend, migrations: Migration[], count: number, options: Running): Promise<MigrationReport> {
   const { journal } = options;
   const rows = await journal.load();
   const report: MigrationReport = { applied: [], skipped: [], expanded: [], contracted: [], deferred: [], releasable: [] };
   const byName = new Map(migrations.map((migration) => [migration.name, migration]));
+  const position = new Map(migrations.map((migration, index) => [migration.name, index]));
 
-  // Walk the order things were actually applied in, newest first. Declaration order can have been
-  // reshuffled since it ran, so the store's own history is the only reliable inverse ordering.
-  const order = rows
-    .filter((row) => row.status === "applied" && row.phase === "expand" && byName.has(row.name))
-    .sort((a, b) => b.appliedAt - a.appliedAt);
+  // Newest first, by the store's own history: declaration order can have been reshuffled since. Rows
+  // written within the same millisecond tie on `appliedAt`, so declaration order breaks the tie —
+  // never the reverse, which would pick the oldest of a batch applied together.
+  const targets = rows
+    .filter((row) => row.status === "applied" && row.phase === "expand")
+    .sort((a, b) => b.appliedAt - a.appliedAt || (position.get(b.name) ?? -1) - (position.get(a.name) ?? -1))
+    .slice(0, count);
 
-  for (const row of order) {
-    if (report.applied.length >= count) break;
-    const migration = byName.get(row.name)!;
-    if (!migration.down) {
-      report.skipped.push(migration.name);
-      continue;
-    }
-    // If what already ran destroyed data, `down` can restore the schema but not the values, so
-    // rolling back would quietly hand back an empty column. (A rename's drop is exempt — its values
-    // live on under the new name.)
-    const destroyed = rows.some(
-      (candidate) => candidate.name === migration.name && candidate.status === "applied" && destroysData(candidate.ops)
-    );
-    if (destroyed) {
-      report.skipped.push(migration.name);
-      continue;
-    }
+  const blockers: MigrationBlocker[] = [];
+  for (const target of targets) {
+    const refusal = rollbackRefusal(target, byName.get(target.name), rows, options);
+    if (refusal) blockers.push({ code: "ROLLBACK_REFUSED", migration: target.name, message: refusal });
+  }
+  if (blockers.length) throw new MigrationBlockedError(blockers);
 
+  for (const target of targets) {
+    const migration = byName.get(target.name)!;
     await runPhase(backend, migration, await downOps(migration), "expand", options, {
       resume: null,
       progress: null,
@@ -284,6 +287,35 @@ async function rollbackAll(backend: Backend, migrations: Migration[], count: num
   }
 
   return report;
+}
+
+/** Why rolling back this applied migration would be unsafe, or `null` if it can be. */
+function rollbackRefusal(
+  expand: JournalRow,
+  migration: Migration | undefined,
+  rows: JournalRow[],
+  options: RunnerOptions
+): string | null {
+  const name = JSON.stringify(expand.name);
+  if (!migration) return `${name} is the most recently applied migration but is not declared, so its \`down\` is unknown.`;
+  if (!migration.down) return `${name} declares no \`down\`.`;
+  if (!expand.opsHash && !expand.ops.length && !options.rollbackAdopted) {
+    // Adopted from an earlier tracking table: no record of what it did, nor of when relative to its
+    // neighbours. Its `down` may undo far more than intended (dropping the table it created).
+    return `${name} was adopted from the legacy tracking table, so what it did isn't recorded. Pass \`rollbackAdopted: true\` to run its \`down\` anyway.`;
+  }
+  const contract = rows.find((row) => row.name === expand.name && row.phase === "contract");
+  if (contract?.status === "pending" && contract.ops.length) {
+    // Mid-window, the legacy field is the authoritative copy: a `down` reversing the rename would
+    // copy the new build's stale mirror over what older builds have been writing.
+    return `${name} is mid-window — its contract hasn't run, and the legacy field still holds the authoritative values. Roll forward instead, or release the contract first.`;
+  }
+  // If what ran destroyed data, `down` can restore the schema but not the values: it would hand back
+  // an empty column. (A rename's drop is exempt — its values live on under the new name.)
+  if (rows.some((row) => row.name === expand.name && row.status === "applied" && destroysData(row.ops))) {
+    return `${name} destroyed data its \`down\` can't restore.`;
+  }
+  return null;
 }
 
 /**
@@ -329,8 +361,11 @@ export async function readHistory(
   }
   if (!names.length) return { rows: existing, adopted: false };
 
+  // Stamped in the legacy table's own order, one millisecond apart, so the history keeps its sequence:
+  // a single shared stamp would leave "most recent" to chance.
   const adopted: JournalRow[] = [];
-  for (const name of names) {
+  const base = now();
+  names.forEach((name, index) => {
     for (const phase of ["expand", "contract"] as const) {
       adopted.push({
         name,
@@ -340,10 +375,10 @@ export async function readHistory(
         ops: [],
         opsHash: "", // unknown, so never reported as drift
         cursor: null,
-        appliedAt: now()
+        appliedAt: base - names.length + index
       });
     }
-  }
+  });
   return { rows: adopted, adopted: true };
 }
 

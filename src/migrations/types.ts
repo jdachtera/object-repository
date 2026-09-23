@@ -143,6 +143,11 @@ export interface MigrateOptions {
    * expands, so a deploy can never destroy data without the operator saying so in as many words.
    */
   applyContracts?: boolean;
+  /**
+   * Let `rollback()` run the `down` of a migration adopted from the legacy tracking table, whose
+   * effect isn't recorded. Off by default: its `down` may undo far more than the operator expects.
+   */
+  rollbackAdopted?: boolean;
   /** Page size for the generic executor's keyset scan. */
   batchSize?: number;
   ctx?: Context;
@@ -212,7 +217,8 @@ export type MigrationBlockerCode =
   | "NARROWING_RETYPE"
   | "INVALID_SCHEMA_VERSION"
   | "JOURNAL_INCONSISTENT"
-  | "UNRECOVERABLE_CONTRACT";
+  | "UNRECOVERABLE_CONTRACT"
+  | "ROLLBACK_REFUSED";
 
 export interface MigrationWarning {
   code: MigrationWarningCode;

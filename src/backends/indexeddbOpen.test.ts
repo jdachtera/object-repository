@@ -111,3 +111,55 @@ describe("IndexedDB schema provisioning", () => {
     ).resolves.toEqual([]);
   });
 });
+
+describe("IndexedDB connection lifecycle", () => {
+  const readAll = (backend: IndexedDBBackend, model: string) =>
+    backend.query({ model, where: all().serialize(), order: [{ property: "uuid", descending: false }], paging: { start: 0 } }, ctx);
+
+  it("keeps working after yielding to a peer's upgrade, instead of failing on the closed connection", async () => {
+    const name = dbName();
+    const first = new IndexedDBBackend({ name });
+    first.save("User", { uuid: "u1", name: "Ann" }, ctx);
+    await first.persist(ctx);
+
+    const peer = new IndexedDBBackend({ name });
+    peer.registerModel("Post", []);
+    await readAll(peer, "Post"); // bumps the version; `first` closes its connection
+
+    first.save("User", { uuid: "u2", name: "Bo" }, ctx);
+    await first.persist(ctx);
+    expect((await readAll(first, "User")).map((row) => row.uuid)).toEqual(["u1", "u2"]);
+  });
+
+  it("writes a batch whose persist was blocked, once the retry succeeds", async () => {
+    const name = dbName();
+    const holder = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(name, 1);
+      request.onupgradeneeded = () => request.result.createObjectStore("Held", { keyPath: "uuid" });
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+
+    const backend = new IndexedDBBackend({ name });
+    backend.save("User", { uuid: "u1", name: "Ann" }, ctx);
+    await expect(backend.persist(ctx)).rejects.toThrow(SchemaUpgradeBlockedError);
+
+    holder.close();
+    await new Promise((resolve) => setTimeout(resolve, 10)); // the orphaned open request settles and closes
+    await backend.persist(ctx); // the retry the error asks for
+    expect((await readAll(backend, "User")).map((row) => row.uuid)).toEqual(["u1"]);
+  });
+
+  it("rebuilds an index redefined under the same name", async () => {
+    const name = dbName();
+    const backend = new IndexedDBBackend({ name });
+    backend.registerModel("User", [{ name: "by_email", fields: [{ path: "email" }] }]);
+    await readAll(backend, "User");
+
+    const later = new IndexedDBBackend({ name });
+    later.registerModel("User", [{ name: "by_email", fields: [{ path: "email" }], unique: true }]);
+    later.save("User", { uuid: "u1", email: "a@x" }, ctx);
+    later.save("User", { uuid: "u2", email: "a@x" }, ctx);
+    await expect(later.persist(ctx)).rejects.toThrow(); // the unique definition is in force
+  });
+});

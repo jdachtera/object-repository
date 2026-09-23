@@ -107,11 +107,27 @@ describe("migrations — lifecycle (pg-mem)", () => {
     expect(await orm.migrate(migrations)).toMatchObject({ applied: ["add_col"], skipped: ["base"] });
   });
 
-  it("skips rollback of a migration without a down()", async () => {
+  it("refuses rollback of a migration without a down()", async () => {
     const orm = pgManager();
     const migrations: Migration[] = [{ name: "irreversible", up: (m) => m.createTable("z", [{ name: "n", type: "integer" }]) }];
     await orm.migrate(migrations);
-    expect(await orm.rollback(migrations)).toMatchObject({ applied: [], skipped: ["irreversible"] });
+    await expect(orm.rollback(migrations)).rejects.toThrow(/declares no `down`/);
+  });
+
+  it("refuses to roll back history adopted from the legacy table unless asked to", async () => {
+    const { Pool } = newDb().adapters.createPg();
+    const pool = new Pool();
+    await pool.query(`CREATE TABLE "_object_repository_migrations" ("name" text PRIMARY KEY, "applied_at" bigint)`);
+    await pool.query(`INSERT INTO "_object_repository_migrations" VALUES ('0002_users', 2), ('0001_base', 1)`);
+    const orm = new RepositoryManager({ backend: new PostgresBackend(pool) });
+    const history: Migration[] = [
+      { name: "0001_base", up: (m) => m.createTable("base", [{ name: "n", type: "integer" }]), down: (m) => m.dropTable("base") },
+      { name: "0002_users", up: (m) => m.createTable("users", [{ name: "n", type: "integer" }]), down: (m) => m.dropTable("users") }
+    ];
+    await orm.migrate(history);
+    await expect(orm.rollback(history)).rejects.toThrow(/adopted from the legacy tracking table/);
+    // Asked explicitly, it reverts the one applied last in the legacy table's own order.
+    await expect(orm.rollback(history, 1, { rollbackAdopted: true })).resolves.toMatchObject({ applied: ["0002_users"] });
   });
 
   it("forwards through a PolicyBackend to the inner store", async () => {

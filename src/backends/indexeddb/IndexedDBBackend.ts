@@ -84,7 +84,8 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
   private readonly droppedIndexes = new Set<string>();
   private openingPromise: Promise<IDBDatabase> | null = null;
   /** Index names per object store in the currently-open database (see `snapshotIndexes`). */
-  private presentIndexes = new Map<string, Set<string>>();
+  /** Per store, each present index's name → its definition signature (see `indexSignature`). */
+  private presentIndexes = new Map<string, Map<string, string>>();
 
   private saveQueue: PersistedChange[] = [];
   private removeQueue: PersistedChange[] = [];
@@ -200,15 +201,23 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
 
     const models = unique([...saved, ...removed].map((change) => change.model));
     if (models.length > 0) {
-      const db = await this.ensureOpen(...models);
-      const tx = db.transaction(models, "readwrite");
-      for (const change of saved) {
-        tx.objectStore(change.model).put(change.record);
+      try {
+        const db = await this.ensureOpen(...models);
+        const tx = db.transaction(models, "readwrite");
+        for (const change of saved) {
+          tx.objectStore(change.model).put(change.record);
+        }
+        for (const change of removed) {
+          tx.objectStore(change.model).delete(String(change.record.uuid));
+        }
+        await transactionDone(tx);
+      } catch (error) {
+        // Nothing was written (the transaction is all-or-nothing): put the batch back, ahead of anything
+        // queued since, so the retry a blocked upgrade asks for actually writes it.
+        this.saveQueue = [...saved, ...this.saveQueue];
+        this.removeQueue = [...removed, ...this.removeQueue];
+        throw error;
       }
-      for (const change of removed) {
-        tx.objectStore(change.model).delete(String(change.record.uuid));
-      }
-      await transactionDone(tx);
     }
 
     for (const change of saved) {
@@ -321,10 +330,12 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
     for (const [model, indexes] of this.models) {
       if (!db.objectStoreNames.contains(model)) return false;
       const present = this.presentIndexes.get(model);
-      for (const name of present ?? []) if (this.droppedIndexes.has(`${model}\0${name}`)) return false;
+      for (const name of present?.keys() ?? []) if (this.droppedIndexes.has(`${model}\0${name}`)) return false;
       for (const index of indexes) {
         if (index.text || index.ttlSeconds !== undefined) continue; // not expressible in IndexedDB
-        if (!present?.has(index.name)) return false;
+        // A definition changed under the same name (`unique` switched on) counts as missing, so the
+        // index is rebuilt rather than left enforcing the old definition.
+        if (present?.get(index.name) !== indexSignature(indexKeyPath(index), index.unique ?? false)) return false;
       }
     }
     return true;
@@ -337,7 +348,16 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
     if (!stores.length) return;
     const tx = db.transaction(stores, "readonly");
     for (const store of stores) {
-      this.presentIndexes.set(store, new Set(nameList(tx.objectStore(store).indexNames)));
+      const objectStore = tx.objectStore(store);
+      this.presentIndexes.set(
+        store,
+        new Map(
+          nameList(objectStore.indexNames).map((name) => {
+            const index = objectStore.index(name);
+            return [name, indexSignature(index.keyPath, index.unique)];
+          })
+        )
+      );
     }
   }
 
@@ -348,9 +368,18 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
     if (!this.hasAllStores(this.db)) {
       const nextVersion = this.db.version + 1;
       this.db.close();
+      // Cleared before awaiting: if the upgrade fails, a closed handle must not stay behind as `this.db`
+      // — a closed database still lists its stores, so it would keep passing `hasAllStores`.
+      this.forget();
       this.db = await this.open(nextVersion);
     }
     return this.db;
+  }
+
+  /** Drop the current connection's state, so the next operation opens afresh. */
+  private forget(): void {
+    this.db = null;
+    this.presentIndexes = new Map();
   }
 
   private open(version?: number): Promise<IDBDatabase> {
@@ -370,26 +399,50 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
           }
           for (const index of indexes) {
             if (index.text || index.ttlSeconds !== undefined) continue; // not expressible in IndexedDB
-            if (!store.indexNames.contains(index.name)) {
-              // Compound → an array keyPath; single-field → the field path.
-              const keyPath = index.fields.length === 1 ? index.fields[0]!.path : index.fields.map((f) => f.path);
-              store.createIndex(index.name, keyPath, { unique: index.unique ?? false });
+            const keyPath = indexKeyPath(index);
+            if (store.indexNames.contains(index.name)) {
+              const existing = store.index(index.name);
+              if (indexSignature(existing.keyPath, existing.unique) === indexSignature(keyPath, index.unique ?? false)) continue;
+              store.deleteIndex(index.name); // redefined under the same name: rebuild it
             }
+            store.createIndex(index.name, keyPath, { unique: index.unique ?? false });
           }
         }
       };
       // `blocked` fires when another connection still holds the previous version. IndexedDB then just
       // waits — so without this the request never settles and every caller awaiting it hangs.
-      request.onblocked = () => reject(new SchemaUpgradeBlockedError(this.name, version));
+      let settled = false;
+      request.onblocked = () => {
+        settled = true;
+        reject(new SchemaUpgradeBlockedError(this.name, version));
+      };
       request.onsuccess = () => {
         const db = request.result;
+        if (settled) {
+          // The caller was already told this open was blocked. When the blocker finally lets go the
+          // request still succeeds — close that late connection instead of leaking it or letting it
+          // overwrite the state of whatever connection is current by now.
+          db.close();
+          return;
+        }
+        settled = true;
         // Symmetrically: don't be the connection that blocks someone else's upgrade. A peer tab
-        // bumping the version fires `versionchange` here, and closing lets it proceed.
-        db.onversionchange = () => db.close();
+        // bumping the version fires `versionchange` here; closing lets it proceed, and forgetting the
+        // handle makes the next operation here reopen at the new version instead of failing on a
+        // closed connection until the page reloads.
+        const release = () => {
+          db.close();
+          if (this.db === db) this.forget();
+        };
+        db.onversionchange = release;
+        db.onclose = release;
         this.snapshotIndexes(db);
         resolve(db);
       };
-      request.onerror = () => reject(request.error ?? new Error("Failed to open IndexedDB"));
+      request.onerror = () => {
+        settled = true;
+        reject(request.error ?? new Error("Failed to open IndexedDB"));
+      };
     });
   }
 }
@@ -512,4 +565,14 @@ function transactionDone(tx: IDBTransaction): Promise<void> {
 
 function unique(values: string[]): string[] {
   return [...new Set(values)];
+}
+
+/** Compound → an array keyPath; single-field → the field path. */
+function indexKeyPath(index: IndexSpec): string | string[] {
+  return index.fields.length === 1 ? index.fields[0]!.path : index.fields.map((field) => field.path);
+}
+
+/** What makes two index definitions the same index: the key path and uniqueness. */
+function indexSignature(keyPath: string | string[], unique: boolean): string {
+  return `${JSON.stringify(keyPath)}|${unique ? "unique" : ""}`;
 }

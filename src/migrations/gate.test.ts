@@ -288,13 +288,17 @@ describe("rollback", () => {
     expect(rerun.expanded).toEqual(["m1"]);
   });
 
-  it("skips a migration with no down()", async () => {
+  it("refuses a migration with no down() — rather than reverting an older one in its place", async () => {
     const backend = await seeded();
+    const older: Migration = { name: "m0", up: (m) => m.addField("User", "a", "text"), down: (m) => m.dropField("User", "a") };
     const migration: Migration = { name: "m1", up: (m) => m.addField("User", "tier", "text", { fill: "x" }) };
-    await run(backend, [migration]);
+    await run(backend, [older, migration]);
 
-    const report = await rollbackMigrations(backend, [migration], 1, { models, now });
-    expect(report.skipped).toEqual(["m1"]);
+    await expect(rollbackMigrations(backend, [older, migration], 1, { models, now })).rejects.toMatchObject({
+      blockers: [{ code: "ROLLBACK_REFUSED", migration: "m1" }]
+    });
+    const log = await new BackendJournal(backend, ctx).load();
+    expect(log.some((row) => row.name === "m0")).toBe(true); // the older one was not reverted instead
   });
 
   it("refuses once a released contract has destroyed data down() cannot restore", async () => {
@@ -308,8 +312,36 @@ describe("rollback", () => {
     };
     await run(backend, [migration], { schemaVersion: 7, minSupportedSchemaVersion: 7, applyContracts: true });
 
-    const report = await rollbackMigrations(backend, [migration], 1, { models, now });
-    expect(report.skipped).toEqual(["0009_drop_name"]);
+    await expect(rollbackMigrations(backend, [migration], 1, { models, now })).rejects.toMatchObject({
+      blockers: [{ code: "ROLLBACK_REFUSED", migration: "0009_drop_name" }]
+    });
+  });
+
+  it("reverts the later of two migrations applied in the same millisecond", async () => {
+    const backend = await seeded();
+    const frozen = () => 5000;
+    const first: Migration = { name: "m1", up: (m) => m.addField("User", "a", "text", { fill: "1" }), down: (m) => m.dropField("User", "a") };
+    const second: Migration = { name: "m2", up: (m) => m.addField("User", "b", "text", { fill: "2" }), down: (m) => m.dropField("User", "b") };
+    await runMigrations(backend, [first, second], { models, now: frozen });
+
+    const report = await rollbackMigrations(backend, [first, second], 1, { models, now: frozen });
+    expect(report.applied).toEqual(["m2"]);
+    expect((await readUsers(backend))[0]).toMatchObject({ a: "1" });
+  });
+
+  it("refuses to roll back mid-window, where the legacy field is authoritative", async () => {
+    const backend = await seeded();
+    const migration: Migration = { ...rename(), down: (m) => m.renameField("User", "fullName", "name", "text") };
+    await run(backend, [migration], { schemaVersion: 7, minSupportedSchemaVersion: 5 });
+    await expect(rollbackMigrations(backend, [migration], 1, { models, now })).rejects.toThrow(/mid-window/);
+  });
+
+  it("refuses a migration that isn't declared any more rather than reach past it", async () => {
+    const backend = await seeded();
+    const older: Migration = { name: "m0", up: (m) => m.addField("User", "a", "text"), down: (m) => m.dropField("User", "a") };
+    const newer: Migration = { name: "m1", up: (m) => m.addField("User", "b", "text"), down: (m) => m.dropField("User", "b") };
+    await run(backend, [older, newer]);
+    await expect(rollbackMigrations(backend, [older], 1, { models, now })).rejects.toThrow(/not declared/);
   });
 
   it("does roll back a released rename, whose values live on under the new name", async () => {
