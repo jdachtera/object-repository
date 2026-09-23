@@ -9,6 +9,7 @@ interface SocketLike {
   close(): void;
   on(event: "message", listener: (data: unknown) => void): void;
   on(event: "close", listener: () => void): void;
+  on(event: "error", listener: (error: unknown) => void): void;
 }
 /** The upgrade request `ws` hands to the `connection` listener (an `http.IncomingMessage` at runtime) —
  *  structurally typed so `context()` can read a token/cookie without a hard `node:http` dependency. */
@@ -43,20 +44,37 @@ export function attachWebSocketServer(
   const contextFor = options.context ?? ((): Context => SYSTEM_CONTEXT);
 
   server.on("connection", (socket, request) => {
-    // Resolve the (possibly async) per-connection context before wiring anything up; a failure here
-    // means we couldn't authenticate the connection, so close it rather than run under a default.
-    void Promise.resolve(contextFor(request))
-      .then((ctx) => {
-        const unsubscribe = adapter.subscribe((event) => {
-          socket.send(JSON.stringify({ type: "event", event }));
-        }, ctx);
+    // A socket emits `error` for a malformed frame or a broken connection, and an `error` event with no
+    // listener is thrown — one bad client would crash the process and drop every other connection.
+    socket.on("error", () => socket.close());
 
-        socket.on("message", (data) => {
-          // Never let a malformed frame or a failed send become an unhandled rejection — that would
-          // crash the whole process (Node's default) and drop every *other* connection. Contain it.
-          void handleMessage(adapter, socket, String(data), ctx).catch(() => {});
-        });
-        socket.on("close", unsubscribe);
+    // Listen from the start: frames that arrive while an async `context()` is still resolving are
+    // held and answered once it has, rather than silently dropped (which left that client hanging).
+    let ctx: Context | null = null;
+    let closed = false;
+    const early: string[] = [];
+    let unsubscribe: (() => void) | null = null;
+    socket.on("message", (data) => {
+      // Never let a malformed frame or a failed send become an unhandled rejection. Contain it.
+      if (ctx) void handleMessage(adapter, socket, String(data), ctx).catch(() => {});
+      else early.push(String(data));
+    });
+    socket.on("close", () => {
+      closed = true;
+      unsubscribe?.();
+    });
+
+    // Resolve the (possibly async) per-connection context before serving anything; a failure means
+    // the connection couldn't be authenticated, so close it rather than run under a default.
+    void Promise.resolve()
+      .then(() => contextFor(request))
+      .then((resolved) => {
+        if (closed) return; // gone during authentication: subscribing now would leak the subscription
+        ctx = resolved;
+        unsubscribe = adapter.subscribe((event) => {
+          socket.send(JSON.stringify({ type: "event", event }));
+        }, resolved);
+        for (const data of early.splice(0)) void handleMessage(adapter, socket, data, resolved).catch(() => {});
       })
       .catch(() => socket.close());
   });

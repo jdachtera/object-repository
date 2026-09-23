@@ -21,6 +21,8 @@ function matches(doc: Record<string, unknown>, filter: MongoFilter): boolean {
       const ops = cond as Record<string, unknown>;
       if ("$in" in ops) {
         if (!(ops.$in as unknown[]).some((v) => norm(v) === norm(doc[key]))) return false;
+      } else if ("$eq" in ops) {
+        if (norm(doc[key]) !== norm(ops.$eq)) return false;
       } else return false; // other operators unused in this test
     } else if (norm(doc[key]) !== norm(cond)) {
       return false;
@@ -53,7 +55,10 @@ class Coll implements MongoCollection {
     }
     if (options.upsert) {
       const inserted: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(filter)) if (!(v && typeof v === "object" && !(v instanceof Oid))) inserted[k] = v;
+      for (const [k, v] of Object.entries(filter)) {
+        if (!(v && typeof v === "object" && !(v instanceof Oid))) inserted[k] = v;
+        else if (!(v instanceof Oid) && "$eq" in v) inserted[k] = (v as { $eq: unknown }).$eq; // as Mongo does
+      }
       Object.assign(inserted, u.$set ?? {}, u.$setOnInsert ?? {});
       this.docs.push(inserted);
     }

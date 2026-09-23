@@ -59,7 +59,7 @@ runSuite(
 describe("array element matching — Mongo compilation", () => {
   it("compiles `any` to $elemMatch", () => {
     expect(compileMongoFilter(any("items", eq("sku", "X")).serialize())).toEqual({
-      items: { $elemMatch: { sku: "X" } }
+      items: { $elemMatch: { sku: { $eq: "X" } } }
     });
     expect(compileMongoFilter(any("items", gt("qty", 4)).serialize())).toEqual({
       items: { $elemMatch: { qty: { $gt: 4 } } }

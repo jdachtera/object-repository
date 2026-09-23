@@ -177,3 +177,70 @@ describe("WebSocket auth seam receives the upgrade request", () => {
     }
   });
 });
+
+describe("network-seam security", () => {
+  it("streams change events only for models the adapter exposes (never reserved ones)", async () => {
+    const store = new InMemoryBackend();
+    const adapter = new BackendAdapter(store, undefined, undefined, ["Note"]);
+    const seen: string[] = [];
+    adapter.subscribe((event) => seen.push(event.model), SYSTEM_CONTEXT);
+    store.save("Note", { uuid: "n1" }, SYSTEM_CONTEXT);
+    store.save("Secret", { uuid: "s1" }, SYSTEM_CONTEXT);
+    store.save("_object_repository_migration_log", { uuid: "j1" }, SYSTEM_CONTEXT);
+    await store.persist(SYSTEM_CONTEXT);
+    expect(seen).toEqual(["Note"]);
+  });
+
+  it("answers 401 when authentication throws, instead of crashing the process", async () => {
+    const server: Server = createServer(
+      createRequestListener(new BackendAdapter(new InMemoryBackend()), {
+        context: () => {
+          throw new Error("bad token");
+        }
+      })
+    );
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    let uncaught: unknown;
+    const onUncaught = (e: unknown) => (uncaught = e);
+    process.on("uncaughtException", onUncaught);
+    try {
+      const { port } = server.address() as AddressInfo;
+      const response = await fetch(`http://127.0.0.1:${port}/rpc`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ method: "query", params: { plan: { model: "X", where: { type: "all" }, order: [], paging: { start: 0 } } } })
+      });
+      expect(response.status).toBe(401);
+      expect(uncaught).toBeUndefined();
+    } finally {
+      process.off("uncaughtException", onUncaught);
+      server.close();
+    }
+  });
+
+  it("survives a socket error, and answers a frame sent while authentication was still running", async () => {
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    let sockets = 0;
+    wss.on("connection", () => sockets++);
+    attachWebSocketServer(wss, new BackendAdapter(new InMemoryBackend()), {
+      context: () => new Promise((resolve) => setTimeout(() => resolve(SYSTEM_CONTEXT), 30))
+    });
+    await new Promise<void>((r) => wss.on("listening", r));
+    const url = `ws://127.0.0.1:${(wss.address() as AddressInfo).port}`;
+    try {
+      const client = new WsClient(url);
+      const reply = new Promise<Record<string, unknown>>((r) => client.on("message", (d) => r(JSON.parse(String(d)))));
+      await new Promise<void>((r) => client.on("open", () => r()));
+      // Sent immediately — before the 30 ms authentication has resolved.
+      client.send(JSON.stringify({ type: "request", id: 1, op: { method: "query", params: { plan: { model: "X", where: { type: "all" }, order: [], paging: { start: 0 } } } } }));
+      expect(await reply).toMatchObject({ type: "response", id: 1 });
+
+      // An `error` on a server-side socket must not throw out of the event emitter.
+      for (const socket of wss.clients) expect(() => socket.emit("error", new Error("bad frame"))).not.toThrow();
+      client.close();
+    } finally {
+      wss.close();
+    }
+    expect(sockets).toBe(1);
+  });
+});

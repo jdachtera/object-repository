@@ -155,8 +155,15 @@ export class BackendAdapter implements TransportAdapter {
   }
 
   /** Forward the backend's change feed to a transport subscriber (server→client push, §7). */
+  /**
+   * Stream change events — only for models this adapter exposes. The backend's feed carries every
+   * model, including reserved ones (the sync outbox, the migration journal and lease) and any outside
+   * the allow-list; forwarding those would publish exactly what `query` refuses to return.
+   */
   subscribe(onEvent: (event: ChangeEvent) => void, ctx: Context): Unsubscribe {
-    return this.backend.changes(onEvent, ctx);
+    return this.backend.changes((event) => {
+      if (this.modelAllowed(event.model)) onEvent(event);
+    }, ctx);
   }
 }
 

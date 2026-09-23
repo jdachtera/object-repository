@@ -724,9 +724,20 @@ function orderClause(order: SortKey[]): string {
   return ` ORDER BY ${keys.join(", ")}`;
 }
 
+function pageBound(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new Error(`Invalid paging bound ${JSON.stringify(value)}: expected a non-negative integer.`);
+  }
+  return value;
+}
+
 function pagingClause(paging: QueryPlan["paging"]): string {
-  if (paging.end !== undefined) return ` LIMIT ${paging.end - paging.start} OFFSET ${paging.start}`;
-  if (paging.start > 0) return ` LIMIT -1 OFFSET ${paging.start}`;
+  // Bounds are interpolated, and over a transport they come from the client: whole numbers only. An
+  // empty or inverted window is `LIMIT 0` — SQLite reads a negative LIMIT as "no limit" and would
+  // hand back every row, past any page-size cap.
+  const start = pageBound(paging.start);
+  if (paging.end !== undefined) return ` LIMIT ${Math.max(0, pageBound(paging.end) - start)} OFFSET ${start}`;
+  if (start > 0) return ` LIMIT -1 OFFSET ${start}`;
   return "";
 }
 

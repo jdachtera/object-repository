@@ -235,6 +235,9 @@ export class MongoBackend
   }
 
   async query(plan: QueryPlan, _ctx: Context): Promise<JsonObject[]> {
+    // An empty or inverted window has no rows. Mongo reads `limit: 0` as "no limit", so it can't be
+    // passed through — that would return the whole collection, past any page-size cap.
+    if (plan.paging.end !== undefined && plan.paging.end <= plan.paging.start) return [];
     const docs = await this.db
       .collection(plan.model)
       .find(this.filter(plan.model, plan.where), findOptions(plan, this.identity))
@@ -528,6 +531,11 @@ class MongoVisitor implements ExpressionVisitor<MongoFilter> {
 
   // Map the model's `uuid` to the stored key field, and encode id-typed values (uuid + FK refs).
   private prop(property: string): string {
+    // A field name is data from a query plan — over a transport, from the client. A `$`-prefixed
+    // segment would be read as an operator (`$where` runs server-side JavaScript), so refuse it.
+    if (property.split(".").some((segment) => segment.startsWith("$")) || property.includes("\0")) {
+      throw new Error(`Invalid field name ${JSON.stringify(property)}: a field name may not start with "$".`);
+    }
     return property === "uuid" ? this.identity.field : property;
   }
   private val(property: string, value: JsonValue): unknown {
@@ -546,7 +554,9 @@ class MongoVisitor implements ExpressionVisitor<MongoFilter> {
     if (value === null && comparator === "=") return { [prop]: { $type: "null" } };
     if (value === null && comparator === "!=") return { [prop]: { $not: { $type: "null" } } };
     const v = this.val(property, value);
-    if (comparator === "=") return { [prop]: v };
+    // `$eq`, never a bare value: a bare object value like `{ $ne: null }` would be *executed* as an
+    // operator — `password: { $ne: null }` matching every row — where the reference compares it.
+    if (comparator === "=") return { [prop]: { $eq: v } };
     return { [prop]: { [MONGO_OP[comparator]]: v } };
   }
   expr(left: ValueExpr, comparator: Comparator, right: ValueExpr): MongoFilter {
@@ -571,8 +581,9 @@ class MongoVisitor implements ExpressionVisitor<MongoFilter> {
     return { [this.prop(property)]: { $nin: values.map((value) => this.val(property, value)) } };
   }
   contains(property: string, value: JsonValue): MongoFilter {
-    // Equality against an array field matches documents whose array contains the value.
-    return { [this.prop(property)]: this.val(property, value) };
+    // Equality against an array field matches documents whose array contains the value. `$eq`, for
+    // the same reason as `compare`: an object value is data, not an operator.
+    return { [this.prop(property)]: { $eq: this.val(property, value) } };
   }
   between(property: string, lowerEnd: JsonValue, upperEnd: JsonValue): MongoFilter {
     return { [this.prop(property)]: { $gte: this.val(property, lowerEnd), $lte: this.val(property, upperEnd) } };
