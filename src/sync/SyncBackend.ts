@@ -7,8 +7,8 @@ import type {
   SchemaAwareBackend,
   Unsubscribe
 } from "../core/Backend.ts";
-import { isCounting, isSchemaAware } from "../core/Backend.ts";
-import type { CountingBackend } from "../core/Backend.ts";
+import { isCounting, isReservedModel, isSchemaAware } from "../core/Backend.ts";
+import type { CountingBackend, MigrationTargeting } from "../core/Backend.ts";
 import type { Capabilities, Context, JsonObject, SchemaVersioning, Uuid } from "../core/types.ts";
 import {
   FIELD_VERSIONS_FIELD,
@@ -25,6 +25,11 @@ import { HybridLogicalClock } from "./hlc.ts";
 
 /** Reserved model the durable outbox is stored under, in the local backend. */
 const OUTBOX_MODEL = "_outbox";
+
+/** Models that belong to this replica alone: the outbox, and the library's migration bookkeeping. */
+function isLocalOnly(model: string): boolean {
+  return model === OUTBOX_MODEL || isReservedModel(model);
+}
 
 /** Thrown when the server declines to sync with this client's schema version. */
 export class SyncSchemaError extends Error {
@@ -78,7 +83,7 @@ export interface SyncBackendOptions {
  * remove-vs-concurrent-edit conflict can't be fully arbitrated without tombstones — a documented
  * follow-up.
  */
-export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend {
+export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend, MigrationTargeting {
   readonly capabilities: Capabilities;
 
   private readonly local: Backend;
@@ -109,6 +114,16 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
     if (isSchemaAware(this.local)) return this.local.registerModel(model, indexes, fields);
   }
 
+  /**
+   * Migrations run on the local store directly. Through the sync layer every rewritten record would be
+   * restamped as a fresh edit, beating every other replica's concurrent offline edit, and the journal
+   * would replicate to peers that have not run the migration. Each replica migrates its own store;
+   * the server migrates its own.
+   */
+  migrationTarget(): Backend {
+    return this.local;
+  }
+
   // Reads are offline-first: always local, with tombstones filtered out by query rewriting.
   query(plan: QueryPlan, ctx: Context): Promise<JsonObject[]> {
     return this.local.query(this.excludeTombstones(plan), ctx);
@@ -124,6 +139,10 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
   }
 
   save(model: string, record: JsonObject, ctx: Context, dirty?: readonly string[]): void {
+    if (isLocalOnly(model)) {
+      this.local.save(model, record, ctx, dirty); // bookkeeping: never stamped, never replicated
+      return;
+    }
     if (typeof record.uuid !== "string" || record.uuid.length === 0) {
       record.uuid = generateUuid();
     }
@@ -155,6 +174,10 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
   }
 
   remove(model: string, record: JsonObject, ctx: Context): void {
+    if (isLocalOnly(model)) {
+      this.local.remove(model, record, ctx);
+      return;
+    }
     const version = this.hlc.now();
     const uuid = String(record.uuid);
     // Store a tombstone (a versioned soft-delete) rather than hard-deleting, so a later
@@ -216,6 +239,7 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
     const localByKey = await this.loadLocalRecords(changes, ctx);
     let applied = 0;
     for (const incoming of changes) {
+      if (isLocalOnly(incoming.model)) continue; // a peer's bookkeeping is never ours to adopt
       const local = localByKey.get(`${incoming.model}\0${incoming.uuid}`) ?? null;
       if (await this.applyIncoming(incoming, local, ctx)) applied += 1;
     }

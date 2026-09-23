@@ -19,6 +19,7 @@
  */
 import type {
   AggregatingBackend,
+  MigrationTargeting,
   Backend,
   CountingBackend,
   FieldSpec,
@@ -159,5 +160,12 @@ export function multiWriteBackend(options: MultiWriteOptions): Backend {
     };
   }
 
+  // A migration has to run on each store, through its own manager: running it here would migrate the
+  // primary alone and leave every secondary on the old shape, silently diverging.
+  (wrapped as Backend & MigrationTargeting).migrationTarget = () => {
+    throw new Error(
+      "Migrations can't run through a multi-write backend: they would reach the primary only. Migrate each store through its own manager."
+    );
+  };
   return wrapped;
 }

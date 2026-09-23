@@ -47,6 +47,8 @@ export interface ExecuteOptions {
   checkpoint?: (cursor: string) => void | Promise<void>;
   /** Called after each persisted page — the runner renews its lease here. */
   heartbeat?: () => Promise<void>;
+  /** Collects the models a pass registered with a reduced index set, so the runner can restore them. */
+  registered?: Set<string>;
 }
 
 /** How many records an op rewrote. */
@@ -138,7 +140,7 @@ export async function applyOp(backend: Backend, op: MigrationOp, options: Execut
     case "dropIndex":
       // Index maintenance is schema, not data: re-register the model and let the backend reconcile.
       // A store with no schema concept has nothing to do and correctly does nothing.
-      await reregister(backend, op.model, options);
+      await reregister(backend, op.model, options, true);
       return { rows: 0 };
 
     case "rawSql":
@@ -221,11 +223,22 @@ async function flushPage(backend: Backend, options: ExecuteOptions, cursor: stri
 }
 
 /** Register a model's layout with a schema-aware backend, refusing to guess when it isn't known. */
-async function reregister(backend: Backend, model: string, options: ExecuteOptions): Promise<void> {
+async function reregister(
+  backend: Backend,
+  model: string,
+  options: ExecuteOptions,
+  withUnique = false
+): Promise<void> {
   if (!isSchemaAware(backend)) return;
   const schema = options.models[model];
   if (!schema) throw new SchemaUnknownError(model);
-  await register(backend, model, schema.fields, schema.indexes);
+  // A record pass registers the model so a columnar store knows its columns, but leaves its unique
+  // indexes out. A unique index is a contract, created by an explicit `addIndex` behind the gate;
+  // building it here, over data the migration may be about to de-duplicate, would block the very
+  // migration that makes it valid. The runner restores the full registration when the run ends.
+  const indexes = withUnique ? schema.indexes : schema.indexes.filter((index) => !index.unique);
+  options.registered?.add(model);
+  await register(backend, model, schema.fields, indexes);
 }
 
 async function register(backend: Backend, model: string, fields: FieldSpec[], indexes: IndexSpec[]): Promise<void> {

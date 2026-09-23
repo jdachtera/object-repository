@@ -11,7 +11,7 @@
  * Contracts whose gate has cleared are reported as `releasable` and wait for someone to say so.
  */
 import type { Backend } from "../core/Backend.ts";
-import { isMigrationLowering, isTransactional } from "../core/Backend.ts";
+import { isMigrationLowering, isSchemaAware, isTransactional, migrationTarget } from "../core/Backend.ts";
 import type { Context } from "../core/types.ts";
 import { SYSTEM_CONTEXT } from "../core/types.ts";
 import { generateUuid } from "../core/uuid.ts";
@@ -73,12 +73,13 @@ export async function runMigrations(
   options: RunnerOptions = {}
 ): Promise<MigrationReport> {
   assertUniqueNames(migrations);
+  const store = migrationTarget(backend);
   const ctx = options.ctx ?? SYSTEM_CONTEXT;
   const now = options.now ?? Date.now;
-  const journal = options.journal ?? new BackendJournal(backend, ctx);
+  const journal = options.journal ?? new BackendJournal(store, ctx);
 
-  return withLease(backend, ctx, now, options, (lease) =>
-    applyAll(backend, migrations, { ...options, ctx, now, journal, lease })
+  return withLease(store, ctx, now, options, (lease, registered) =>
+    applyAll(store, migrations, { ...options, ctx, now, journal, lease, registered })
   );
 }
 
@@ -94,7 +95,7 @@ async function withLease<T>(
   ctx: Context,
   now: () => number,
   options: RunnerOptions,
-  body: (lease: Lease | null) => Promise<T>
+  body: (lease: Lease | null, registered: Set<string>) => Promise<T>
 ): Promise<T> {
   const lease = options.skipLock ? null : await acquireLock(backend, ctx, now, options.lockOwner ?? generateUuid());
   if (!options.skipLock && !lease) {
@@ -104,13 +105,19 @@ async function withLease<T>(
   }
 
   let failed = false;
+  const registered = new Set<string>();
   try {
-    return await body(lease);
+    return await body(lease, registered);
   } catch (error) {
     failed = true;
     backend.discardPending?.();
     throw error;
   } finally {
+    // After a failed run on a transactional store, the reduced registration was made in the rolled-back
+    // transaction's scope and never reached this backend — and re-registering here would re-provision
+    // the very columns the rollback just removed.
+    const rolledBack = failed && isTransactional(backend) && backend.capabilities.transactions;
+    if (!rolledBack) await restoreRegistrations(backend, registered, options);
     try {
       await lease?.release();
     } catch (releaseError) {
@@ -219,13 +226,14 @@ export async function rollbackMigrations(
   options: RunnerOptions = {}
 ): Promise<MigrationReport> {
   assertUniqueNames(migrations);
+  const store = migrationTarget(backend);
   const ctx = options.ctx ?? SYSTEM_CONTEXT;
   const now = options.now ?? Date.now;
-  const journal = options.journal ?? new BackendJournal(backend, ctx);
+  const journal = options.journal ?? new BackendJournal(store, ctx);
   // A rollback rewrites the store exactly as a run does, so it takes the same lease: a rollback racing
   // a deploy's migrate would otherwise interleave with it.
-  return withLease(backend, ctx, now, options, (lease) =>
-    rollbackAll(backend, migrations, count, { ...options, ctx, now, journal, lease })
+  return withLease(store, ctx, now, options, (lease, registered) =>
+    rollbackAll(store, migrations, count, { ...options, ctx, now, journal, lease, registered })
   );
 }
 
@@ -338,7 +346,31 @@ export async function readHistory(
 }
 
 /** The runner's options once resolved, plus the lease it holds. */
-type Running = RunnerOptions & { ctx: Context; now: () => number; journal: MigrationJournal; lease: Lease | null };
+type Running = RunnerOptions & {
+  ctx: Context;
+  now: () => number;
+  journal: MigrationJournal;
+  lease: Lease | null;
+  registered: Set<string>;
+};
+
+/**
+ * Give every model a pass registered with a reduced index set its full registration back, so the
+ * store enforces its unique constraints again. A unique index that can't be built yet — its de-dupe
+ * contract hasn't been released — is left as `define()` would leave it; the run's outcome stands.
+ */
+async function restoreRegistrations(backend: Backend, registered: Set<string>, options: RunnerOptions): Promise<void> {
+  if (!isSchemaAware(backend)) return;
+  for (const model of registered) {
+    const schema = options.models?.[model];
+    if (!schema) continue;
+    try {
+      await backend.registerModel(model, schema.indexes, schema.fields);
+    } catch {
+      // see above
+    }
+  }
+}
 
 /** How a phase is journalled. */
 interface PhaseRecord {
@@ -458,7 +490,8 @@ async function executeOps(
             }
           }
         : { checkpoint: (at: string) => void (cursor = at) }),
-      ...(heartbeat ? { heartbeat: () => heartbeat(cursor) } : {})
+      ...(heartbeat ? { heartbeat: () => heartbeat(cursor) } : {}),
+      registered: options.registered
     });
   }
 }

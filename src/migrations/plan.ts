@@ -6,7 +6,7 @@
  * against production, and cheap enough to belong in CI as the "what does this deploy touch?" gate.
  */
 import type { Backend } from "../core/Backend.ts";
-import { isMigrationLowering } from "../core/Backend.ts";
+import { isMigrationLowering, migrationTarget } from "../core/Backend.ts";
 import { SYSTEM_CONTEXT } from "../core/types.ts";
 import { BackendJournal, indexRows, rowId } from "./journal.ts";
 import { evaluateMigrations } from "./evaluate.ts";
@@ -26,6 +26,7 @@ export async function planMigrations(
   options: RunnerOptions = {}
 ): Promise<MigrationPlan> {
   assertUniqueNames(migrations);
+  backend = migrationTarget(backend);
   const ctx = options.ctx ?? SYSTEM_CONTEXT;
   const journal = options.journal ?? new BackendJournal(backend, ctx);
   const stored = await journal.readSchemaState();

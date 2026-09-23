@@ -1,4 +1,5 @@
 import type {
+  MigrationTargeting,
   Backend,
   ChangeListener,
   CountingBackend,
@@ -51,12 +52,13 @@ export interface AccessPolicy {
  * can't see are not forwarded (preventing cross-tenant leakage). `removed` events carry no record
  * and pass through.
  */
-export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBackend, RawQueryable {
+export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBackend, RawQueryable, MigrationTargeting {
   readonly capabilities: Capabilities;
 
   /**
-   * Schema migration is a deploy-time operation, not a per-request one, so it forwards to the inner
-   * store untouched. Attached in the constructor **only when the inner store is migratable**, so
+   * The legacy SQL-only migration hatch. Schema migration is a deploy-time operation, not a per-request
+   * one, so it forwards to the inner store untouched (the portable runner gets there through
+   * `migrationTarget`). Attached in the constructor **only when the inner store is migratable**, so
    * `isMigratable(policyBackend)` answers for the stack it actually wraps — a method declared
    * unconditionally that throws inside would make the capability probe report a hatch that isn't
    * there, moving a checkable boolean into a runtime failure.
@@ -78,6 +80,15 @@ export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBacke
 
   registerModel(model: string, indexes: IndexSpec[], fields?: FieldSpec[]): void | Promise<void> {
     if (isSchemaAware(this.inner)) return this.inner.registerModel(model, indexes, fields);
+  }
+
+  /**
+   * Migrations run on the store beneath the policy. Row policy is per-request authorization; applied
+   * to a migration it would rewrite only the rows the context can see and journal the migration as
+   * applied — a silent partial migration — or hide the migration lease and block every run.
+   */
+  migrationTarget(): Backend {
+    return this.inner;
   }
 
   /**

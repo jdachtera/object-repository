@@ -244,6 +244,26 @@ way is discarded, not committed by whatever persists next.
 Run migrations from **one place** — a deploy step, not application startup. Pass `skipLock: true` only
 if you already guarantee that.
 
+## Decorated and synced stacks
+
+A migration is maintenance on the store, not an application write, so it runs on the store beneath
+every decorator. `migrate()`, `rollback()` and `plan()` unwrap each layer through `migrationTarget()`:
+
+- **`PolicyBackend`, `HooksBackend`, `observe()`** unwrap to what they wrap. Row policy would otherwise
+  migrate only the rows the context can see and journal the migration as applied. Hooks would fire
+  for every rewritten record.
+- **`SyncBackend`** unwraps to its local store. Records are rewritten in place, keeping their
+  `_version`, and nothing is queued for push, so a migration never overwrites another replica's offline
+  edits. Each replica migrates its own store, and the server migrates its own. The journal, schema
+  state and lease (`_object_repository_*`) are local-only: never stamped, pushed or adopted from a pull.
+- **`multiWriteBackend`** refuses. Migrating through it would reach the primary alone. Migrate each
+  store through its own manager.
+
+A record pass also registers the model without its unique indexes. A unique index is a contract,
+created by an explicit `addIndex` behind the gate. Building it as a side effect, over data a later
+step is about to de-duplicate, would block that step. The full registration is restored when the run
+ends.
+
 ## What this does not protect you from
 
 Stated plainly, because a safety mechanism you misunderstand is worse than none.

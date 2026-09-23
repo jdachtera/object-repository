@@ -186,6 +186,39 @@ export interface LeasingBackend {
   releaseLease(model: string, key: string, owner: string, ctx: Context): Promise<void>;
 }
 
+/** The prefix of the library's own bookkeeping models: the migration journal, schema state and lease. */
+export const RESERVED_MODEL_PREFIX = "_object_repository_";
+
+/** Is `model` the library's own bookkeeping rather than application data? */
+export function isReservedModel(model: string): boolean {
+  return model.startsWith(RESERVED_MODEL_PREFIX);
+}
+
+/**
+ * Optional: a decorator names the store underneath it that schema migrations should run against.
+ *
+ * A migration is maintenance on the *store*, not an application write. Run through a decorator it
+ * would be filtered by row policy (a user context rewrites only its own rows and journals the
+ * migration as applied), fire the application's hooks for every record, and — through a sync layer —
+ * restamp every record as a fresh edit that overwrites other replicas' offline work. A decorator that
+ * cannot sensibly be migrated through (a fan-out over several stores) throws instead.
+ */
+export interface MigrationTargeting {
+  migrationTarget(): Backend;
+}
+
+/** The store a migration against `backend` should actually run on: every decorator unwrapped. */
+export function migrationTarget(backend: Backend): Backend {
+  let current = backend;
+  for (;;) {
+    const unwrap = (current as Partial<MigrationTargeting>).migrationTarget;
+    if (typeof unwrap !== "function") return current;
+    const next = unwrap.call(current);
+    if (next === current) return current;
+    current = next;
+  }
+}
+
 /** Narrow a backend to the leasing interface. */
 export function isLeasing(backend: object): backend is LeasingBackend {
   const candidate = backend as Partial<LeasingBackend>;
