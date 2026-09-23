@@ -9,7 +9,8 @@ import type {
 } from "../core/Backend.ts";
 import { isCounting, isReservedModel, isSchemaAware } from "../core/Backend.ts";
 import type { CountingBackend, MigrationTargeting } from "../core/Backend.ts";
-import type { Capabilities, Context, JsonObject, SchemaVersioning, Uuid } from "../core/types.ts";
+import type { Capabilities, Context, JsonObject, Uuid } from "../core/types.ts";
+import type { SchemaAdvertisement, SchemaRefusalCode } from "../core/schema.ts";
 import {
   FIELD_VERSIONS_FIELD,
   RESERVED_RECORD_FIELDS as RESERVED,
@@ -34,7 +35,7 @@ function isLocalOnly(model: string): boolean {
 /** Thrown when the server declines to sync with this client's schema version. */
 export class SyncSchemaError extends Error {
   constructor(
-    readonly code: "SCHEMA_TOO_OLD" | "SCHEMA_TOO_NEW" | "SCHEMA_MISMATCH",
+    readonly code: SchemaRefusalCode,
     message: string
   ) {
     super(message);
@@ -64,10 +65,13 @@ export interface SyncBackendOptions {
    */
   fieldLevel?: boolean;
   /**
-   * The schema versions this client declares. Supplying them (on both ends) lets the server refuse a
-   * client it can no longer serve, instead of the two exchanging records neither can interpret.
+   * The schema versions this client declares, and optionally its fingerprint (`manager.fingerprint()`).
+   * They are sent with the handshake and with every pull and push, so a server declaring its own
+   * version refuses a client it can no longer serve — including after a redeploy mid-session —
+   * instead of the two exchanging records neither can interpret. A client declaring nothing is
+   * judged as version 0.
    */
-  schema?: SchemaVersioning;
+  schema?: SchemaAdvertisement;
 }
 
 /**
@@ -91,7 +95,7 @@ export class SyncBackend implements Backend, SchemaAwareBackend, CountingBackend
   private readonly conflict: ConflictPolicy;
   private readonly hlc: HybridLogicalClock;
   private readonly fieldLevel: boolean;
-  private readonly schema: SchemaVersioning | undefined;
+  private readonly schema: SchemaAdvertisement | undefined;
   /** Session-scoped cache of the last-known per-field versions, keyed `model\0uuid` (field-level mode). */
   private readonly fieldVersions = new Map<string, Record<string, string>>();
 

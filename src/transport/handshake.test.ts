@@ -129,3 +129,18 @@ describe("a rolling deploy: the two ends legitimately differ", () => {
     await expect(connect(server).handshake(unversioned.fingerprint(), ctx)).rejects.toThrow(SchemaMismatchError);
   });
 });
+
+describe("per-request enforcement over the backend transport", () => {
+  it("refuses a query from a client below the floor even without a handshake, with a typed error", async () => {
+    const { BackendAdapter } = await import("./BackendAdapter.js");
+    const { InProcessTransport } = await import("./InProcessTransport.js");
+    const { RemoteBackend, SchemaTooOldError, SchemaMismatchError } = await import("./RemoteBackend.js");
+    const { InMemoryBackend } = await import("../backends/memory/InMemoryBackend.js");
+    const { SYSTEM_CONTEXT } = await import("../core/types.js");
+    const adapter = new BackendAdapter(new InMemoryBackend(), undefined, undefined, undefined, undefined, { schemaVersion: 7, minSupportedSchemaVersion: 7 });
+    const remote = new RemoteBackend(new InProcessTransport(adapter), new InMemoryBackend().capabilities);
+    const query = remote.query({ model: "User", where: { type: "all" }, order: [], paging: { start: 0 } }, SYSTEM_CONTEXT);
+    await expect(query).rejects.toBeInstanceOf(SchemaTooOldError);
+    await expect(query).rejects.toBeInstanceOf(SchemaMismatchError); // one instanceof catches every refusal
+  });
+});

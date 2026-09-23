@@ -220,11 +220,26 @@ fingerprint is all there is and equality still rules, exactly as before.
 | client below the floor | `SchemaTooOldError` — the client must upgrade |
 | client ahead of the server | `SchemaTooNewError` — deploy the server first; it must lead |
 | no versions, shapes differ | `SchemaMismatchError`, as before |
+| the same version, shapes differ | `SchemaMismatchError`: a model change without a version bump |
+| a version that isn't a non-negative integer (an unset env var read as `NaN`) | refused, `SCHEMA_INVALID` |
 
-The same check runs on the sync path. `SyncBackend` handshakes once per session before its first
-exchange and throws `SyncSchemaError` if refused, so a long-offline client discovers it must upgrade
-instead of silently trading records neither side understands. A server too old to know the method
-answers `UNSUPPORTED_METHOD`, which reads as unchecked — so this can be deployed to either end first.
+`SchemaTooOldError` and `SchemaTooNewError` extend `SchemaMismatchError`, so one `instanceof` catches
+every refusal.
+
+**The server enforces it on every request.** The handshake lets a client fail early, but a server that
+declares a `schemaVersion` checks the client's advertisement on every request too: `RemoteBackend`
+and `RemoteSyncTarget` send it with each one. A client that never shook hands, or one still connected
+when a redeploy raised the floor, is refused on its next request. A client that advertises no version
+predates versioning and counts as version 0, so a server at version 1 still serves it, and raising the
+floor refuses it rather than waving it through. A server that declares no version keeps the advisory
+fingerprint check.
+
+The same check runs on the sync path. `SyncBackend` handshakes before its first exchange, and every
+pull and push is judged by the server again. A refusal throws `SyncSchemaError` with its `code`, so a
+long-offline client finds out it must upgrade instead of silently exchanging records neither side
+understands. Only a server too old to know the method (`UNSUPPORTED_METHOD`) reads as unchecked, so
+this can be deployed to either end first. Any other failure, such as an authorization error, is an
+error, never a pass.
 
 **Deployment order matters: the server leads.** It must be running the new version, with the floor
 still low enough to serve the old clients, before any client updates.

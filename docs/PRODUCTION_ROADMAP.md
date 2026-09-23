@@ -34,7 +34,7 @@ access. The **command plane** (task-based RPC for non-CRUD verbs) now rides the 
       Client/server skew is handled: when both ends advertise a schema version the handshake judges
       compatibility by range instead of fingerprint equality (equality refuses exactly the deploys a
       window exists to permit), with `SCHEMA_TOO_OLD`/`SCHEMA_TOO_NEW` naming the remedy; the same
-      check runs once per session on the sync path. `migrate()` takes a compare-and-set lease so two
+      check runs on the sync path, and a server declaring a version enforces it on every request. `migrate()` takes a compare-and-set lease so two
       replicas cannot both migrate, renews it as it works, and runs each phase atomically with its
       journal rows (transactional stores) or resumably, page by page (the rest).
       *Known gaps, deliberately out of scope here:* `define()`-time provisioning still creates unique

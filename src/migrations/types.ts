@@ -148,6 +148,11 @@ export interface MigrateOptions {
    * effect isn't recorded. Off by default: its `down` may undo far more than the operator expects.
    */
   rollbackAdopted?: boolean;
+  /**
+   * Skip the migration lease that stops two replicas migrating at once. Only for a caller that
+   * already guarantees a single runner (a dedicated deploy step); leaving it on is the safe default.
+   */
+  skipLock?: boolean;
   /** Page size for the generic executor's keyset scan. */
   batchSize?: number;
   ctx?: Context;

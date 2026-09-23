@@ -71,12 +71,12 @@ await orm.transaction(async (tx) => {
 const adults = await users.all().filter(gt("age", 18)).sort("age").list();
 const peters = await users.all().filter(eq("name", "Peter")).list(); // peters[0] === peter
 
-// versioned migrations for non-additive schema changes (rename/drop/retype + data backfills);
-// each runs once, tracked in _object_repository_migrations, and rollback() reverts via down():
+// portable migrations for non-additive schema changes (rename/drop/retype + data backfills), on every
+// backend; each runs once, journalled in the store, and rollback() reverts via down():
 await orm.migrate([
-  { name: "0001_add_status", up: (m) => m.addColumn("User", "status", "text") },
-  { name: "0002_backfill", up: (m) => m.sql(`UPDATE "User" SET "status" = 'active'`) },
-  { name: "0003_rename", up: (m) => m.renameColumn("User", "status", "state"), down: (m) => m.renameColumn("User", "state", "status") }
+  { name: "0001_add_status", up: (m) => m.addField("User", "status", "text", { fill: "active" }) },
+  { name: "0002_rename", up: (m) => m.renameField("User", "status", "state", "text"),
+    down: (m) => m.renameField("User", "state", "status", "text") }
 ]);
 ```
 
@@ -327,7 +327,8 @@ report.expanded;  // ["0012_fullname"] — the new field is added and back-fille
 report.deferred;  // the drop, withheld until you raise the floor AND pass applyContracts
 ```
 
-`migrate()` never destroys anything on its own. See [docs/MIGRATIONS.md](docs/MIGRATIONS.md).
+A bare `migrate()` never runs a versioned migration's destructive half. See
+[docs/MIGRATIONS.md](docs/MIGRATIONS.md).
 
 ### Migrating between stores
 

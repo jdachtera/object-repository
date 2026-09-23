@@ -380,8 +380,10 @@ windows exist, because a window is *defined by* the two ends differing — it wo
 deploys the gate makes safe. So when both ends advertise a version (`src/core/schema.ts`), the server
 serves any client from its floor up to its own version and the fingerprint becomes advisory; when
 either end declares none, equality still rules and nothing changes for anyone not using versions. The
-same check runs on the sync path, once per session, so a long-offline client is told to upgrade rather
-than silently exchanging records neither side can interpret. The server must lead a rollout: a client
-ahead of the server is refused.
+same check runs on the sync path. A server declaring a version enforces it on every request, not only
+at the handshake, so a long-offline client, or one connected across a redeploy that raised the floor,
+is told to upgrade rather than silently exchanging records neither side can interpret. A client
+advertising no version counts as version 0. The server must lead a rollout: a client ahead of the
+server is refused.
 
 See [docs/MIGRATIONS.md](docs/MIGRATIONS.md) for the operator's guide.

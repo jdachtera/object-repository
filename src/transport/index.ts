@@ -3,7 +3,7 @@
  * process boundary. `RemoteBackend` (client) proxies to a `BackendAdapter` (server) wrapping a real
  * backend, over a `Transport`. The in-process transport runs the whole stack with no network.
  */
-export { RemoteBackend, SchemaMismatchError } from "./RemoteBackend.ts";
+export { RemoteBackend, SchemaMismatchError, SchemaTooOldError, SchemaTooNewError } from "./RemoteBackend.ts";
 export { BackendAdapter } from "./BackendAdapter.ts";
 export { SyncTargetAdapter } from "./SyncTargetAdapter.ts";
 export { InProcessTransport } from "./InProcessTransport.ts";

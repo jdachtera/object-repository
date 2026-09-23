@@ -88,3 +88,43 @@ describe("deployability of the check itself", () => {
     expect(handshakes).toBe(1);
   });
 });
+
+describe("the server enforces, and nothing fails open", () => {
+  it("refuses a client that never shakes hands, once the floor has risen past version 0", async () => {
+    const adapter = new SyncTargetAdapter(new InMemorySyncTarget(), { schemaVersion: 7, minSupportedSchemaVersion: 5 });
+    const transport = new InProcessTransport(adapter);
+    const response = await transport.request({ method: "pull", params: { cursor: null } }, ctx);
+    expect(response).toMatchObject({ ok: false, error: { code: "SCHEMA_TOO_OLD" } });
+  });
+
+  it("still serves a pre-versioning client while the floor allows version 0", async () => {
+    const adapter = new SyncTargetAdapter(new InMemorySyncTarget(), { schemaVersion: 1 }); // floor defaults to 0
+    const response = await new InProcessTransport(adapter).request({ method: "pull", params: { cursor: null } }, ctx);
+    expect(response.ok).toBe(true);
+  });
+
+  it("refuses a connected client on its next request after a redeploy raises the floor", async () => {
+    let adapter = new SyncTargetAdapter(new InMemorySyncTarget(), { schemaVersion: 7, minSupportedSchemaVersion: 5 });
+    const transport = new InProcessTransport({ handle: (request, context) => adapter.handle(request, context) });
+    const client = new SyncBackend({ local: new InMemoryBackend(), remote: new RemoteSyncTarget(transport), schema: { schemaVersion: 6 } });
+    await client.reconcile(ctx); // handshake passes, once per session
+
+    adapter = new SyncTargetAdapter(new InMemorySyncTarget(), { schemaVersion: 8, minSupportedSchemaVersion: 7 });
+    await expect(client.reconcile(ctx)).rejects.toMatchObject({ code: "SCHEMA_TOO_OLD" });
+  });
+
+  it("treats a failed handshake as a failure, not as a server too old to check", async () => {
+    const transport = new InProcessTransport({
+      handle: async () => ({ ok: false, error: { code: "UNAUTHORIZED", message: "who are you" } })
+    });
+    const client = new SyncBackend({ local: new InMemoryBackend(), remote: new RemoteSyncTarget(transport), schema: { schemaVersion: 6 } });
+    await expect(client.reconcile(ctx)).rejects.toThrow(/UNAUTHORIZED/);
+  });
+
+  it("refuses a version that isn't a whole number rather than let it pass every comparison", async () => {
+    const floor = Number(process.env.SURELY_UNSET_MIN_SCHEMA); // NaN
+    await expect(connected({ schemaVersion: 6 }, { schemaVersion: 7, minSupportedSchemaVersion: floor }).reconcile(ctx)).rejects.toMatchObject({
+      code: "SCHEMA_INVALID"
+    });
+  });
+});

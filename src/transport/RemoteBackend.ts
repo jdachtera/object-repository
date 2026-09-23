@@ -1,5 +1,5 @@
 import type { SchemaVersioning } from "../core/types.ts";
-import type { SchemaAdvertisement } from "../core/schema.ts";
+import { isSchemaRefusal, type SchemaAdvertisement, type SchemaRefusalCode } from "../core/schema.ts";
 import type {
   Backend,
   ChangeEvent,
@@ -10,7 +10,7 @@ import type {
 } from "../core/Backend.ts";
 import type { Capabilities, Context, JsonObject, Uuid } from "../core/types.ts";
 import type { AggregatePlan, AggregateResultRow, QueryPlan } from "../core/QueryPlan.ts";
-import type { Transport, WireResponse } from "../core/Transport.ts";
+import type { Transport, WireRequest, WireResponse } from "../core/Transport.ts";
 
 /**
  * Client side of the transport boundary (ARCHITECTURE.md §10): a `Backend` whose every operation is
@@ -28,6 +28,8 @@ export class RemoteBackend implements Backend {
   private removes: PersistedChange[] = [];
   private readonly listeners = new Set<ChangeListener>();
   private subscription?: Unsubscribe;
+  /** Sent with every request, so a versioned server can judge each one (set by `handshake`). */
+  private advertisement: SchemaAdvertisement | undefined;
 
   constructor(
     private readonly transport: Transport,
@@ -53,24 +55,21 @@ export class RemoteBackend implements Backend {
    */
   async handshake(fingerprint: string, ctx: Context, schema?: SchemaVersioning): Promise<void> {
     const params: SchemaAdvertisement = { fingerprint, ...(schema ?? {}) };
-    const response = await this.transport.request({ method: "handshake", params: { ...params } }, ctx);
-    if (!response.ok) {
-      const code = response.error?.code;
-      const message = response.error?.message ?? "Schema handshake failed";
-      if (code === "SCHEMA_MISMATCH") throw new SchemaMismatchError(message);
-      if (code === "SCHEMA_TOO_OLD") throw new SchemaTooOldError(message);
-      if (code === "SCHEMA_TOO_NEW") throw new SchemaTooNewError(message);
-    }
-    expect(response);
+    this.advertisement = params;
+    expect(await this.transport.request({ method: "handshake", params: { ...params } }, ctx));
+  }
+
+  private send(request: WireRequest, ctx: Context): Promise<WireResponse> {
+    return this.transport.request(this.advertisement ? { ...request, schema: this.advertisement } : request, ctx);
   }
 
   async query(plan: QueryPlan, ctx: Context): Promise<JsonObject[]> {
-    const response = await this.transport.request({ method: "query", params: { plan } }, ctx);
+    const response = await this.send({ method: "query", params: { plan } }, ctx);
     return expect(response) as JsonObject[];
   }
 
   async queryUuids(plan: QueryPlan, ctx: Context): Promise<Uuid[]> {
-    const response = await this.transport.request({ method: "queryUuids", params: { plan } }, ctx);
+    const response = await this.send({ method: "queryUuids", params: { plan } }, ctx);
     return expect(response) as Uuid[];
   }
 
@@ -81,7 +80,7 @@ export class RemoteBackend implements Backend {
    * `AggregatingBackend`, so `Repository.runAggregate` picks the push-down path over the transport.
    */
   async aggregate(plan: AggregatePlan, ctx: Context): Promise<AggregateResultRow[]> {
-    const response = await this.transport.request({ method: "aggregate", params: { plan } }, ctx);
+    const response = await this.send({ method: "aggregate", params: { plan } }, ctx);
     return expect(response) as AggregateResultRow[];
   }
 
@@ -97,7 +96,7 @@ export class RemoteBackend implements Backend {
     const params = { saves: this.saves, removes: this.removes };
     this.saves = [];
     this.removes = [];
-    const response = await this.transport.request({ method: "persist", params }, ctx);
+    const response = await this.send({ method: "persist", params }, ctx);
     return expect(response) as PersistResult;
   }
 
@@ -142,9 +141,16 @@ export class RemoteBackend implements Backend {
   }
 }
 
-/** Thrown when the two ends' schema shapes disagree and there are no versions to interpret them by. */
+/**
+ * The server can't serve this client's schema. The base of every schema refusal, so one `instanceof`
+ * catches them all; thrown as itself when the shapes disagree with no versions to interpret them by,
+ * or when a version is invalid.
+ */
 export class SchemaMismatchError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly code: SchemaRefusalCode = "SCHEMA_MISMATCH"
+  ) {
     super(message);
     this.name = "SchemaMismatchError";
   }
@@ -155,17 +161,17 @@ export class SchemaMismatchError extends Error {
  * contracts that destroyed the shape this client still expects. The client must upgrade; there is no
  * way for the server to serve it.
  */
-export class SchemaTooOldError extends Error {
+export class SchemaTooOldError extends SchemaMismatchError {
   constructor(message: string) {
-    super(message);
+    super(message, "SCHEMA_TOO_OLD");
     this.name = "SchemaTooOldError";
   }
 }
 
 /** Thrown when this build is *ahead* of the server — the rollout ran backwards; the server must lead. */
-export class SchemaTooNewError extends Error {
+export class SchemaTooNewError extends SchemaMismatchError {
   constructor(message: string) {
-    super(message);
+    super(message, "SCHEMA_TOO_NEW");
     this.name = "SchemaTooNewError";
   }
 }
@@ -173,6 +179,13 @@ export class SchemaTooNewError extends Error {
 function expect(response: WireResponse): unknown {
   if (!response.ok) {
     const error = response.error;
+    // A schema refusal can come back on any request once the server enforces it — a redeploy that
+    // raised the floor mid-session — so it is typed here, not only at the handshake.
+    if (error && isSchemaRefusal(error.code)) {
+      if (error.code === "SCHEMA_TOO_OLD") throw new SchemaTooOldError(error.message);
+      if (error.code === "SCHEMA_TOO_NEW") throw new SchemaTooNewError(error.message);
+      throw new SchemaMismatchError(error.message, error.code);
+    }
     throw new Error(error ? `${error.code}: ${error.message}` : "Remote backend request failed");
   }
   return response.result;

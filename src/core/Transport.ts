@@ -1,3 +1,4 @@
+import type { SchemaAdvertisement } from "./schema.ts";
 import type { Context } from "./types.ts";
 
 /**
@@ -40,6 +41,11 @@ export type WireMethod =
 
 export interface WireRequest {
   method: WireMethod;
+  /**
+   * The client's schema advertisement, sent with every request so a versioned server can refuse a
+   * client it no longer serves on any request — not only at the handshake, which a client may skip.
+   */
+  schema?: SchemaAdvertisement;
   /**
    * Method arguments (e.g. a serialized QueryPlan). Typed `unknown` rather than `JsonValue`: the
    * payload must be JSON-serializable, but that is a runtime contract the transport enforces (the

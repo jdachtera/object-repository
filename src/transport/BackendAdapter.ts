@@ -6,7 +6,7 @@ import {
   type Unsubscribe
 } from "../core/Backend.ts";
 import type { Context, SchemaVersioning } from "../core/types.ts";
-import { checkSchemaCompatibility, type SchemaAdvertisement } from "../core/schema.ts";
+import { checkSchemaCompatibility, enforceSchema, type SchemaAdvertisement } from "../core/schema.ts";
 import type { AggregatePlan, QueryPlan } from "../core/QueryPlan.ts";
 import { reduceAggregatePlan } from "../expressions/aggregateReduce.ts";
 import type { TransportAdapter, WireRequest, WireResponse } from "../core/Transport.ts";
@@ -54,6 +54,13 @@ export class BackendAdapter implements TransportAdapter {
     this.allowedModels = allowedModels ? new Set(allowedModels) : undefined;
   }
 
+  private advertisement(): SchemaAdvertisement {
+    return {
+      ...(this.schemaFingerprint === undefined ? {} : { fingerprint: this.schemaFingerprint }),
+      ...(this.schema ?? {})
+    };
+  }
+
   /** Clamp a returned window to `maxPageSize` so a client can't request an unbounded bulk read. */
   private clamp(plan: QueryPlan): QueryPlan {
     if (this.maxPageSize === undefined) return plan;
@@ -70,6 +77,10 @@ export class BackendAdapter implements TransportAdapter {
 
   async handle(request: WireRequest, ctx: Context): Promise<WireResponse> {
     try {
+      if (request.method !== "handshake") {
+        const refusal = enforceSchema(request.schema, this.advertisement());
+        if (refusal && !refusal.compatible) return err(refusal.code, refusal.message);
+      }
       switch (request.method) {
         case "handshake": {
           const client = request.params as unknown as SchemaAdvertisement;

@@ -42,11 +42,6 @@ import type {
 export { MigrationLockedError };
 
 export interface RunnerOptions extends MigrateOptions {
-  /**
-   * Skip the cooperative lease that stops two replicas migrating at once. Only for a caller that
-   * already guarantees a single runner (a dedicated deploy step); leaving it on is the safe default.
-   */
-  skipLock?: boolean;
   /** Identifies this runner in the lease row. Defaults to a fresh id per call. */
   lockOwner?: string;
   /** The build's declared schema version. `0` means ungated — today's behaviour. */

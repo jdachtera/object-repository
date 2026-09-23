@@ -73,3 +73,17 @@ describe("without versions, the fingerprint still rules", () => {
     expect(checkSchemaCompatibility({ fingerprint: "abc" }, {})).toEqual({ compatible: true, basis: "unchecked" });
   });
 });
+
+describe("drift at the same version", () => {
+  it("refuses equal versions whose models differ", () => {
+    expect(
+      checkSchemaCompatibility({ schemaVersion: 7, fingerprint: "a" }, { schemaVersion: 7, fingerprint: "b" })
+    ).toMatchObject({ compatible: false, code: "SCHEMA_MISMATCH" });
+  });
+
+  it("still allows different shapes across versions — that is a window", () => {
+    expect(checkSchemaCompatibility({ schemaVersion: 6, fingerprint: "a" }, { schemaVersion: 7, fingerprint: "b" })).toMatchObject({
+      compatible: true
+    });
+  });
+});
