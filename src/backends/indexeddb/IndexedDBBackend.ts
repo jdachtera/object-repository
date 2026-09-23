@@ -207,9 +207,11 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
 
     const models = unique([...saved, ...removed].map((change) => change.model));
     if (models.length > 0) {
+      let writing = false;
       try {
         const db = await this.ensureOpen(...models);
         const tx = db.transaction(models, "readwrite");
+        writing = true;
         for (const change of saved) {
           tx.objectStore(change.model).put(change.record);
         }
@@ -218,11 +220,13 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
         }
         await transactionDone(tx);
       } catch (error) {
-        // Nothing was written (the transaction is all-or-nothing). A blocked upgrade is transient, so put
-        // the batch back, ahead of anything queued since, for the retry the error asks for. Anything else
-        // — a unique-index conflict, say — would fail the same way every time: requeued, it would ride
-        // along with, and sink, every later persist.
-        if (error instanceof SchemaUpgradeBlockedError) {
+        // Nothing was written (the transaction is all-or-nothing). A failure before the write transaction
+        // began — a blocked or failed upgrade, a connection another tab's upgrade closed — is about
+        // getting the database open, and the retry the error invites should write the batch: put it
+        // back, ahead of anything since. A failure *in* the write is the batch's own (a unique-index
+        // conflict, an invalid key; closing a connection never aborts a running transaction), and
+        // requeued it would fail the same way every time, sinking every later persist with it.
+        if (!writing) {
           this.saveQueue = [...saved, ...this.saveQueue];
           this.removeQueue = [...removed, ...this.removeQueue];
         }
@@ -388,6 +392,36 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
     return this.db;
   }
 
+  /** Which of these unique indexes would cover duplicate values in the data as it stands. */
+  private async duplicated<T extends { model: string; keyPath: string | string[] }>(candidates: T[]): Promise<T[]> {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = this.factory.open(this.name); // the current version: no upgrade
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      const blamed: T[] = [];
+      for (const candidate of candidates) {
+        if (!db.objectStoreNames.contains(candidate.model)) continue;
+        const tx = db.transaction(candidate.model, "readonly");
+        const rows = await requestResult<JsonObject[]>(tx.objectStore(candidate.model).getAll());
+        const seen = new Set<string>();
+        for (const row of rows) {
+          const key = indexKeyOf(row, candidate.keyPath);
+          if (key === undefined) continue; // not indexed, so it can't collide
+          if (seen.has(key)) {
+            blamed.push(candidate);
+            break;
+          }
+          seen.add(key);
+        }
+      }
+      return blamed;
+    } finally {
+      db.close();
+    }
+  }
+
   /** Drop the current connection's state, so the next operation opens afresh. */
   private forget(): void {
     this.db = null;
@@ -399,14 +433,13 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
       const request =
         version === undefined ? this.factory.open(this.name) : this.factory.open(this.name, version);
 
-      const attempted: string[] = [];
+      const attempted: Array<{ key: string; model: string; name: string; keyPath: string | string[] }> = [];
       request.onupgradeneeded = () => {
         const db = request.result;
         const tx = request.transaction;
         for (const [model, indexes] of this.models) {
-          const store = db.objectStoreNames.contains(model)
-            ? tx!.objectStore(model)
-            : db.createObjectStore(model, { keyPath: "uuid" });
+          const created = !db.objectStoreNames.contains(model);
+          const store = created ? db.createObjectStore(model, { keyPath: "uuid" }) : tx!.objectStore(model);
           for (const name of nameList(store.indexNames)) {
             if (this.droppedIndexes.has(`${model}\0${name}`)) store.deleteIndex(name);
           }
@@ -422,7 +455,8 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
               store.deleteIndex(index.name); // redefined under the same name: rebuild it
             }
             store.createIndex(index.name, keyPath, { unique: index.unique ?? false });
-            if (index.unique) attempted.push(key);
+            // A new store is empty, so its unique indexes can't be what failed.
+            if (index.unique && !created) attempted.push({ key, model, name: index.name, keyPath });
           }
         }
       };
@@ -459,16 +493,24 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
       request.onerror = () => {
         settled = true;
         const error = request.error ?? new Error("Failed to open IndexedDB");
-        if (attempted.length) {
-          // The upgrade aborted as a whole; a unique index over already-duplicate data is what does
-          // that. Stop requiring those indexes, so the next operation opens instead of failing the
-          // same way — and say which ones, since the constraint is now not in force.
-          for (const key of attempted) this.unbuildable.add(key);
-          const names = attempted.map((key) => key.split("\0").slice(0, 2).join("."));
-          reject(new Error(`IndexedDB upgrade failed building unique index(es) ${names.join(", ")} — likely duplicate values. They are not enforced until the data is fixed. (${String((error as Error).message ?? error)})`));
+        if (!attempted.length) {
+          reject(error);
           return;
         }
-        reject(error);
+        // The upgrade aborted as a whole, so it doesn't say which index was to blame. Look: an index is
+        // unbuildable only if the data it would cover really holds duplicates. Those alone stop being
+        // required, so the next operation opens instead of failing the same way — and the error names
+        // them, since their constraint is now not in force. A failure with no duplicates behind it
+        // (a full disk, say) marks nothing: it is reported as it is.
+        void this.duplicated(attempted).then(
+          (blamed) => {
+            if (!blamed.length) return reject(error);
+            for (const candidate of blamed) this.unbuildable.add(candidate.key);
+            const names = blamed.map((candidate) => `${candidate.model}.${candidate.name}`);
+            reject(new Error(`IndexedDB upgrade failed building unique index(es) ${names.join(", ")}: the data holds duplicate values. They are not enforced until the data is fixed. (${String((error as Error).message ?? error)})`));
+          },
+          () => reject(error)
+        );
       };
     });
   }
@@ -602,4 +644,17 @@ function indexKeyPath(index: IndexSpec): string | string[] {
 /** What makes two index definitions the same index: the key path and uniqueness. */
 function indexSignature(keyPath: string | string[], unique: boolean): string {
   return `${JSON.stringify(keyPath)}|${unique ? "unique" : ""}`;
+}
+
+/**
+ * The key a record has under an index's key path, as a comparable string — or `undefined` when the
+ * record isn't in the index (a missing path, or a value IndexedDB can't use as a key).
+ */
+function indexKeyOf(record: JsonObject, keyPath: string | string[]): string | undefined {
+  const at = (path: string): unknown => path.split(".").reduce<unknown>((value, part) => (value as Record<string, unknown> | undefined)?.[part], record);
+  const valid = (value: unknown): boolean =>
+    typeof value === "string" || (typeof value === "number" && !Number.isNaN(value)) || value instanceof Date || (Array.isArray(value) && value.every(valid));
+  const values = Array.isArray(keyPath) ? keyPath.map(at) : [at(keyPath)];
+  if (!values.every(valid)) return undefined;
+  return JSON.stringify(values);
 }

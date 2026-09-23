@@ -911,6 +911,16 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     this.cache.invalidateResults();
   }
 
+  /**
+   * The stored shape changed in a way this process can't replay (another process's rollback). Drop the
+   * write baselines, so a save carries nothing forward: a record loaded before then is written as the
+   * instance holds it, not with fields the store may no longer have.
+   */
+  forgetBaselines(): void {
+    this.cache.clearBaselines();
+    this.cache.invalidateResults();
+  }
+
   /** The window state changed: results cached under the old one are no longer right. */
   windowsChanged(): void {
     this.cache.invalidateResults();

@@ -49,6 +49,11 @@ export interface RunnerOptions extends MigrateOptions {
   /** Supplied for tests; defaults to the wall clock. */
   now?: () => number;
 
+  /**
+   * Called as soon as each migration's `down` has run and its journal rows are gone — so a caller can
+   * react to a rollback that fails part-way, for the migrations it did revert.
+   */
+  onRolledBack?: (migration: Migration) => void | Promise<void>;
   /** Overrides the journal implementation (the SQL backends supply their own table-backed one). */
   journal?: MigrationJournal;
 }
@@ -279,6 +284,7 @@ async function rollbackAll(backend: Backend, migrations: Migration[], count: num
       ]
     });
     report.applied.push(migration.name);
+    await options.onRolledBack?.(migration);
   }
 
   return report;

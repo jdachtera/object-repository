@@ -127,7 +127,7 @@ export class RepositoryManager {
   private readonly windows = new WindowState();
   private windowsLoaded = false;
   /** The applied journal rows this process knows about; newer ones changed the store behind it. */
-  private seenApplied: Set<string> | null = null;
+  private seenApplied: Map<string, JournalRow> | null = null;
 
   constructor(options: RepositoryManagerOptions = {}) {
     this.backend = options.backend ?? new InMemoryBackend();
@@ -324,12 +324,22 @@ export class RepositoryManager {
     // Journalled work this process hasn't seen yet changed the stored shape under its repositories.
     const applied = rows.filter((row) => row.status === "applied");
     if (this.seenApplied) {
-      for (const row of applied) {
-        if (this.seenApplied.has(journalKey(row))) continue;
+      // Replayed in the order they ran — the journal loads in id (hash) order, and a rename followed
+      // by a drop of the renamed field, replayed backwards, would leave the field behind to resurrect.
+      const fresh = applied.filter((row) => !this.seenApplied!.has(journalKey(row))).sort(appliedOrder);
+      for (const row of fresh) {
         for (const op of row.ops) if ("model" in op) this.registry.get(op.model)?.storeChanged(op);
       }
+      // A row that has gone was rolled back — elsewhere, since this process's own rollbacks report
+      // each reverted migration as it goes. Its `down` isn't journalled, so what it changed can't be
+      // replayed: stop carrying anything forward for the models it touched.
+      const current = new Set(applied.map(journalKey));
+      for (const [key, row] of this.seenApplied) {
+        if (current.has(key)) continue;
+        for (const op of row.ops) if ("model" in op) this.registry.get(op.model)?.forgetBaselines();
+      }
     }
-    this.seenApplied = new Set(applied.map(journalKey));
+    this.seenApplied = new Map(applied.map((row) => [journalKey(row), row]));
     const changed = this.windows.update(rows);
     for (const model of changed) {
       this.register(model);
@@ -342,7 +352,7 @@ export class RepositoryManager {
     if (this.seenApplied) return;
     try {
       const rows = await new BackendJournal(migrationTarget(this.backend), this.ctx).load();
-      this.seenApplied = new Set(rows.filter((row) => row.status === "applied").map(journalKey));
+      this.seenApplied = new Map(rows.filter((row) => row.status === "applied").map((row) => [journalKey(row), row]));
     } catch {
       // unreadable: nothing to compare against, as for a process that never read it
     }
@@ -368,17 +378,19 @@ export class RepositoryManager {
    */
   async rollback(migrations: Migration[], count = 1, options: MigrateOptions = {}): Promise<MigrationReport> {
     await this.snapshotJournal();
-    let report: MigrationReport | undefined;
     try {
-      report = await rollbackMigrations(this.backend, migrations, count, this.runnerOptions(options));
-      return report;
+      return await rollbackMigrations(this.backend, migrations, count, {
+        ...this.runnerOptions(options),
+        // A `down` isn't journalled, so apply each one that ran to the baselines directly — as it
+        // runs, so a rollback that fails part-way still accounts for the migrations it reverted.
+        onRolledBack: async (migration) => {
+          for (const op of await downOps(migration)) if ("model" in op) this.registry.get(op.model)?.storeChanged(op);
+          for (const key of [...(this.seenApplied?.keys() ?? [])]) {
+            if (this.seenApplied!.get(key)!.name === migration.name) this.seenApplied!.delete(key);
+          }
+        }
+      });
     } finally {
-      // A rollback's `down` ops aren't journalled, so apply the ones that ran to the baselines directly.
-      for (const name of report?.applied ?? []) {
-        const migration = migrations.find((candidate) => candidate.name === name);
-        if (!migration) continue;
-        for (const op of await downOps(migration)) if ("model" in op) this.registry.get(op.model)?.storeChanged(op);
-      }
       await this.refreshSchemaState().catch(() => {});
     }
   }
@@ -565,4 +577,15 @@ function indexSpecs(properties: PropertyMap, declared: IndexDecl[] | undefined):
 /** A journal row's identity across reads: re-applying a phase (after a rollback) is a new event. */
 function journalKey(row: JournalRow): string {
   return `${row.name}\0${row.phase}\0${row.appliedAt}`;
+}
+
+/**
+ * The order journal rows were applied in: by time, then — for rows stamped in the same millisecond —
+ * by name (migration names are conventionally sequence-prefixed) and phase (an expand precedes its
+ * contract).
+ */
+function appliedOrder(a: JournalRow, b: JournalRow): number {
+  if (a.appliedAt !== b.appliedAt) return a.appliedAt - b.appliedAt;
+  if (a.name !== b.name) return a.name < b.name ? -1 : 1;
+  return a.phase === b.phase ? 0 : a.phase === "expand" ? -1 : 1;
 }

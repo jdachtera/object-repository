@@ -604,3 +604,18 @@ describe("every refusal comes before any operation", () => {
     });
   });
 });
+
+describe("a rollback that fails part-way", () => {
+  it("reports each migration it did revert as it goes, so callers can account for them", async () => {
+    const backend = await seeded();
+    const first: Migration = { name: "m1", up: (m) => m.addField("User", "a", "text"), down: () => { throw new Error("down failed"); } };
+    const second: Migration = { name: "m2", up: (m) => m.addField("User", "b", "text", { fill: "B" }), down: (m) => m.dropField("User", "b") };
+    await run(backend, [first, second]);
+
+    const reverted: string[] = [];
+    await expect(
+      rollbackMigrations(backend, [first, second], 2, { models, now, onRolledBack: (migration) => void reverted.push(migration.name) })
+    ).rejects.toThrow("down failed");
+    expect(reverted).toEqual(["m2"]);
+  });
+});

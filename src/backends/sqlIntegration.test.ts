@@ -821,6 +821,40 @@ describe("MySQL (real engine)", () => {
     expect(idx[0]?.Sub_part).toBe(255);
   });
 
+  it("a concurrent writer inserting the same new uuid first settles as last-write-wins, not an error", async () => {
+    if (!pool) return;
+    await pool.query("DROP TABLE IF EXISTS `race_my`");
+    await new MySqlBackend(pool).registerModel("race_my", [], [{ name: "name", type: "text" }]);
+    let raced = false;
+    // Between this writer's existence check and its insert, another process inserts the same uuid.
+    const racing = new MySqlBackend({
+      query: (sql: string, params: unknown[]) => pool!.query(sql, params),
+      getConnection: async () => {
+        const conn = await pool!.getConnection();
+        return {
+          query: async (sql: string, params: unknown[]) => {
+            const result = await conn.query(sql, params);
+            if (!raced && sql.startsWith("SELECT `uuid`")) {
+              raced = true;
+              await pool!.query("INSERT INTO `race_my` (`uuid`, `name`) VALUES ('r1', 'other')");
+            }
+            return result;
+          },
+          beginTransaction: () => conn.beginTransaction(),
+          commit: () => conn.commit(),
+          rollback: () => conn.rollback(),
+          release: () => conn.release()
+        };
+      }
+    } as never);
+    await racing.registerModel("race_my", [], [{ name: "name", type: "text" }]);
+    racing.save("race_my", { uuid: "r1", name: "mine" }, ctx);
+    await racing.persist(ctx);
+    expect(raced).toBe(true);
+    const [rows] = (await pool.query("SELECT `uuid`, `name` FROM `race_my`")) as unknown as [Array<{ uuid: string; name: string }>];
+    expect(rows).toEqual([{ uuid: "r1", name: "mine" }]);
+  });
+
   it("re-saving a uuid updates in place via ON DUPLICATE KEY UPDATE (no duplicate row)", async () => {
     if (!pool) return;
     const orm = new RepositoryManager({ backend: new MySqlBackend(pool) });

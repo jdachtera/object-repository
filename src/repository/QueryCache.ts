@@ -50,6 +50,9 @@ export class QueryCache<T> {
   editBaselines(edit: (record: JsonObject) => void): void {
     for (const record of this.baseline.values()) edit(record);
   }
+  clearBaselines(): void {
+    this.baseline.clear();
+  }
   deleteBaseline(uuid: Uuid): void {
     this.baseline.delete(uuid);
   }

@@ -532,19 +532,38 @@ export class SqlBackend
     // The last write to a uuid within one batch wins, as it did under the upsert.
     const byUuid = new Map(chunk.map((change) => [String(change.record.uuid), change]));
     const uuids = [...byUuid.keys()];
+    // A plain read, not `FOR UPDATE`: locking rows that don't exist yet takes gap locks, and two writers
+    // probing the same new uuid would deadlock. A writer that slips in between is caught at the insert.
     const found = await exec.run(
-      `SELECT \`uuid\` AS uuid FROM ${this.dialect.ref(model)} WHERE \`uuid\` IN (${uuids.map(() => "?").join(", ")}) FOR UPDATE`,
+      `SELECT \`uuid\` AS uuid FROM ${this.dialect.ref(model)} WHERE \`uuid\` IN (${uuids.map(() => "?").join(", ")})`,
       uuids
     );
     const existing = new Set(found.map((row) => String(row.uuid)));
 
     const inserts = [...byUuid.values()].filter((change) => !existing.has(String(change.record.uuid)));
     if (inserts.length) {
-      const tuple = `(${columns.map(() => "?").join(", ")})`;
-      await exec.run(
-        `INSERT INTO ${this.dialect.ref(model)} (${columns.map((c) => this.dialect.column(c)).join(", ")}) VALUES ${inserts.map(() => tuple).join(", ")}`,
-        inserts.flatMap((change) => this.encodeRow(model, change.record))
-      );
+      const insert = (changes: PersistedChange[]) =>
+        exec.run(
+          `INSERT INTO ${this.dialect.ref(model)} (${columns.map((c) => this.dialect.column(c)).join(", ")}) VALUES ${changes
+            .map(() => `(${columns.map(() => "?").join(", ")})`)
+            .join(", ")}`,
+          changes.flatMap((change) => this.encodeRow(model, change.record))
+        );
+      try {
+        await insert(inserts);
+      } catch (error) {
+        if (!isPrimaryKeyDuplicate(error)) throw error; // another unique key: the collision it should be
+        // Another writer inserted one of these uuids since the read — the race the old upsert settled
+        // as last-write-wins. Settle it the same way: row by row, an existing uuid is updated instead.
+        for (const change of inserts) {
+          try {
+            await insert([change]);
+          } catch (rowError) {
+            if (!isPrimaryKeyDuplicate(rowError)) throw rowError;
+            existing.add(String(change.record.uuid));
+          }
+        }
+      }
     }
 
     const setColumns = updateColumns ?? columns.filter((column) => column !== "uuid");
@@ -867,4 +886,10 @@ function coerce(params: JsonValue[]): unknown[] {
 function alreadyInTargetState(op: MigrationOp, error: unknown): boolean {
   const errno = (error as { errno?: unknown } | null)?.errno;
   return (op.kind === "addIndex" && errno === 1061) || (op.kind === "dropIndex" && errno === 1091);
+}
+
+/** MySQL's duplicate-entry error (1062) on the primary key — a uuid another writer inserted first. */
+function isPrimaryKeyDuplicate(error: unknown): boolean {
+  const { errno, message } = (error ?? {}) as { errno?: unknown; message?: unknown };
+  return errno === 1062 && /for key '(?:[^']*\.)?PRIMARY'/.test(String(message));
 }

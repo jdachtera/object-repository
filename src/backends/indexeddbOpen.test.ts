@@ -203,3 +203,44 @@ describe("a unique index that can't be built", () => {
     await later.persist(ctx);
   });
 });
+
+describe("a persist that fails only because the database couldn't open", () => {
+  it("keeps its batch for the next attempt when the upgrade failed building an index", async () => {
+    const name = dbName();
+    const first = new IndexedDBBackend({ name });
+    first.save("User", { uuid: "u1", email: "dup@x" }, ctx);
+    first.save("User", { uuid: "u2", email: "dup@x" }, ctx);
+    await first.persist(ctx);
+
+    const later = new IndexedDBBackend({ name });
+    later.registerModel("User", [{ name: "by_email", fields: [{ path: "email" }], unique: true }]);
+    later.save("Post", { uuid: "p1" }, ctx);
+    await expect(later.persist(ctx)).rejects.toThrow(/by_email/);
+    await later.persist(ctx); // the next attempt opens without the unbuildable index…
+    const posts = await later.query({ model: "Post", where: all().serialize(), order: [], paging: { start: 0 } }, ctx);
+    expect(posts.map((row) => row.uuid)).toEqual(["p1"]); // …and writes the batch that was waiting
+  });
+});
+
+describe("blaming the right index when an upgrade fails", () => {
+  it("stops requiring only the index over duplicate data; a clean one added alongside is still enforced", async () => {
+    const name = dbName();
+    const first = new IndexedDBBackend({ name });
+    first.save("User", { uuid: "u1", email: "dup@x" }, ctx);
+    first.save("User", { uuid: "u2", email: "dup@x" }, ctx);
+    first.save("Product", { uuid: "p1", sku: "A" }, ctx);
+    await first.persist(ctx);
+
+    const later = new IndexedDBBackend({ name });
+    later.registerModel("User", [{ name: "by_email", fields: [{ path: "email" }], unique: true }]);
+    later.registerModel("Product", [{ name: "by_sku", fields: [{ path: "sku" }], unique: true }]);
+    const read = (model: string) => later.query({ model, where: all().serialize(), order: [], paging: { start: 0 } }, ctx);
+    const failure = (await read("User").catch((error: Error) => error)) as Error;
+    expect(failure.message).toMatch(/User\.by_email/);
+    expect(failure.message).not.toMatch(/Product/);
+
+    expect(await read("Product")).toHaveLength(1);
+    later.save("Product", { uuid: "p2", sku: "A" }, ctx);
+    await expect(later.persist(ctx)).rejects.toThrow(); // by_sku was built and is enforced
+  });
+});
