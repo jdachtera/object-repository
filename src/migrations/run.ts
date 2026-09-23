@@ -11,15 +11,25 @@
  * Contracts whose gate has cleared are reported as `releasable` and wait for someone to say so.
  */
 import type { Backend } from "../core/Backend.ts";
-import { isMigrationLowering } from "../core/Backend.ts";
+import { isMigrationLowering, isTransactional } from "../core/Backend.ts";
 import type { Context } from "../core/types.ts";
 import { SYSTEM_CONTEXT } from "../core/types.ts";
 import { generateUuid } from "../core/uuid.ts";
 import { applyOp, type ExecuteOptions } from "./execute.ts";
 import { MigrationBlockedError, SchemaVersionError } from "./errors.ts";
-import { acquireLock, BackendJournal, indexRows, rowId, validateMigrationNames, type JournalRow, type MigrationJournal, type SchemaState } from "./journal.ts";
+import {
+  acquireLock,
+  BackendJournal,
+  indexRows,
+  MigrationLockedError,
+  validateMigrationNames,
+  type JournalRow,
+  type Lease,
+  type MigrationJournal,
+  type SchemaState
+} from "./journal.ts";
 import { downOps } from "./ops.ts";
-import { destroysInWholePass, evaluateMigrations } from "./evaluate.ts";
+import { destroysInWholePass, encodeResume, evaluateMigrations, type ResumePoint } from "./evaluate.ts";
 import type {
   MigrateOptions,
   Migration,
@@ -28,13 +38,7 @@ import type {
   Phase
 } from "./types.ts";
 
-/** Thrown when another runner already holds the migration lease. */
-export class MigrationLockedError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "MigrationLockedError";
-  }
-}
+export { MigrationLockedError };
 
 export interface RunnerOptions extends MigrateOptions {
   /**
@@ -73,19 +77,45 @@ export async function runMigrations(
   const now = options.now ?? Date.now;
   const journal = options.journal ?? new BackendJournal(backend, ctx);
 
-  const lock = options.skipLock
-    ? null
-    : await acquireLock(backend, ctx, now, options.lockOwner ?? generateUuid());
-  if (!options.skipLock && !lock) {
+  return withLease(backend, ctx, now, options, (lease) =>
+    applyAll(backend, migrations, { ...options, ctx, now, journal, lease })
+  );
+}
+
+/**
+ * Hold the lease for the duration of `body`.
+ *
+ * On failure, whatever the body left queued is discarded first: the release's own persist (on a store
+ * without native leases) would otherwise commit it. And a release that fails never masks the error
+ * that got us here.
+ */
+async function withLease<T>(
+  backend: Backend,
+  ctx: Context,
+  now: () => number,
+  options: RunnerOptions,
+  body: (lease: Lease | null) => Promise<T>
+): Promise<T> {
+  const lease = options.skipLock ? null : await acquireLock(backend, ctx, now, options.lockOwner ?? generateUuid());
+  if (!options.skipLock && !lease) {
     throw new MigrationLockedError(
       "Another process is already migrating this store. Run migrations from one place — a deploy step, not application startup."
     );
   }
 
+  let failed = false;
   try {
-    return await applyAll(backend, migrations, { ...options, ctx, now, journal });
+    return await body(lease);
+  } catch (error) {
+    failed = true;
+    backend.discardPending?.();
+    throw error;
   } finally {
-    await lock?.release();
+    try {
+      await lease?.release();
+    } catch (releaseError) {
+      if (!failed) throw releaseError; // eslint-disable-line no-unsafe-finally
+    }
   }
 }
 
@@ -99,7 +129,7 @@ export async function runMigrations(
 async function applyAll(
   backend: Backend,
   migrations: Migration[],
-  options: RunnerOptions & { ctx: Context; now: () => number; journal: MigrationJournal }
+  options: Running
 ): Promise<MigrationReport> {
   const { now, journal } = options;
   const state = await resolveVersions(journal, options);
@@ -126,18 +156,22 @@ async function applyAll(
     const { migration, bodyHash } = decision;
 
     if (decision.expand) {
-      await runPhase(backend, migration, decision.expand, "expand", options);
-      await journal.write(row(migration, "expand", "applied", decision.expand, bodyHash, now()));
+      // The expand's completion and what the contract half owes are recorded together, with the
+      // phase's own writes where the store allows: that debt has to outlive this source file being
+      // edited, reordered or deleted, so it must never be lost between two separate writes.
+      await runPhase(backend, migration, decision.expand, "expand", options, {
+        resume: decision.expandResume,
+        progress: (cursor) => row(migration, "expand", "pending", decision.expand!, bodyHash, now(), cursor),
+        done: () => [
+          row(migration, "expand", "applied", decision.expand!, bodyHash, now()),
+          decision.owed.length
+            ? row(migration, "contract", "pending", decision.owed, bodyHash, now())
+            : row(migration, "contract", "applied", [], bodyHash, now())
+        ]
+      });
       report.expanded.push(migration.name);
       report.applied.push(migration.name);
       if (decision.whole && destroysInWholePass(decision.expand)) report.contracted.push(migration.name);
-      // Record what the contract half owes *now*, while the migration is in front of us — that debt
-      // has to outlive this source file being edited, reordered or deleted.
-      await journal.write(
-        decision.owed.length
-          ? row(migration, "contract", "pending", decision.owed, bodyHash, now())
-          : row(migration, "contract", "applied", [], bodyHash, now())
-      );
     } else if (decision.contract === "none" && !decision.orphaned) {
       report.skipped.push(migration.name);
     }
@@ -152,8 +186,11 @@ async function applyAll(
         report.releasable.push(decision.outstanding!);
         break;
       case "run":
-        await runPhase(backend, migration, decision.owed, "contract", options);
-        await journal.write(row(migration, "contract", "applied", decision.owed, bodyHash, now()));
+        await runPhase(backend, migration, decision.owed, "contract", options, {
+          resume: decision.contractResume,
+          progress: (cursor) => row(migration, "contract", "pending", decision.owed, bodyHash, now(), cursor),
+          done: () => [row(migration, "contract", "applied", decision.owed, bodyHash, now())]
+        });
         report.contracted.push(migration.name);
         if (!report.applied.includes(migration.name)) report.applied.push(migration.name);
         break;
@@ -185,6 +222,15 @@ export async function rollbackMigrations(
   const ctx = options.ctx ?? SYSTEM_CONTEXT;
   const now = options.now ?? Date.now;
   const journal = options.journal ?? new BackendJournal(backend, ctx);
+  // A rollback rewrites the store exactly as a run does, so it takes the same lease: a rollback racing
+  // a deploy's migrate would otherwise interleave with it.
+  return withLease(backend, ctx, now, options, (lease) =>
+    rollbackAll(backend, migrations, count, { ...options, ctx, now, journal, lease })
+  );
+}
+
+async function rollbackAll(backend: Backend, migrations: Migration[], count: number, options: Running): Promise<MigrationReport> {
+  const { journal } = options;
   const rows = await journal.load();
   const report: MigrationReport = { applied: [], skipped: [], expanded: [], contracted: [], deferred: [], releasable: [] };
   const byName = new Map(migrations.map((migration) => [migration.name, migration]));
@@ -213,9 +259,17 @@ export async function rollbackMigrations(
       continue;
     }
 
-    await runPhase(backend, migration, await downOps(migration), "expand", { ...options, ctx, now, journal });
-    await journal.remove(migration.name, "expand");
-    await journal.remove(migration.name, "contract");
+    await runPhase(backend, migration, await downOps(migration), "expand", options, {
+      resume: null,
+      progress: null,
+      done: () => [],
+      // Contract first: interrupted between the two, the journal still reads as a valid state (an
+      // expand whose contract is owed) rather than a contract with no expand, which is refused.
+      forget: [
+        { name: migration.name, phase: "contract" },
+        { name: migration.name, phase: "expand" }
+      ]
+    });
     report.applied.push(migration.name);
   }
 
@@ -283,29 +337,129 @@ export async function readHistory(
   return { rows: adopted, adopted: true };
 }
 
-/** Run one phase's ops, preferring a backend's native lowering and falling back to the reference. */
+/** The runner's options once resolved, plus the lease it holds. */
+type Running = RunnerOptions & { ctx: Context; now: () => number; journal: MigrationJournal; lease: Lease | null };
+
+/** How a phase is journalled. */
+interface PhaseRecord {
+  /** Where an interrupted attempt stopped. */
+  resume: ResumePoint | null;
+  /** The in-progress row marking a resume point, or `null` for a pass that can't resume (a rollback). */
+  progress: ((cursor: string) => JournalRow) | null;
+  /** The rows recording the phase as complete. */
+  done: () => JournalRow[];
+  /** Rows to delete on completion (a rollback un-applies them). */
+  forget?: Array<{ name: string; phase: Phase }>;
+}
+
+/**
+ * Run one phase's ops and journal it.
+ *
+ * On a store with real transactions the ops and the journal rows commit together, so a crash leaves
+ * either the whole phase recorded or none of it — never a column added with no record of why, which
+ * the retry would then trip over. Statements issued inside the transaction run on its own connection,
+ * outside the executor's per-statement timeout, so a long backfill can't time out client-side while
+ * it quietly commits server-side.
+ *
+ * Elsewhere, each page of a record pass is persisted together with a resume marker, so an interrupted
+ * pass continues from where it stopped rather than re-applying a non-idempotent transform to pages
+ * that already had it.
+ */
 async function runPhase(
   backend: Backend,
   migration: Migration,
   ops: MigrationOp[],
   phase: Phase,
-  options: RunnerOptions & { ctx: Context; now: () => number; journal: MigrationJournal }
+  options: Running,
+  record: PhaseRecord
 ): Promise<void> {
-  const execute: ExecuteOptions = {
-    ctx: options.ctx,
-    batchSize: options.batchSize ?? DEFAULT_BATCH,
-    migration: migration.name,
-    phase,
-    models: options.models ?? {},
-    transforms: migration.transforms ?? {},
-    ...(options.onProgress ? { onProgress: options.onProgress } : {}),
-    backendName: backend.constructor?.name ?? "this backend"
-  };
+  const { journal, lease } = options;
+  // Always prove the lease before a contract: that is the step that must never run twice.
+  await lease?.renew(phase === "contract");
 
-  for (const op of ops) {
+  if (isTransactional(backend) && backend.capabilities.transactions) {
+    let journalled = false;
+    await backend.transaction(async (tx) => {
+      await executeOps(tx, migration, ops, phase, options, null, {
+        heartbeat: async () => lease?.renew(false, tx)
+      });
+      const scoped = journal.within?.(tx);
+      if (scoped) {
+        await settle(scoped, record);
+        journalled = true;
+      }
+    }, options.ctx);
+    if (!journalled) await settle(journal, record);
+    return;
+  }
+
+  const progress = record.progress;
+  const at = (op: number) => (cursor: string) => progress!(encodeResume({ op, after: cursor }));
+  await executeOps(backend, migration, ops, phase, options, record.resume, (index) =>
+    progress && journal.stage
+      ? {
+          // Queued now, persisted with the page it describes.
+          checkpoint: async (cursor) => journal.stage!(at(index)(cursor)),
+          heartbeat: async () => lease?.renew()
+        }
+      : progress
+        ? {
+            // A journal kept elsewhere can't share the page's flush. Record the marker after the page
+            // lands: an interruption between the two re-applies that one page rather than skipping it.
+            heartbeat: async (cursor) => {
+              await journal.write(at(index)(cursor));
+              await lease?.renew();
+            }
+          }
+        : { heartbeat: async () => lease?.renew() }
+  );
+  await settle(journal, record);
+}
+
+async function settle(journal: MigrationJournal, record: PhaseRecord): Promise<void> {
+  for (const entry of record.done()) await journal.write(entry);
+  for (const entry of record.forget ?? []) await journal.remove(entry.name, entry.phase);
+}
+
+type PageHooks = Pick<ExecuteOptions, "checkpoint"> & { heartbeat?: (cursor: string) => Promise<void> };
+
+/** Run `ops` in order, preferring a backend's native lowering and falling back to the reference. */
+async function executeOps(
+  backend: Backend,
+  migration: Migration,
+  ops: MigrationOp[],
+  phase: Phase,
+  options: Running,
+  resume: ResumePoint | null,
+  hooks: PageHooks | ((index: number) => PageHooks)
+): Promise<void> {
+  for (let index = resume?.op ?? 0; index < ops.length; index++) {
+    const op = ops[index]!;
     const lowered = isMigrationLowering(backend) ? await backend.lowerMigrationOp(op, options.ctx) : null;
     if (lowered) continue; // the backend did it natively — same effect, lower cost
-    await applyOp(backend, op, execute);
+
+    const { checkpoint, heartbeat } = typeof hooks === "function" ? hooks(index) : hooks;
+    let cursor = "";
+    await applyOp(backend, op, {
+      ctx: options.ctx,
+      batchSize: options.batchSize ?? DEFAULT_BATCH,
+      migration: migration.name,
+      phase,
+      models: options.models ?? {},
+      transforms: migration.transforms ?? {},
+      ...(options.onProgress ? { onProgress: options.onProgress } : {}),
+      backendName: backend.constructor?.name ?? "this backend",
+      after: resume && index === resume.op ? resume.after : null,
+      ...(checkpoint
+        ? {
+            checkpoint: async (at: string) => {
+              cursor = at;
+              await checkpoint(at);
+            }
+          }
+        : { checkpoint: (at: string) => void (cursor = at) }),
+      ...(heartbeat ? { heartbeat: () => heartbeat(cursor) } : {})
+    });
   }
 }
 
@@ -370,7 +524,8 @@ function row(
   status: "applied" | "pending",
   ops: MigrationOp[],
   bodyHash: string,
-  at: number
+  at: number,
+  cursor: string | null = null
 ): JournalRow {
   return {
     name: migration.name,
@@ -379,7 +534,7 @@ function row(
     version: migration.schemaVersion ?? 0,
     ops,
     opsHash: bodyHash,
-    cursor: null,
+    cursor,
     appliedAt: at
   };
 }

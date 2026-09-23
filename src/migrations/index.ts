@@ -48,9 +48,12 @@ export {
   acquireLock,
   LOCK_ID,
   LOCK_LEASE_MS,
+  LOCK_RENEW_MS,
+  type Lease,
   type JournalRow,
   type MigrationJournal,
   type SchemaState
 } from "./journal.ts";
 export { planMigrations, formatPlan } from "./plan.ts";
 export { validateMigrationNames, MAX_MIGRATION_NAME_LENGTH } from "./journal.ts";
+export { evaluateMigrations, type MigrationDecision, type ContractAction, type ResumePoint } from "./evaluate.ts";

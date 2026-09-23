@@ -1,5 +1,6 @@
 import type {
   Backend,
+  LeasingBackend,
   ChangeEvent,
   ChangeListener,
   CountingBackend,
@@ -69,7 +70,7 @@ export interface IndexedDBBackendOptions {
  * paging via the shared `scan()` helper. Object stores and indexes are provisioned from the
  * `registerModel` calls the RepositoryManager makes during `define`.
  */
-export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBackend {
+export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBackend, LeasingBackend {
   readonly capabilities = CAPABILITIES;
 
   private readonly name: string;
@@ -218,6 +219,27 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
     }
 
     return { saved, removed };
+  }
+
+  /** Read and claim inside one readwrite transaction, which IndexedDB serializes against every other. */
+  async acquireLease(model: string, key: string, owner: string, now: number, ttlMs: number, _ctx: Context): Promise<boolean> {
+    const db = await this.ensureOpen(model);
+    const tx = db.transaction(model, "readwrite");
+    const store = tx.objectStore(model);
+    const held = await requestResult<JsonObject | undefined>(store.get(key));
+    const free = !held || String(held.owner) === owner || Number(held.expiresAt ?? 0) <= now;
+    if (free) store.put({ ...held, uuid: key, owner, expiresAt: now + ttlMs });
+    await transactionDone(tx);
+    return free;
+  }
+
+  async releaseLease(model: string, key: string, owner: string, _ctx: Context): Promise<void> {
+    const db = await this.ensureOpen(model);
+    const tx = db.transaction(model, "readwrite");
+    const store = tx.objectStore(model);
+    const held = await requestResult<JsonObject | undefined>(store.get(key));
+    if (held && String(held.owner) === owner) store.delete(key);
+    await transactionDone(tx);
   }
 
   discardPending(): void {

@@ -36,6 +36,31 @@ export interface MigrationDecision {
   contract: ContractAction;
   /** Set when `owed` is non-empty and not yet settled. */
   outstanding: DeferredContract | null;
+  /** Where an interrupted expand pass stopped, to resume rather than restart. */
+  expandResume: ResumePoint | null;
+  /** Where an interrupted contract pass stopped. */
+  contractResume: ResumePoint | null;
+}
+
+/** An interrupted pass: the op it was on, and the last uuid whose page was persisted. */
+export interface ResumePoint {
+  op: number;
+  after: string | null;
+}
+
+export function encodeResume(point: ResumePoint): string {
+  return JSON.stringify(point);
+}
+
+function decodeResume(cursor: string | null): ResumePoint | null {
+  if (!cursor) return null;
+  try {
+    const parsed = JSON.parse(cursor) as Partial<ResumePoint>;
+    if (typeof parsed.op !== "number") return null;
+    return { op: parsed.op, after: typeof parsed.after === "string" ? parsed.after : null };
+  } catch {
+    return null;
+  }
 }
 
 export interface Evaluation {
@@ -81,8 +106,24 @@ export async function evaluateMigrations(
     let expand: MigrationOp[] | null = null;
     let whole = false;
     let owed: MigrationOp[];
+    let expandResume: ResumePoint | null = null;
+    let contractResume: ResumePoint | null = null;
 
-    if (!expandApplied) {
+    if (expandRow?.status === "pending") {
+      // An expand that was interrupted part-way. Finish exactly the ops it started — the gate or
+      // `applyContracts` may have moved since, and re-deciding would re-run ops it already did.
+      if (expandRow.opsHash && expandRow.opsHash !== bodyHash) {
+        blockers.push({
+          code: "CHECKSUM_DRIFT",
+          migration: migration.name,
+          message: `"${migration.name}" was interrupted part-way, and its operations have changed since. Restore the version that started, let it finish, then add a new migration.`
+        });
+      }
+      expand = expandRow.ops;
+      whole = ranWhole(migration, expandRow);
+      owed = whole ? [] : splitPhases(recorder.ops, false).contract;
+      expandResume = decodeResume(expandRow.cursor);
+    } else if (!expandApplied) {
       whole = migration.schemaVersion === undefined || (open && applyContracts);
       const phases = splitPhases(recorder.ops, whole);
       expand = phases.expand;
@@ -101,6 +142,7 @@ export async function evaluateMigrations(
       } else if (contractRow?.status === "pending" && contractRow.ops.length) {
         // The journal's record wins: the source may have been edited or reordered since.
         owed = contractRow.ops;
+        contractResume = decodeResume(contractRow.cursor);
       } else if (drifted) {
         owed = []; // already blocked; the edited source is no guide to what is owed
       } else {
@@ -110,7 +152,11 @@ export async function evaluateMigrations(
       }
     }
 
-    decisions.push(decide(migration, false, bodyHash, expand, whole, owed, open, applyContracts, minSupported));
+    decisions.push({
+      ...decide(migration, false, bodyHash, expand, whole, owed, open, applyContracts, minSupported),
+      expandResume,
+      contractResume
+    });
   }
 
   // Debts whose migration has since been deleted from the array. The journal recorded what they owe
@@ -119,7 +165,10 @@ export async function evaluateMigrations(
     if (row.phase !== "contract" || row.status !== "pending" || declared.has(row.name)) continue;
     const migration: Migration = { name: row.name, schemaVersion: row.version, up: () => {} };
     const open = gateOpen(migration, minSupported);
-    const decision = decide(migration, true, row.opsHash, null, false, row.ops, open, applyContracts, minSupported);
+    const decision = {
+      ...decide(migration, true, row.opsHash, null, false, row.ops, open, applyContracts, minSupported),
+      contractResume: decodeResume(row.cursor)
+    };
     const unrecoverable = !row.ops.length || row.ops.some((op) => op.kind === "transform");
     if (unrecoverable && (decision.contract === "run" || !row.ops.length)) {
       blockers.push({
@@ -158,7 +207,18 @@ function decide(
         ...(orphaned ? { orphaned: true } : {})
       }
     : null;
-  return { migration, orphaned, bodyHash, expand, whole, owed, contract, outstanding };
+  return {
+    migration,
+    orphaned,
+    bodyHash,
+    expand,
+    whole,
+    owed,
+    contract,
+    outstanding,
+    expandResume: null,
+    contractResume: null
+  };
 }
 
 /** Did an earlier run take this migration's expand as a single, whole pass? Then nothing is owed. */

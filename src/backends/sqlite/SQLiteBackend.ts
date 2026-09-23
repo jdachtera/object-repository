@@ -5,6 +5,7 @@ import type {
   ChangeListener,
   CountingBackend,
   IndexSpec,
+  LeasingBackend,
   MultiPatchingBackend,
   PatchOp,
   PatchingBackend,
@@ -86,7 +87,8 @@ export class SQLiteBackend
     PatchingBackend,
     MultiPatchingBackend,
     UpsertingBackend,
-    AggregatingBackend
+    AggregatingBackend,
+    LeasingBackend
 {
   readonly capabilities = CAPABILITIES;
 
@@ -322,6 +324,32 @@ export class SQLiteBackend
   discardPending(): void {
     this.saveQueue = [];
     this.removeQueue = [];
+  }
+
+  /**
+   * One conditional upsert: the claim lands only if the row is absent, expired, or already ours. A
+   * single statement is atomic on its own, so this holds on a batch-only driver (D1) as well.
+   */
+  async acquireLease(model: string, key: string, owner: string, now: number, ttlMs: number, _ctx: Context): Promise<boolean> {
+    await this.ensureTable(model);
+    const table = ident(model);
+    const data = JSON.stringify({ uuid: key, owner, expiresAt: now + ttlMs });
+    await this.db
+      .prepare(
+        `INSERT INTO ${table} (uuid, data) VALUES (?, ?) ON CONFLICT(uuid) DO UPDATE SET data = excluded.data ` +
+          `WHERE COALESCE(json_extract(${table}.data, '$.expiresAt'), 0) <= ? OR json_extract(${table}.data, '$.owner') = ?`
+      )
+      .run(key, data, now, owner);
+    const rows = (await this.db.prepare(`SELECT json_extract(data, '$.owner') AS owner FROM ${table} WHERE uuid = ?`).all(key)) as {
+      owner: unknown;
+    }[];
+    return rows[0]?.owner === owner;
+  }
+
+  async releaseLease(model: string, key: string, owner: string, _ctx: Context): Promise<void> {
+    await this.ensureTable(model);
+    const table = ident(model);
+    await this.db.prepare(`DELETE FROM ${table} WHERE uuid = ? AND json_extract(data, '$.owner') = ?`).run(key, owner);
   }
 
   changes(listener: ChangeListener, _ctx: Context): Unsubscribe {

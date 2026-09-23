@@ -167,6 +167,32 @@ export function isMigrationLowering(backend: object): backend is MigrationLoweri
 }
 
 /**
+ * Optional capability: an expiring, single-holder lease, claimed with one atomic compare-and-set.
+ *
+ * The migration runner uses it so two replicas cannot both migrate. A read-then-write protocol cannot
+ * give that guarantee: both runners can read "free" before either writes. So each store claims with
+ * the one conditional write it has (SQL `UPDATE … WHERE`, a Mongo upsert against a unique key, a single
+ * IndexedDB transaction, a synchronous in-process check).
+ *
+ * The lease is the row `key` of `model`, holding `owner` and `expiresAt`.
+ */
+export interface LeasingBackend {
+  /**
+   * Claim `key` for `owner` until `now + ttlMs`. Succeeds when the lease is free, expired, or already
+   * `owner`'s (so this also renews). Resolves `false` when another owner holds a live lease.
+   */
+  acquireLease(model: string, key: string, owner: string, now: number, ttlMs: number, ctx: Context): Promise<boolean>;
+  /** Give the lease up, but only if `owner` still holds it: never free a successor's lease. */
+  releaseLease(model: string, key: string, owner: string, ctx: Context): Promise<void>;
+}
+
+/** Narrow a backend to the leasing interface. */
+export function isLeasing(backend: object): backend is LeasingBackend {
+  const candidate = backend as Partial<LeasingBackend>;
+  return typeof candidate.acquireLease === "function" && typeof candidate.releaseLease === "function";
+}
+
+/**
  * Optional capability: count matching rows natively (ARCHITECTURE.md §11). A store that can count
  * without materializing rows (IndexedDB `count`, SQL `COUNT(*)`) implements this; otherwise the
  * engine falls back to fetching and counting in memory. Same result either way — only faster.

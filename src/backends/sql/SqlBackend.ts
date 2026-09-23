@@ -14,6 +14,7 @@
  */
 import type {
   AggregatingBackend,
+  LeasingBackend,
   Backend,
   ChangeEvent,
   ChangeListener,
@@ -110,7 +111,8 @@ export class SqlBackend
     AggregatingBackend,
     RawQueryable<SqlRawQuery>,
     TransactionalBackend,
-    MigratableBackend
+    MigratableBackend,
+    LeasingBackend
 {
   readonly capabilities: Capabilities;
 
@@ -164,11 +166,51 @@ export class SqlBackend
 
     let rows = 0;
     for (const statement of statements) {
-      const result = await this.exec.run(statement.sql, statement.params);
+      let result: unknown;
+      try {
+        result = await this.exec.run(statement.sql, statement.params);
+      } catch (error) {
+        // MySQL's index DDL has no IF [NOT] EXISTS. A retry after a crash between the DDL and the
+        // journal write must find the index already in its target state and carry on, not fail.
+        if (!alreadyInTargetState(op, error)) throw error;
+      }
       rows += Array.isArray(result) ? result.length : 0;
     }
     if ("model" in op && changesColumns(op)) this.refreshModel(op);
     return { rows };
+  }
+
+  /**
+   * Claim the lease with one conditional write. The seed insert never overwrites an existing row, and
+   * the `UPDATE … WHERE` only lands when the lease is expired or already ours. Each is atomic on its
+   * own, so two runners can never both read "free" and both claim.
+   */
+  async acquireLease(model: string, key: string, owner: string, now: number, ttlMs: number, _ctx: Context): Promise<boolean> {
+    await this.ensure(model);
+    const table = this.dialect.ref(model);
+    const [uuid, ownerCol, expires] = [this.dialect.column("uuid"), this.dialect.column("owner"), this.dialect.column("expiresAt")];
+    const seed =
+      this.dialect.name === "mysql"
+        ? `INSERT IGNORE INTO ${table} (${uuid}, ${ownerCol}, ${expires}) VALUES (?, ?, ?)`
+        : `INSERT INTO ${table} (${uuid}, ${ownerCol}, ${expires}) VALUES (?, ?, ?) ON CONFLICT (${uuid}) DO NOTHING`;
+    await this.exec.run(this.dialect.finalize(seed), [key, owner, now + ttlMs]);
+    await this.exec.run(
+      this.dialect.finalize(
+        `UPDATE ${table} SET ${ownerCol} = ?, ${expires} = ? WHERE ${uuid} = ? AND (${expires} IS NULL OR ${expires} <= ? OR ${ownerCol} = ?)`
+      ),
+      [owner, now + ttlMs, key, now, owner]
+    );
+    const rows = await this.exec.run(this.dialect.finalize(`SELECT ${ownerCol} AS owner FROM ${table} WHERE ${uuid} = ?`), [key]);
+    return rows.length === 1 && String(rows[0]!.owner) === owner;
+  }
+
+  async releaseLease(model: string, key: string, owner: string, _ctx: Context): Promise<void> {
+    await this.ensure(model);
+    const [uuid, ownerCol] = [this.dialect.column("uuid"), this.dialect.column("owner")];
+    await this.exec.run(
+      this.dialect.finalize(`DELETE FROM ${this.dialect.ref(model)} WHERE ${uuid} = ? AND ${ownerCol} = ?`),
+      [key, owner]
+    );
   }
 
   /**
@@ -437,9 +479,10 @@ export class SqlBackend
       await this.persist(ctx);
       return result;
     }
+    let scoped: SqlBackend | undefined;
     try {
-      return await this.exec.transaction(async (txExec) => {
-        const scoped = this.forTransaction(txExec);
+      const result = await this.exec.transaction(async (txExec) => {
+        scoped = this.forTransaction(txExec);
         const result = await fn(scoped);
         // Fold in writes queued on the outer backend (repos not obtained from the tx scope) so the
         // whole unit commits together, then flush once on the tx connection.
@@ -450,10 +493,26 @@ export class SqlBackend
         await scoped.persist(ctx);
         return result;
       });
+      // Committed. Anything the scope learned about table shapes (a migration's DDL, a re-registered
+      // model) is now true of the database, so this backend must stop encoding against the old one.
+      if (scoped) this.adoptSchema(scoped);
+      return result;
     } catch (error) {
       this.discardPending();
       throw error;
     }
+  }
+
+  private adoptSchema(scoped: SqlBackend): void {
+    for (const model of new Set([...this.schemas.keys(), ...scoped.schemas.keys()])) {
+      const fields = scoped.schemas.get(model);
+      if (fields) this.schemas.set(model, fields);
+      else this.schemas.delete(model);
+    }
+    scoped.indexes.forEach((specs, model) => this.indexes.set(model, specs));
+    scoped.provisioned.forEach((done, model) => this.provisioned.set(model, done));
+    for (const model of this.provisioned.keys()) if (!scoped.provisioned.has(model)) this.provisioned.delete(model);
+    this.liveColumnCache.clear();
   }
 
   /**
@@ -705,4 +764,10 @@ function coerce(params: JsonValue[]): unknown[] {
     if (value !== null && typeof value === "object") return JSON.stringify(value);
     return value;
   });
+}
+
+/** MySQL: `CREATE INDEX` on a name that exists (1061), `DROP INDEX` on one that doesn't (1091). */
+function alreadyInTargetState(op: MigrationOp, error: unknown): boolean {
+  const errno = (error as { errno?: unknown } | null)?.errno;
+  return (op.kind === "addIndex" && errno === 1061) || (op.kind === "dropIndex" && errno === 1091);
 }

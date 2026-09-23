@@ -215,11 +215,31 @@ still low enough to serve the old clients, before any client updates.
 
 ## Concurrency
 
-`migrate()` takes a cooperative lease so two replicas booting together cannot both migrate — the
-second gets `MigrationLockedError`. It is a *lease*, not a lock: it expires, so a process that dies
-mid-migration does not wedge every future deploy. That also means it is not airtight — a runner that
-stalls past the lease can still overlap with its successor. It converts the common accident into a
-clear refusal and does not pretend to be a distributed lock.
+`migrate()` and `rollback()` take a lease so two runners cannot both migrate. The second gets
+`MigrationLockedError`. Every built-in store claims the lease with one atomic compare-and-set (the
+`LeasingBackend` capability), so two replicas booting in the same instant cannot both read "free" and
+both proceed. A store without the capability falls back to read, write and read back. That catches
+the common accident but not a true race.
+
+It is a *lease*, not a lock: it expires, so a process that dies mid-migration does not wedge every
+future deploy. A live runner renews it as it works, after every page of a record pass and before every
+contract. A runner that finds its lease taken stops with `MigrationLockedError` rather than carry on
+alongside its successor. Releasing checks the owner, so a late runner can't free its successor's lease.
+
+### Interrupted runs
+
+On a store with real transactions (Postgres, MySQL), each phase's operations and its journal rows
+commit together. A failure leaves either the whole phase recorded or none of it. On Postgres the DDL
+rolls back with it. MySQL commits DDL implicitly, so there the lowered DDL is written to be safe to
+re-run instead: `addField` onto an existing column only fills it, and a repeated index create or drop
+is recognised as already done. Migration statements run on the transaction's own connection, outside
+the executor's per-statement timeout, so a long backfill can't time out on the client while it
+commits on the server.
+
+On other stores, each page of a record pass is persisted together with a resume marker in the journal.
+An interrupted pass continues from its last persisted page instead of starting over, so a
+non-idempotent `transform` (`price * 100`) is never applied to a record twice. A page that failed part
+way is discarded, not committed by whatever persists next.
 
 Run migrations from **one place** — a deploy step, not application startup. Pass `skipLock: true` only
 if you already guarantee that.
@@ -241,8 +261,10 @@ Stated plainly, because a safety mechanism you misunderstand is worse than none.
 5. **Field-level sync during a window.** `mergeByField` compares per-field versions independently, so a
    two-writer merge can briefly pick the legacy half from one replica and the canonical half from
    another. It self-heals on the next full write through the Repository, but it is not atomic.
-6. **A runner that stalls past its lease.** The lease expires so a dead process cannot wedge deploys,
-   which means a *very* slow one can still overlap with its successor. Run migrations from one place.
+6. **A runner that stalls past its lease between two renewals.** A runner checks its lease before
+   every contract and after every page, and stops once it has lost it. A single page or statement that
+   runs longer than the lease (5 minutes) can still overlap with a successor. Run migrations from one
+   place.
 7. **`unique` on the canonical half of a window.** Refused at `define()`: two constraints over one
    logical value double-report, and the legacy half carries the constraint until the contract runs.
 8. **Chained windows** (`a → b` and `b → c` open at once). Refused. Close one before opening the next.

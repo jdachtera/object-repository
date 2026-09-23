@@ -21,7 +21,8 @@ export interface Statement {
 /**
  * Statements realizing `op`, or `null` to decline.
  *
- * `present` is the live column set for `op`'s model. A field operation naming a column that isn't
+ * `present` is the live column set for `op`'s model; empty means the table doesn't exist. A field
+ * operation naming a column that isn't
  * there refers to something held in the JSON overflow (a relation, or a field the model never declared
  * as a scalar), and emitting DDL against a missing column would simply throw — so those decline.
  */
@@ -44,7 +45,11 @@ export function lowerToSql(op: MigrationOp, dialect: SqlDialect, present: Readon
       return [ddl(dialect.dropTable(op.model))];
 
     case "addField": {
-      const statements = [ddl(dialect.addColumn(op.model, op.field, dialect.columnType(op.type)))];
+      // No table yet: the reference executor provisions it from the model's declared layout. An
+      // existing column (auto-provisioned by `define()`, or added by an interrupted earlier attempt)
+      // is already in the target state, so only the fill remains.
+      if (present.size === 0) return null;
+      const statements = present.has(op.field) ? [] : [ddl(dialect.addColumn(op.model, op.field, dialect.columnType(op.type)))];
       if (op.fill !== undefined) {
         const column = dialect.column(op.field);
         statements.push({
@@ -59,7 +64,9 @@ export function lowerToSql(op: MigrationOp, dialect: SqlDialect, present: Readon
       return present.has(op.field) ? [ddl(dialect.dropColumn(op.model, op.field))] : null;
 
     case "renameField":
-      return present.has(op.from) ? [ddl(dialect.renameColumn(op.model, op.from, op.to))] : null;
+      // A target column that already exists would make the rename fail (or, on a retry, mean it
+      // already ran): decline, and let the reference move the values without losing either field.
+      return present.has(op.from) && !present.has(op.to) ? [ddl(dialect.renameColumn(op.model, op.from, op.to))] : null;
 
     case "retypeField":
       return present.has(op.field)

@@ -34,11 +34,12 @@ access. The **command plane** (task-based RPC for non-CRUD verbs) now rides the 
       Client/server skew is handled: when both ends advertise a schema version the handshake judges
       compatibility by range instead of fingerprint equality (equality refuses exactly the deploys a
       window exists to permit), with `SCHEMA_TOO_OLD`/`SCHEMA_TOO_NEW` naming the remedy; the same
-      check runs once per session on the sync path. `migrate()` takes a cooperative lease so two
-      replicas booting together cannot both migrate.
+      check runs once per session on the sync path. `migrate()` takes a compare-and-set lease so two
+      replicas cannot both migrate, renews it as it works, and runs each phase atomically with its
+      journal rows (transactional stores) or resumably, page by page (the rest).
       *Known gaps, deliberately out of scope here:* `define()`-time provisioning still creates unique
-      indexes outside the gate; the migration lease expires, so a runner that stalls past it can still
-      overlap with its successor; and client-side lazy migration is not built — a client cannot yet
+      indexes outside the gate; a single statement that outlives the migration lease can still overlap
+      with a successor; and client-side lazy migration is not built — a client cannot yet
       migrate its own local store on open, nor rewrite outbox entries queued in a pre-migration shape
       (the capability reserves `applySchemaOps` as a batch so that stays additive).
 - [x] **Durable sync server + transport bridge.** The offline-first stack now runs against a real store

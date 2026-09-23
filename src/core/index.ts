@@ -53,6 +53,7 @@ export type {
   UpsertingBackend,
   RawQueryable,
   TransactionalBackend,
+  LeasingBackend,
   ChangeEvent,
   ChangeListener,
   Unsubscribe
@@ -66,7 +67,8 @@ export {
   isMultiPatching,
   isUpserting,
   isRawQueryable,
-  isTransactional
+  isTransactional,
+  isLeasing
 } from "./Backend.ts";
 
 export type {

@@ -27,9 +27,27 @@ describe("lowering to Postgres", () => {
   });
 
   it("renames a column as metadata rather than rewriting rows", () => {
-    expect(sqlFor({ kind: "renameField", model: "User", from: "name", to: "fullName", type: "text" })).toEqual([
-      `ALTER TABLE "User" RENAME COLUMN "name" TO "fullName"`
-    ]);
+    expect(
+      sqlFor({ kind: "renameField", model: "User", from: "name", to: "fullName", type: "text" }, new Set(["uuid", "name"]))
+    ).toEqual([`ALTER TABLE "User" RENAME COLUMN "name" TO "fullName"`]);
+  });
+
+  it("declines a rename onto a column that already exists, which would fail or clobber", () => {
+    expect(lowerToSql({ kind: "renameField", model: "User", from: "name", to: "fullName", type: "text" }, postgresDialect, present)).toBeNull();
+  });
+
+  it("adds only the fill when the column is already there — auto-provisioned, or from an interrupted attempt", () => {
+    const statements = lowerToSql(
+      { kind: "addField", model: "User", field: "age", type: "integer", fill: 0 },
+      postgresDialect,
+      present
+    )!;
+    expect(statements.map((statement) => statement.sql)).toEqual([`UPDATE "User" SET "age" = $1 WHERE "age" IS NULL`]);
+    expect(lowerToSql({ kind: "addField", model: "User", field: "age", type: "integer" }, postgresDialect, present)).toEqual([]);
+  });
+
+  it("declines addField when the table doesn't exist yet, so the reference provisions it", () => {
+    expect(lowerToSql({ kind: "addField", model: "User", field: "tier", type: "text" }, postgresDialect, new Set())).toBeNull();
   });
 
   it("drops, retypes and indexes", () => {

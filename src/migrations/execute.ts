@@ -38,6 +38,15 @@ export interface ExecuteOptions {
   onProgress?: (progress: MigrationProgress) => void;
   /** Reported in `MigrationNotSupportedError`, purely for the message. */
   backendName?: string;
+  /** Resume a record pass after this uuid: an interrupted run's last persisted page. */
+  after?: string | null;
+  /**
+   * Called with a page's last uuid once its writes are queued and before they are persisted, so the
+   * runner can queue a resume marker that lands in the same flush as the page it describes.
+   */
+  checkpoint?: (cursor: string) => void | Promise<void>;
+  /** Called after each persisted page — the runner renews its lease here. */
+  heartbeat?: () => Promise<void>;
 }
 
 /** How many records an op rewrote. */
@@ -48,8 +57,9 @@ export interface OpResult {
 /**
  * Apply one operation using only the portable `Backend` surface.
  *
- * Every op is idempotent: re-running a completed pass is a no-op, which is what lets an interrupted
- * migration simply be run again.
+ * Every op but `transform` is idempotent: re-running a completed pass is a no-op. A transform need not
+ * be (`price * 100`), so an interrupted pass resumes from its last persisted page (`after`) instead of
+ * starting over.
  */
 export async function applyOp(backend: Backend, op: MigrationOp, options: ExecuteOptions): Promise<OpResult> {
   switch (op.kind) {
@@ -59,9 +69,16 @@ export async function applyOp(backend: Backend, op: MigrationOp, options: Execut
 
     case "dropModel": {
       let rows = 0;
-      for await (const page of pageByUuid(backend, op.model, everything(), options.batchSize, options.ctx)) {
+      for await (const page of pageByUuid(
+        backend,
+        op.model,
+        everything(),
+        options.batchSize,
+        options.ctx,
+        options.after ?? null
+      )) {
         for (const row of page.rows) backend.remove(op.model, row, options.ctx);
-        await backend.persist(options.ctx);
+        await flushPage(backend, options, page.cursor);
         rows += page.rows.length;
         report(options, op, rows);
       }
@@ -148,33 +165,59 @@ async function rewrite(
   const dirty = ["uuid", ...fields.filter((field) => field !== "uuid")];
   let rows = 0;
 
-  for await (const page of pageByUuid(backend, op.model, where, options.batchSize, options.ctx)) {
+  for await (const page of pageByUuid(
+    backend,
+    op.model,
+    where,
+    options.batchSize,
+    options.ctx,
+    options.after ?? null
+  )) {
     let written = 0;
-    for (const row of page.rows) {
-      const next = change(row);
-      if (next === null) {
-        if (!removeOnNull) continue; // unchanged — skip, which is what makes a re-run free
-        if (op.kind === "transform" && op.phase === "expand") {
-          // Declared expand is a promise that nothing pre-existing is disturbed; deleting a record
-          // breaks it, and the gate that should have held it back was bypassed on that promise.
-          throw new Error(
-            `Transform "${op.transform}" on "${op.model}" is declared phase "expand" but deleted record ${JSON.stringify(row.uuid)}. A transform that deletes must be a contract.`
-          );
+    try {
+      for (const row of page.rows) {
+        const next = change(row);
+        if (next === null) {
+          if (!removeOnNull) continue; // unchanged — skip, which is what makes a re-run free
+          if (op.kind === "transform" && op.phase === "expand") {
+            // Declared expand is a promise that nothing pre-existing is disturbed; deleting a record
+            // breaks it, and the gate that should have held it back was bypassed on that promise.
+            throw new Error(
+              `Transform "${op.transform}" on "${op.model}" is declared phase "expand" but deleted record ${JSON.stringify(row.uuid)}. A transform that deletes must be a contract.`
+            );
+          }
+          backend.remove(op.model, row, options.ctx);
+          written += 1;
+          continue;
         }
-        backend.remove(op.model, row, options.ctx);
+        backend.save(op.model, next, options.ctx, dirty);
         written += 1;
-        continue;
       }
-      backend.save(op.model, next, options.ctx, dirty);
-      written += 1;
+    } catch (error) {
+      // A throw mid-page must not leave that page half-queued: the next persist anyone issues — the
+      // lease release, or the application's own — would commit it, and the rerun would apply it again.
+      backend.discardPending?.();
+      throw error;
     }
     if (written > 0) {
-      await backend.persist(options.ctx);
+      await flushPage(backend, options, page.cursor);
       rows += written;
       report(options, op, rows);
     }
   }
   return { rows };
+}
+
+/** Persist one page together with its resume marker, discarding both if the flush fails. */
+async function flushPage(backend: Backend, options: ExecuteOptions, cursor: string): Promise<void> {
+  try {
+    await options.checkpoint?.(cursor);
+    await backend.persist(options.ctx);
+  } catch (error) {
+    backend.discardPending?.();
+    throw error;
+  }
+  await options.heartbeat?.();
 }
 
 /** Register a model's layout with a schema-aware backend, refusing to guess when it isn't known. */
@@ -191,5 +234,10 @@ async function register(backend: Backend, model: string, fields: FieldSpec[], in
 }
 
 function report(options: ExecuteOptions, op: MigrationOp, rows: number): void {
-  options.onProgress?.({ migration: options.migration, phase: options.phase, op, rows });
+  options.onProgress?.({
+    migration: options.migration,
+    phase: options.phase,
+    op,
+    rows
+  });
 }

@@ -1,5 +1,6 @@
 import type {
   AggregatingBackend,
+  LeasingBackend,
   Backend,
   ChangeEvent,
   ChangeListener,
@@ -175,7 +176,8 @@ export class MongoBackend
     MultiPatchingBackend,
     UpsertingBackend,
     AggregatingBackend,
-    RawQueryable<MongoRawQuery>
+    RawQueryable<MongoRawQuery>,
+    LeasingBackend
 {
   readonly capabilities = CAPABILITIES;
 
@@ -367,6 +369,36 @@ export class MongoBackend
         if (found.length > 0) throw new UniqueConstraintError(model, fields);
       }
     }
+  }
+
+  discardPending(): void {
+    this.saveQueue = [];
+    this.removeQueue = [];
+  }
+
+  /**
+   * One upsert filtered on "free, expired, or mine". When another owner's live lease exists the filter
+   * matches nothing, so the upsert tries to insert a second document with the same key, and the
+   * unique index on the key rejects it: that rejection is the refusal.
+   */
+  async acquireLease(model: string, key: string, owner: string, now: number, ttlMs: number, _ctx: Context): Promise<boolean> {
+    const collection = this.db.collection(model);
+    if (this.identity.field !== "_id") await collection.createIndex({ [this.identity.field]: 1 }, { unique: true });
+    try {
+      await collection.updateOne(
+        { ...keyFilter(key, this.identity), $or: [{ expiresAt: { $lte: now } }, { expiresAt: null }, { owner }] },
+        { $set: { owner, expiresAt: now + ttlMs } },
+        { upsert: true }
+      );
+      return true;
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code === 11000) return false;
+      throw error;
+    }
+  }
+
+  async releaseLease(model: string, key: string, owner: string, _ctx: Context): Promise<void> {
+    await this.db.collection(model).bulkWrite([{ deleteOne: { filter: { ...keyFilter(key, this.identity), owner } } }]);
   }
 
   async persist(_ctx: Context): Promise<PersistResult> {

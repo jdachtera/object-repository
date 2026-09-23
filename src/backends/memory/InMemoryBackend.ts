@@ -3,6 +3,7 @@ import type {
   ChangeEvent,
   ChangeListener,
   IndexSpec,
+  LeasingBackend,
   PersistResult,
   PersistedChange,
   SchemaAwareBackend,
@@ -37,7 +38,7 @@ const CAPABILITIES: Capabilities = {
  * and emits change events. (Real tombstones land with the sync seam, step 8; today `remove`
  * deletes and emits a `removed` event.)
  */
-export class InMemoryBackend implements Backend, SchemaAwareBackend {
+export class InMemoryBackend implements Backend, SchemaAwareBackend, LeasingBackend {
   readonly capabilities = CAPABILITIES;
 
   private readonly store = new Map<string, Map<Uuid, JsonObject>>();
@@ -136,6 +137,20 @@ export class InMemoryBackend implements Backend, SchemaAwareBackend {
   discardPending(): void {
     this.saveQueue = [];
     this.removeQueue = [];
+  }
+
+  /** Check-and-claim in one synchronous step, so no other caller in this process can interleave. */
+  async acquireLease(model: string, key: string, owner: string, now: number, ttlMs: number, _ctx: Context): Promise<boolean> {
+    const store = this.modelStore(model);
+    const held = store.get(key);
+    if (held && String(held.owner) !== owner && Number(held.expiresAt ?? 0) > now) return false;
+    store.set(key, { ...held, uuid: key, owner, expiresAt: now + ttlMs });
+    return true;
+  }
+
+  async releaseLease(model: string, key: string, owner: string, _ctx: Context): Promise<void> {
+    const store = this.modelStore(model);
+    if (String(store.get(key)?.owner) === owner) store.delete(key);
   }
 
   changes(listener: ChangeListener, _ctx: Context): Unsubscribe {

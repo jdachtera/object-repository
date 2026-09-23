@@ -11,13 +11,12 @@
  * journal plus the declared `minSupportedSchemaVersion`, so there are never two sources of truth to
  * disagree, and nothing to garbage-collect when the gate moves.
  *
- * Two implementations share this interface. `BackendJournal` writes reserved models through the plain
- * `Backend` seam, so it works on every store including the schemaless ones. The SQL backends use a
- * real table instead (`src/backends/sql/journal.ts`), which is also where the upgrade path for
- * already-deployed tracking tables lives.
+ * `BackendJournal` writes reserved models through the plain `Backend` seam, so it works on every store
+ * including the schemaless ones; on SQL the reserved models are ordinary columnar tables. The upgrade
+ * path for an already-deployed SQL tracking table is `legacyMigrationNames` plus the runner's adoption.
  */
 import type { Backend } from "../core/Backend.ts";
-import { isSchemaAware } from "../core/Backend.ts";
+import { isLeasing, isSchemaAware } from "../core/Backend.ts";
 import type { Context, JsonObject } from "../core/types.ts";
 import { everything, pageByUuid } from "./paging.ts";
 import type { MigrationOp, Phase } from "./types.ts";
@@ -33,7 +32,8 @@ export const SCHEMA_STATE_ID = "__schema__";
  * A phase's journal entry.
  *
  * `status` is the whole state machine: an `applied` row means the work is done, a `pending` contract
- * row means the ops in `ops` are owed but withheld by the gate.
+ * row means the ops in `ops` are owed but withheld by the gate, and a `pending` expand row means an
+ * expand was interrupted part-way — `cursor` says where, so the next run resumes instead of restarting.
  */
 export interface JournalRow {
   name: string;
@@ -62,6 +62,17 @@ export interface MigrationJournal {
   remove(name: string, phase: Phase): Promise<void>;
   readSchemaState(): Promise<SchemaState | null>;
   writeSchemaState(state: SchemaState): Promise<void>;
+  /**
+   * The same journal, writing through `backend` — a transaction's scope — so a phase's journal rows
+   * commit or roll back together with the phase's own writes.
+   */
+  within?(backend: Backend): MigrationJournal;
+  /**
+   * Queue `row` without persisting, so the next persist of the journal's backend carries it along with
+   * whatever else is queued. The runner stages a resume marker in the same flush as the page it
+   * describes, so the two can never disagree.
+   */
+  stage?(row: JournalRow): Promise<void>;
 }
 
 /**
@@ -147,9 +158,17 @@ export class BackendJournal implements MigrationJournal {
   }
 
   async write(row: JournalRow): Promise<void> {
+    await this.stage(row);
+    await this.backend.persist(this.ctx);
+  }
+
+  async stage(row: JournalRow): Promise<void> {
     await this.ensureModels();
     this.backend.save(MIGRATION_LOG_MODEL, encodeRow(row), this.ctx);
-    await this.backend.persist(this.ctx);
+  }
+
+  within(backend: Backend): MigrationJournal {
+    return new BackendJournal(backend, this.ctx);
   }
 
   async remove(name: string, phase: Phase): Promise<void> {
@@ -237,8 +256,8 @@ function parseOps(value: unknown): MigrationOp[] {
     const parsed: unknown = JSON.parse(value);
     return Array.isArray(parsed) ? (parsed as MigrationOp[]) : [];
   } catch {
-    // A corrupt ops payload must not make the journal unreadable: an owed contract with no
-    // recoverable ops is reported as drift by the runner rather than crashing the whole run.
+    // A corrupt ops payload must not make the journal unreadable. The runner re-derives an owed
+    // contract from an unchanged source, and otherwise refuses it as unrecoverable.
     return [];
   }
 }
@@ -249,53 +268,101 @@ export const LOCK_ID = "__lock__";
 /** How long a held lock stays valid before another runner may assume its holder died. */
 export const LOCK_LEASE_MS = 5 * 60_000;
 
+/** A live runner renews at least this often, so its lease never lapses while it works. */
+export const LOCK_RENEW_MS = 60_000;
+
+/** The runner's lease was taken by another runner: it must stop before it does anything else. */
+export class MigrationLockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MigrationLockedError";
+  }
+}
+
+/** A held migration lease. */
+export interface Lease {
+  readonly owner: string;
+  /**
+   * Prove the lease is still ours and extend it. Writes only when `LOCK_RENEW_MS` has passed since the
+   * last renewal, unless `force`. Throws `MigrationLockedError` if another runner has taken it, which
+   * is what stops a runner that stalled past its lease from carrying on alongside its successor.
+   * `via` renews through a transaction's scope, so the renewal needs no second connection.
+   */
+  renew(force?: boolean, via?: Backend): Promise<void>;
+  /** Give the lease up, only if it is still ours. */
+  release(): Promise<void>;
+}
+
 /**
- * A cooperative lease preventing two runners from migrating the same store at once.
+ * Claim the lease preventing two runners from migrating the same store at once.
  *
- * Two replicas booting together both read the same pending set and both act on it. For an expand
- * that is mostly survivable — the operations are idempotent — but a contract release is a genuine
- * race, and concurrent DDL against one table is not something to leave to luck.
+ * A store with the `LeasingBackend` capability claims with one atomic compare-and-set, so two replicas
+ * booting together can never both proceed. A store without it falls back to read, write, read back:
+ * that catches the common accident but not a true race, so every built-in store implements the
+ * capability.
  *
- * Deliberately a *lease*, not a lock: a process that dies mid-migration must not wedge every future
- * deploy, so the claim expires. That makes this cooperative rather than airtight — a runner that
- * stalls past the lease can still overlap with its successor. It converts the common accident (two
- * replicas booting together) into a clear refusal, and does not pretend to be a distributed lock.
+ * It is a *lease*, not a lock: a process that dies mid-migration must not wedge every future deploy,
+ * so the claim expires. A live runner renews it as it works (`Lease.renew`), and a runner that finds
+ * it has lost the lease stops instead of overlapping with its successor.
  */
 export async function acquireLock(
   backend: Backend,
   ctx: Context,
   now: () => number,
   owner: string
-): Promise<{ release(): Promise<void> } | null> {
+): Promise<Lease | null> {
   // Register first: the lease lives in a reserved model, and querying it before a schema-aware
   // backend knows its shape would provision it column-less.
   if (isSchemaAware(backend)) await backend.registerModel(SCHEMA_STATE_MODEL, [], STATE_FIELDS);
-  const rows = await backend.query(
-    { model: SCHEMA_STATE_MODEL, where: everything(), order: [], paging: { start: 0 } },
-    ctx
-  );
-  const held = rows.find((row) => String(row.uuid) === LOCK_ID);
-  const expires = held ? Number(held.expiresAt ?? 0) : 0;
-  if (held && expires > now()) return null; // someone else holds a live lease
 
-  backend.save(SCHEMA_STATE_MODEL, { uuid: LOCK_ID, owner, expiresAt: now() + LOCK_LEASE_MS }, ctx);
-  await backend.persist(ctx);
+  const claim = async (target: Backend = backend): Promise<boolean> =>
+    isLeasing(target)
+      ? target.acquireLease(SCHEMA_STATE_MODEL, LOCK_ID, owner, now(), LOCK_LEASE_MS, ctx)
+      : claimByReadBack(target, ctx, now, owner);
 
-  // Read back: if another runner claimed it in the same instant, the last write wins and only that
-  // owner proceeds. Cheap, and it closes the obvious both-saw-it-free window.
-  const confirm = await backend.query(
-    { model: SCHEMA_STATE_MODEL, where: everything(), order: [], paging: { start: 0 } },
-    ctx
-  );
-  const mine = confirm.find((row) => String(row.uuid) === LOCK_ID);
-  if (!mine || String(mine.owner) !== owner) return null;
+  if (!(await claim())) return null;
+  let renewedAt = now();
 
   return {
+    owner,
+    renew: async (force = false, via?: Backend) => {
+      if (!force && now() - renewedAt < LOCK_RENEW_MS) return;
+      if (!(await claim(via))) {
+        throw new MigrationLockedError(
+          "This runner's migration lease was taken by another runner. Stopping rather than migrating alongside it."
+        );
+      }
+      renewedAt = now();
+    },
     release: async () => {
+      if (isLeasing(backend)) {
+        await backend.releaseLease(SCHEMA_STATE_MODEL, LOCK_ID, owner, ctx);
+        return;
+      }
+      const held = await readLease(backend, ctx);
+      if (!held || String(held.owner) !== owner) return; // not ours any more: never free a successor's
       backend.remove(SCHEMA_STATE_MODEL, { uuid: LOCK_ID }, ctx);
       await backend.persist(ctx);
     }
   };
+}
+
+/** The fallback for a store with no compare-and-set: read, write, read back. */
+async function claimByReadBack(backend: Backend, ctx: Context, now: () => number, owner: string): Promise<boolean> {
+  const held = await readLease(backend, ctx);
+  if (held && String(held.owner) !== owner && Number(held.expiresAt ?? 0) > now()) return false;
+  backend.save(SCHEMA_STATE_MODEL, { uuid: LOCK_ID, owner, expiresAt: now() + LOCK_LEASE_MS }, ctx);
+  await backend.persist(ctx);
+  const mine = await readLease(backend, ctx);
+  return Boolean(mine) && String(mine!.owner) === owner;
+}
+
+async function readLease(backend: Backend, ctx: Context): Promise<JsonObject | undefined> {
+  const rows = await backend.query(
+    { model: SCHEMA_STATE_MODEL, where: everything(), order: [], paging: { start: 0 } },
+    ctx
+  );
+  return rows.find((row) => String(row.uuid) === LOCK_ID);
 }
 
 /** Index the journal by `(name, phase)` for the runner's state machine. */
