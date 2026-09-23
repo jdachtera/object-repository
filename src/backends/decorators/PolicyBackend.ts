@@ -16,7 +16,7 @@ import { isMigratable, type Migration, type MigrationReport } from "../sql/migra
 import type { Capabilities, Context, JsonObject, Uuid } from "../../core/types.ts";
 import type { QueryPlan } from "../../core/QueryPlan.ts";
 import type { Expression } from "../../expressions/Expression.ts";
-import { and } from "../../expressions/builders.ts";
+import { and, inList } from "../../expressions/builders.ts";
 import { parse } from "../../expressions/parse.ts";
 
 /** Thrown when a write is denied by the access policy. */
@@ -34,6 +34,15 @@ export class PolicyError extends Error {
  * rewriting — the same mechanism as relation preprocessing). `write` authorizes a save/remove.
  * Both receive the ambient `Context` established by a transport adapter.
  */
+/** A write held until `persist`, when the row it replaces can be read and authorized. */
+interface PendingWrite {
+  kind: "save" | "remove";
+  model: string;
+  record: JsonObject;
+  ctx: Context;
+  dirty?: readonly string[];
+}
+
 export interface AccessPolicy {
   /** Extra filter for reads of `model`; `null` means unrestricted. */
   read?(model: string, ctx: Context): Expression | null;
@@ -67,6 +76,10 @@ export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBacke
   migrate?: (migrations: Migration[]) => Promise<MigrationReport>;
   rollback?: (migrations: Migration[], count: number) => Promise<MigrationReport>;
 
+  private pending: PendingWrite[] = [];
+  /** Weak, so a server minting a context per request doesn't accumulate them. */
+  private readonly contextKeys = new WeakMap<Context, number>();
+  private nextContextKey = 0;
   /** Per model, canonical field → the legacy field holding its value (open compatibility windows). */
   private readonly mirrors = new Map<string, Map<string, string>>();
 
@@ -136,22 +149,78 @@ export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBacke
     return (await this.inner.query(rewritten, ctx)).length;
   }
 
+  /**
+   * Queue a write. The record as sent is checked now, so a plainly forbidden write fails where it is
+   * made; the stored row it would replace is checked at `persist`, which is where the store can be read.
+   */
   save(model: string, record: JsonObject, ctx: Context, dirty?: readonly string[]): void {
     this.authorizeWrite(model, record, ctx);
-    this.inner.save(model, record, ctx, dirty);
+    this.pending.push({ kind: "save", model, record, ctx, dirty });
   }
 
   remove(model: string, record: JsonObject, ctx: Context): void {
     this.authorizeWrite(model, record, ctx);
-    this.inner.remove(model, record, ctx);
+    this.pending.push({ kind: "remove", model, record, ctx });
   }
 
-  persist(ctx: Context): Promise<PersistResult> {
+  /**
+   * Authorize every queued write against the row it would replace, then forward them all.
+   *
+   * Checking only the record a client sends is not authorization: over a transport, a client names
+   * any uuid it likes, so it could overwrite or delete another tenant's row just by writing a record
+   * that claims to be its own. So the stored row behind each uuid must be one this context can see —
+   * under the read filter — and may write. A row it can't see is refused, and nothing is forwarded
+   * unless every write passes.
+   */
+  async persist(ctx: Context): Promise<PersistResult> {
+    const pending = this.pending;
+    this.pending = [];
+    await this.authorizeExisting(pending); // refused: the whole batch is dropped, none of it reaches the store
+    for (const change of pending) {
+      if (change.kind === "save") this.inner.save(change.model, change.record, change.ctx, change.dirty);
+      else this.inner.remove(change.model, change.record, change.ctx);
+    }
     return this.inner.persist(ctx);
   }
 
-  /** Forward transaction rollback to the inner queue — without this, a rolled-back write would commit. */
+  private async authorizeExisting(pending: PendingWrite[]): Promise<void> {
+    // One lookup per (model, context): the rows these uuids name, as the store holds them.
+    const groups = new Map<string, PendingWrite[]>();
+    for (const change of pending) {
+      if (typeof change.record.uuid !== "string" || !change.record.uuid) continue; // a fresh insert
+      const key = `${change.model}\0${this.contextKey(change.ctx)}`;
+      groups.set(key, [...(groups.get(key) ?? []), change]);
+    }
+    for (const changes of groups.values()) {
+      const { model, ctx } = changes[0]!;
+      const uuids = [...new Set(changes.map((change) => String(change.record.uuid)))];
+      const byUuid = { model, where: inList("uuid", uuids).serialize(), order: [], paging: { start: 0 } };
+      const stored = await this.inner.query(byUuid, ctx);
+      if (!stored.length) continue; // none exist yet: all inserts, checked as sent
+      const visible = new Set((await this.inner.query(this.rewrite(byUuid, ctx), ctx)).map((row) => String(row.uuid)));
+      for (const row of stored) {
+        const uuid = String(row.uuid);
+        if (!visible.has(uuid)) {
+          throw new PolicyError(`Write to "${model}" denied for the current context: record ${JSON.stringify(uuid)} is not visible to it.`);
+        }
+        this.authorizeWrite(model, row, ctx); // and the row being replaced must be writable, too
+      }
+    }
+  }
+
+  /** Contexts are compared by identity object; the same context queued twice shares one lookup. */
+  private contextKey(ctx: Context): number {
+    let key = this.contextKeys.get(ctx);
+    if (key === undefined) {
+      key = this.nextContextKey++;
+      this.contextKeys.set(ctx, key);
+    }
+    return key;
+  }
+
+  /** Drop the queued writes here and below — without this, a rolled-back write would commit. */
   discardPending(): void {
+    this.pending = [];
     this.inner.discardPending?.();
   }
 
