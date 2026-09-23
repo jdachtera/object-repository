@@ -30,8 +30,9 @@ import { MongoBackend } from "../backends/mongo/MongoBackend.js";
 import { runMigrations } from "./run.js";
 import { everything } from "./paging.js";
 import { SYSTEM_CONTEXT } from "../core/types.js";
-import type { Backend, FieldSpec } from "../core/Backend.js";
-import type { JsonObject } from "../core/types.js";
+import { migrationTarget, type Backend, type FieldSpec, type IndexSpec } from "../core/Backend.js";
+import type { JsonObject, JsonValue } from "../core/types.js";
+import { PolicyBackend } from "../backends/decorators/PolicyBackend.js";
 import type { Migration } from "./types.js";
 import "fake-indexeddb/auto";
 
@@ -68,11 +69,65 @@ interface Case {
   migration: Migration;
   /** The post-migration layout handed to the runner. Defaults to `BEFORE`. */
   after?: FieldSpec[];
+  /** Indexes the store has before the migration runs. */
+  indexesBefore?: IndexSpec[];
+  /** Indexes the application declares after it (what `define()` would register). Defaults to none. */
+  indexesAfter?: IndexSpec[];
+  /**
+   * Behaviour to compare besides the record set — an index's effect shows up only as what the store
+   * then accepts. Its result must match the reference's too.
+   */
+  probe?: (backend: Backend) => Promise<unknown>;
+  /** What the probe must return — on the reference too, which a differential check alone can't catch. */
+  expect?: unknown;
   /** Backends this case can't run on, with the reason. */
   skip?: Record<string, string>;
 }
 
+/** Does the store accept a record duplicating `n` of an existing one? */
+async function acceptsDuplicate(backend: Backend): Promise<string> {
+  backend.save(MODEL, { uuid: "zz", n: 1 }, ctx);
+  try {
+    await backend.persist(ctx);
+    return "accepted";
+  } catch {
+    backend.discardPending?.();
+    return "rejected";
+  }
+}
+
+const UNIQUE_N: IndexSpec = { name: "uniq_n", fields: [{ path: "n" }], unique: true };
+
 const CASES: Case[] = [
+  {
+    label: "addIndex (unique) not declared by the model",
+    // MySQL's upsert (`ON DUPLICATE KEY UPDATE`) turns the unique-key conflict into an update of the
+    // *other* row, so the probe sees "accepted" — the pre-existing F330, not an index divergence.
+    skip: { "MySQL (real)": "F330: MySQL upsert overwrites the conflicting row instead of rejecting" },
+    migration: { name: "m", up: (m) => m.addIndex(MODEL, UNIQUE_N) },
+    probe: acceptsDuplicate,
+    expect: "rejected"
+  },
+  {
+    label: "dropIndex (unique)",
+    migration: { name: "m", up: (m) => m.dropIndex(MODEL, "uniq_n") },
+    indexesBefore: [UNIQUE_N],
+    probe: acceptsDuplicate,
+    expect: "accepted"
+  },
+  {
+    label: "addIndex with a name that isn't an identifier",
+    // MySQL's upsert (`ON DUPLICATE KEY UPDATE`) turns the unique-key conflict into an update of the
+    // *other* row, so the probe sees "accepted" — the pre-existing F330, not an index divergence.
+    skip: { "MySQL (real)": "F330: MySQL upsert overwrites the conflicting row instead of rejecting" },
+    migration: { name: "m", up: (m) => m.addIndex(MODEL, { name: "by-n", fields: [{ path: "n" }], unique: true }) },
+    probe: acceptsDuplicate,
+    expect: "rejected"
+  },
+  {
+    label: "addIndex over a nested path",
+    migration: { name: "m", up: (m) => m.addIndex(MODEL, { name: "by_meta", fields: [{ path: "meta.x" }] }) }
+  },
   {
     label: "dropField",
     migration: { name: "m", up: (m) => m.dropField(MODEL, "legacy") }
@@ -134,21 +189,24 @@ const CASES: Case[] = [
 /** Run one case against one backend and return its resulting records, normalized for comparison. */
 async function outcome(backend: Backend, testCase: Case, minSupported = 0): Promise<JsonObject[]> {
   const { migration } = testCase;
-  if (isSchemaAware(backend)) await backend.registerModel(MODEL, [], BEFORE);
+  if (isSchemaAware(backend)) await backend.registerModel(MODEL, (testCase.indexesBefore ?? []) as never[], BEFORE);
   for (const row of SEED) backend.save(MODEL, { ...row }, ctx);
   await backend.persist(ctx);
 
   await runMigrations(backend, [migration], {
-    models: { [MODEL]: { fields: testCase.after ?? BEFORE, indexes: [] } },
+    models: { [MODEL]: { fields: testCase.after ?? BEFORE, indexes: testCase.indexesAfter ?? [] } },
     now,
     ...(migration.schemaVersion === undefined ? {} : { schemaVersion: migration.schemaVersion, minSupportedSchemaVersion: minSupported })
   });
 
-  const rows = await backend.query(
+  // Verified on the store itself: a decorator above it is the application's, not the migration's.
+  const store = migrationTarget(backend);
+  const rows = await store.query(
     { model: MODEL, where: everything(), order: [{ property: "uuid", descending: false }], paging: { start: 0 } },
     ctx
   );
-  return rows.map(normalize).sort((x, y) => String(x.uuid).localeCompare(String(y.uuid)));
+  const records = rows.map(normalize).sort((x, y) => String(x.uuid).localeCompare(String(y.uuid)));
+  return testCase.probe ? [...records, { probe: (await testCase.probe(store)) as JsonValue }] : records;
 }
 
 function isSchemaAware(backend: object): backend is { registerModel(m: string, i: never[], f: FieldSpec[]): Promise<void> | void } {
@@ -251,11 +309,23 @@ const BACKENDS: Array<[string, () => Promise<Backend | null>]> = [
   ]
 ];
 
+/**
+ * Each engine again beneath a decorator. A migration runs on the store underneath (`migrationTarget`),
+ * so the decorated result must be identical — and a decorator that leaked into the run would show here.
+ */
+const DECORATED: Array<[string, () => Promise<Backend | null>]> = BACKENDS.map(([name, make]) => [
+  `${name} beneath PolicyBackend`,
+  async () => {
+    const inner = await make();
+    return inner ? new PolicyBackend(inner, { read: () => { throw new Error("a migration must not consult row policy"); } }) : null;
+  }
+]);
+
 describe("migration conformance across backends", () => {
   for (const testCase of CASES) {
-    for (const [name, make] of BACKENDS) {
+    for (const [name, make] of [...BACKENDS, ...DECORATED]) {
       it(`${name}: ${testCase.label} matches the in-memory reference`, async (context) => {
-        if (testCase.skip?.[name]) return context.skip();
+        if (testCase.skip?.[name.replace(" beneath PolicyBackend", "")]) return context.skip();
         const backend = await make();
         if (!backend) return context.skip();
 
@@ -263,6 +333,7 @@ describe("migration conformance across backends", () => {
         const actual = await outcome(backend, testCase);
 
         expect(actual, `${name} diverged from the reference on "${testCase.label}"`).toEqual(reference);
+        if (testCase.expect !== undefined) expect(actual.at(-1)).toEqual({ probe: testCase.expect });
       });
     }
   }

@@ -14,6 +14,7 @@ import type { Capabilities, Context, JsonObject, JsonValue, Uuid } from "../../c
 import type { QueryPlan, Comparator } from "../../core/QueryPlan.ts";
 import { generateUuid } from "../../core/uuid.ts";
 import type { Expression } from "../../expressions/Expression.ts";
+import type { MigrationOp } from "../../migrations/types.ts";
 import type { ExpressionVisitor } from "../../expressions/visitor.ts";
 import { parse } from "../../expressions/parse.ts";
 import { scan } from "../util/scan.ts";
@@ -79,6 +80,8 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
   private readonly models = new Map<string, IndexSpec[]>();
 
   private db: IDBDatabase | null = null;
+  /** Indexes a migration dropped (`model\0name`): deleted at the next upgrade, never re-created. */
+  private readonly droppedIndexes = new Set<string>();
   private openingPromise: Promise<IDBDatabase> | null = null;
   /** Index names per object store in the currently-open database (see `snapshotIndexes`). */
   private presentIndexes = new Map<string, Set<string>>();
@@ -101,6 +104,8 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
    * later registrations merge by index name and an empty list never downgrades a populated one.
    */
   registerModel(model: string, indexes: IndexSpec[]): void {
+    // Declaring an index again is asking for it back, after a migration dropped it.
+    for (const index of indexes) this.droppedIndexes.delete(`${model}\0${index.name}`);
     const existing = this.models.get(model);
     if (!existing) {
       this.models.set(model, indexes);
@@ -242,6 +247,19 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
     await transactionDone(tx);
   }
 
+  /**
+   * `dropIndex`, the one migration operation that needs native help here: registration only ever adds
+   * indexes, so the reference executor alone would leave the index — and its constraint — in place.
+   * The index is deleted in a version-change upgrade, the only place IndexedDB allows it.
+   */
+  async lowerMigrationOp(op: MigrationOp, _ctx: Context): Promise<{ rows: number } | null> {
+    if (op.kind !== "dropIndex") return null;
+    this.models.set(op.model, (this.models.get(op.model) ?? []).filter((index) => index.name !== op.index));
+    this.droppedIndexes.add(`${op.model}\0${op.index}`);
+    await this.ensureOpen(op.model);
+    return { rows: 0 };
+  }
+
   discardPending(): void {
     this.saveQueue = [];
     this.removeQueue = [];
@@ -303,6 +321,7 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
     for (const [model, indexes] of this.models) {
       if (!db.objectStoreNames.contains(model)) return false;
       const present = this.presentIndexes.get(model);
+      for (const name of present ?? []) if (this.droppedIndexes.has(`${model}\0${name}`)) return false;
       for (const index of indexes) {
         if (index.text || index.ttlSeconds !== undefined) continue; // not expressible in IndexedDB
         if (!present?.has(index.name)) return false;
@@ -346,6 +365,9 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
           const store = db.objectStoreNames.contains(model)
             ? tx!.objectStore(model)
             : db.createObjectStore(model, { keyPath: "uuid" });
+          for (const name of nameList(store.indexNames)) {
+            if (this.droppedIndexes.has(`${model}\0${name}`)) store.deleteIndex(name);
+          }
           for (const index of indexes) {
             if (index.text || index.ttlSeconds !== undefined) continue; // not expressible in IndexedDB
             if (!store.indexNames.contains(index.name)) {

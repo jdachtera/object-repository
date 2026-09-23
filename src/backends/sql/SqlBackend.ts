@@ -36,7 +36,7 @@ import { generateUuid } from "../../core/uuid.ts";
 import { reduceAggregatePlan } from "../../expressions/aggregateReduce.ts";
 import { scan } from "../util/scan.ts";
 import { compileAggregate, compileWhere, compileWindow } from "./compile.ts";
-import { OVERFLOW_COLUMN, type SqlDialect } from "./dialect.ts";
+import { OVERFLOW_COLUMN, physicalIndexName, type SqlDialect } from "./dialect.ts";
 import { runMigrations, rollbackMigrations, MIGRATIONS_TABLE } from "./migrate.ts";
 import type { MigratableBackend, Migration, MigrationReport } from "./migrate.ts";
 import { UniqueConstraintError, uniqueKey, uniqueKeySets, sameBatchConflict } from "../util/unique.ts";
@@ -161,7 +161,8 @@ export class SqlBackend
    */
   async lowerMigrationOp(op: MigrationOp, _ctx: Context): Promise<{ rows: number } | null> {
     const present = "model" in op ? await this.liveColumns(op.model) : new Set<string>();
-    const statements = lowerToSql(op, this.dialect, present);
+    if (op.kind === "dropIndex") return this.dropIndexNamed(op.model, op.index);
+    const statements = lowerToSql(op, this.dialect, present, "model" in op ? this.columnTypes(op.model) : undefined);
     if (!statements) return null;
 
     let rows = 0;
@@ -178,6 +179,33 @@ export class SqlBackend
     }
     if ("model" in op && changesColumns(op)) this.refreshModel(op);
     return { rows };
+  }
+
+  /**
+   * Drop a model's index by its declared name. Provisioning names it `<model>_<name>`; an index made by
+   * the original SQL-only migration builder carries the bare name. Look up which of the two this table
+   * actually has, so neither a legacy index is missed nor another table's same-named index dropped.
+   */
+  private async dropIndexNamed(model: string, declared: string): Promise<{ rows: number }> {
+    const physical = physicalIndexName(model, declared);
+    let target: string | null = physical;
+    try {
+      const probe = this.dialect.indexesQuery(model);
+      const names = new Set((await this.exec.run(probe.sql, probe.params)).map((row) => String(row.name)));
+      target = names.has(physical) ? physical : names.has(declared) ? declared : null;
+    } catch {
+      // No index catalog to ask (an in-process stand-in): drop the provisioned name if it exists.
+    }
+    if (target !== null) {
+      try {
+        await this.exec.run(this.dialect.finalize(this.dialect.dropIndex(model, target)), []);
+      } catch (error) {
+        if (!alreadyInTargetState({ kind: "dropIndex", model, index: target }, error)) throw error;
+      }
+    }
+    const fields = this.indexes.get(model);
+    if (fields) this.indexes.set(model, fields.filter((index) => index.name !== declared));
+    return { rows: 0 };
   }
 
   /**
@@ -623,7 +651,7 @@ export class SqlBackend
       // skip, dropping that table's constraint. `<model>_<name>` keeps it unique per schema. Fold any
       // non-identifier characters (a developer-supplied name like "songId-userId") to `_` so the
       // dialect's identifier check accepts it.
-      const name = `${model}_${index.name}`.replace(/[^A-Za-z0-9_]/g, "_");
+      const name = physicalIndexName(model, index.name);
       // CREATE INDEX may already exist on a persistent DB (MySQL has no IF NOT EXISTS) — ignore that.
       // Pass column types so MySQL can prefix-length a TEXT-backed index column.
       await this.exec.run(this.dialect.createIndex(model, name, cols, !!index.unique, this.columnTypes(model)), []).catch(() => {});

@@ -26,6 +26,7 @@ import type { ArithOp } from "../../core/QueryPlan.ts";
 import { parse } from "../../expressions/parse.ts";
 import { parseValue } from "../../expressions/values.ts";
 import { UniqueConstraintError, uniqueKey, uniqueKeySets, sameBatchConflict } from "../util/unique.ts";
+import { MigrationNotSupportedError } from "../../migrations/errors.ts";
 import type { MigrationOp } from "../../migrations/types.ts";
 import { all } from "../../expressions/builders.ts";
 
@@ -64,6 +65,8 @@ export interface MongoCollection {
   bulkWrite(operations: object[]): Promise<unknown>;
   updateOne(filter: MongoFilter, update: object, options?: { upsert?: boolean }): Promise<unknown>;
   updateMany(filter: MongoFilter, update: object): Promise<unknown>;
+  /** Needed only by a migration's `dropIndex`; the real driver's `Collection` has it. */
+  dropIndex?(name: string): Promise<unknown>;
 }
 export interface MongoDatabase {
   collection(name: string): MongoCollection;
@@ -301,8 +304,20 @@ export class MongoBackend
       await this.provisionIndexes(op.model, [op.index]);
       return { rows: 0 };
     }
-    // Everything else — including `dropModel` and `dropIndex`, which would need `drop`/`dropIndex` on
-    // the injected driver interface that callers are not required to provide — falls to the reference.
+    if (op.kind === "dropIndex") {
+      // Registration only ever creates indexes, so the reference executor can't drop one here: without
+      // the driver's `dropIndex` this refuses rather than journal a drop that left the index in place.
+      const collection = this.db.collection(op.model);
+      if (typeof collection.dropIndex !== "function") throw new MigrationNotSupportedError(op, "MongoBackend (the injected collection has no dropIndex)");
+      try {
+        await collection.dropIndex(op.index);
+      } catch (error) {
+        if ((error as { codeName?: unknown } | null)?.codeName !== "IndexNotFound") throw error; // already gone
+      }
+      return { rows: 0 };
+    }
+    // Everything else — including `dropModel`, which would need `drop` on the injected driver
+    // interface that callers are not required to provide — falls to the reference.
     return null;
   }
 

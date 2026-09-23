@@ -10,7 +10,7 @@
  * (metadata, O(1)) instead of rewriting every row, and a field copy is a single set-based `UPDATE`
  * instead of N round-trips.
  */
-import type { SqlDialect } from "./dialect.ts";
+import { physicalIndexName, type SqlDialect } from "./dialect.ts";
 import type { MigrationOp } from "../../migrations/types.ts";
 
 export interface Statement {
@@ -26,7 +26,12 @@ export interface Statement {
  * there refers to something held in the JSON overflow (a relation, or a field the model never declared
  * as a scalar), and emitting DDL against a missing column would simply throw — so those decline.
  */
-export function lowerToSql(op: MigrationOp, dialect: SqlDialect, present: ReadonlySet<string>): Statement[] | null {
+export function lowerToSql(
+  op: MigrationOp,
+  dialect: SqlDialect,
+  present: ReadonlySet<string>,
+  columnTypes?: ReadonlyMap<string, string>
+): Statement[] | null {
   const ddl = (sql: string): Statement => ({ sql: dialect.finalize(sql), params: [] });
 
   switch (op.kind) {
@@ -84,22 +89,18 @@ export function lowerToSql(op: MigrationOp, dialect: SqlDialect, present: Readon
       return [ddl(`UPDATE ${dialect.ref(op.model)} SET ${to} = ${from} WHERE ${guard}`)];
     }
 
-    case "addIndex":
+    case "addIndex": {
       if (op.index.text || op.index.ttlSeconds !== undefined) return null; // not expressible here
-      return [
-        ddl(
-          dialect.createIndex(
-            op.model,
-            op.index.name,
-            op.index.fields.map((field) => field.path),
-            !!op.index.unique,
-            op.columnTypes ? new Map(Object.entries(op.columnTypes)) : undefined
-          )
-        )
-      ];
+      const paths = op.index.fields.map((field) => field.path);
+      // A nested path or a field held in the JSON overflow has no column to index: decline, the way
+      // provisioning skips such an index, rather than emit DDL that throws.
+      if (!paths.every((path) => path === "uuid" || present.has(path))) return null;
+      const types = op.columnTypes ? new Map(Object.entries(op.columnTypes)) : columnTypes;
+      return [ddl(dialect.createIndex(op.model, physicalIndexName(op.model, op.index.name), paths, !!op.index.unique, types))];
+    }
 
     case "dropIndex":
-      return [ddl(dialect.dropIndex(op.model, op.index))];
+      return [ddl(dialect.dropIndex(op.model, physicalIndexName(op.model, op.index)))];
 
     case "rawSql":
       // A statement written for another engine is not ours to run.

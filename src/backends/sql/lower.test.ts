@@ -55,7 +55,8 @@ describe("lowering to Postgres", () => {
     expect(sqlFor({ kind: "retypeField", model: "User", field: "age", from: "integer", to: "float" })).toEqual([
       `ALTER TABLE "User" ALTER COLUMN "age" TYPE double precision`
     ]);
-    expect(sqlFor({ kind: "dropIndex", model: "User", index: "by_name" })).toEqual([`DROP INDEX IF EXISTS "by_name"`]);
+    // The physical name provisioning gives it: Postgres index names are schema-global.
+    expect(sqlFor({ kind: "dropIndex", model: "User", index: "by_name" })).toEqual([`DROP INDEX IF EXISTS "User_by_name"`]);
     expect(sqlFor({ kind: "dropModel", model: "User" })).toEqual([`DROP TABLE IF EXISTS "User"`]);
   });
 
@@ -140,7 +141,32 @@ describe("lowering to MySQL", () => {
       mysqlDialect,
       present
     )!;
-    expect(statement!.sql).toBe("CREATE UNIQUE INDEX `by_name` ON `Song` (`name`(255))");
+    expect(statement!.sql).toBe("CREATE UNIQUE INDEX `Song_by_name` ON `Song` (`name`(255))");
+  });
+
+  it("prefixes an index over a TEXT column from the live column types when the op carries none", () => {
+    const [statement] = lowerToSql(
+      { kind: "addIndex", model: "Song", index: { name: "by_name", fields: [{ path: "name" }] } },
+      mysqlDialect,
+      present,
+      new Map([["name", "text"]])
+    )!;
+    expect(statement!.sql).toBe("CREATE INDEX `Song_by_name` ON `Song` (`name`(255))");
+  });
+
+  it("declines an index over a nested path or a field with no column", () => {
+    for (const path of ["address.city", "notAColumn"]) {
+      expect(lowerToSql({ kind: "addIndex", model: "Song", index: { name: "i", fields: [{ path }] } }, mysqlDialect, present)).toBeNull();
+    }
+  });
+
+  it("folds a name that isn't an identifier", () => {
+    const [statement] = lowerToSql(
+      { kind: "addIndex", model: "Song", index: { name: "songId-userId", fields: [{ path: "name" }] } },
+      mysqlDialect,
+      present
+    )!;
+    expect(statement!.sql).toContain("`Song_songId_userId`");
   });
 
   it("modifies rather than alters a column type", () => {

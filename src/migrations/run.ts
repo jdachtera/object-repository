@@ -514,6 +514,10 @@ function followLayout(options: Running, op: MigrationOp): void {
     delete options.models[op.model];
   } else if (op.kind === "dropField") {
     options.models[op.model] = { ...layout, fields: layout.fields.filter((field) => field.name !== op.field) };
+  } else if (op.kind === "addIndex") {
+    options.models[op.model] = { ...layout, indexes: [...layout.indexes.filter((i) => i.name !== op.index.name), op.index] };
+  } else if (op.kind === "dropIndex") {
+    options.models[op.model] = { ...layout, indexes: layout.indexes.filter((i) => i.name !== op.index) };
   } else if (op.kind === "renameField") {
     options.models[op.model] = {
       ...layout,

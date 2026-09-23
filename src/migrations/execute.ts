@@ -137,11 +137,18 @@ export async function applyOp(backend: Backend, op: MigrationOp, options: Execut
     }
 
     case "addIndex":
-    case "dropIndex":
-      // Index maintenance is schema, not data: re-register the model and let the backend reconcile.
-      // A store with no schema concept has nothing to do and correctly does nothing.
-      await reregister(backend, op.model, options, true);
+    case "dropIndex": {
+      // Index maintenance is schema, not data: register the model with the index added or removed
+      // and let the backend reconcile. A store whose registration only ever adds indexes has to lower
+      // `dropIndex` natively; registration alone would leave the index — and its constraint — in place.
+      if (!isSchemaAware(backend)) return { rows: 0 };
+      const schema = options.models[op.model];
+      if (!schema) throw new SchemaUnknownError(op.model);
+      const kept = schema.indexes.filter((index) => index.name !== (op.kind === "addIndex" ? op.index.name : op.index));
+      options.registered?.add(op.model);
+      await register(backend, op.model, schema.fields, op.kind === "addIndex" ? [...kept, op.index] : kept);
       return { rows: 0 };
+    }
 
     case "rawSql":
       throw new MigrationNotSupportedError(op, options.backendName ?? "the portable executor");
