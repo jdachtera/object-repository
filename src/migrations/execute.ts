@@ -23,7 +23,7 @@ import { isSchemaAware } from "../core/Backend.ts";
 import type { Context, JsonObject, JsonValue } from "../core/types.ts";
 import { MigrationNotSupportedError, SchemaUnknownError } from "./errors.ts";
 import { everything, pageByUuid } from "./paging.ts";
-import { coerce } from "./coerce.ts";
+import { cloneValue, coerce } from "./coerce.ts";
 import type { MigrationOp, MigrationProgress, Phase, RecordTransform } from "./types.ts";
 
 export interface ExecuteOptions {
@@ -92,7 +92,7 @@ export async function applyOp(backend: Backend, op: MigrationOp, options: Execut
       if (op.fill === undefined) return { rows: 0 };
       return rewrite(backend, op, options, [op.field], (record) => {
         if (record[op.field] !== undefined) return null;
-        return { ...record, [op.field]: op.fill as JsonValue };
+        return { ...record, [op.field]: coerce(cloneValue(op.fill as JsonValue), op.type) };
       });
 
     case "dropField":
@@ -107,13 +107,13 @@ export async function applyOp(backend: Backend, op: MigrationOp, options: Execut
       return rewrite(backend, op, options, [op.to], (record) => {
         if (!op.overwrite && record[op.to] !== undefined) return null;
         if (record[op.from] === undefined) return null;
-        return { ...record, [op.to]: record[op.from] as JsonValue };
+        return { ...record, [op.to]: coerce(cloneValue(record[op.from] as JsonValue), op.type) };
       });
 
     case "renameField":
       return rewrite(backend, op, options, [op.from, op.to], (record) => {
         if (record[op.from] === undefined) return null;
-        const next = { ...record, [op.to]: record[op.from] as JsonValue };
+        const next = { ...record, [op.to]: coerce(cloneValue(record[op.from] as JsonValue), op.type) };
         delete next[op.from];
         return next;
       });
@@ -122,7 +122,7 @@ export async function applyOp(backend: Backend, op: MigrationOp, options: Execut
       return rewrite(backend, op, options, [op.field], (record) => {
         const value = record[op.field];
         if (value === undefined) return null;
-        const converted = coerce(value, op.to);
+        const converted = coerce(value, op.to, op.from);
         return converted === value ? null : { ...record, [op.field]: converted };
       });
 

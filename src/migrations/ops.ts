@@ -116,7 +116,9 @@ const WIDER_THAN: Readonly<Record<StoredType, readonly StoredType[]>> = {
   date: ["text", "json", "scalar"],
   text: ["json", "scalar"],
   array: ["json", "scalar"],
-  json: ["scalar"],
+  // Not `json` → `scalar`: the stored JSON text would stay a string, so the runtime value would change
+  // from the object it encodes to the text itself.
+  json: [],
   scalar: []
 };
 

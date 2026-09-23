@@ -10,7 +10,8 @@
  * (metadata, O(1)) instead of rewriting every row, and a field copy is a single set-based `UPDATE`
  * instead of N round-trips.
  */
-import { physicalIndexName, type SqlDialect } from "./dialect.ts";
+import { encodeValue, physicalIndexName, type SqlDialect } from "./dialect.ts";
+import { coerce } from "../../migrations/coerce.ts";
 import type { MigrationOp } from "../../migrations/types.ts";
 
 export interface Statement {
@@ -56,10 +57,12 @@ export function lowerToSql(
       if (present.size === 0) return null;
       const statements = present.has(op.field) ? [] : [ddl(dialect.addColumn(op.model, op.field, dialect.columnType(op.type)))];
       if (op.fill !== undefined) {
+        // Bound exactly as a write would bind it: the stored form under `op.type`, encoded for the
+        // column. Bound raw, an array fill became a Postgres array literal and broke every later read.
         const column = dialect.column(op.field);
         statements.push({
           sql: dialect.finalize(`UPDATE ${dialect.ref(op.model)} SET ${column} = ? WHERE ${column} IS NULL`),
-          params: [op.fill]
+          params: [encodeValue(op.type, coerce(op.fill, op.type), dialect)]
         });
       }
       return statements;
@@ -74,9 +77,7 @@ export function lowerToSql(
       return present.has(op.from) && !present.has(op.to) ? [ddl(dialect.renameColumn(op.model, op.from, op.to))] : null;
 
     case "retypeField":
-      return present.has(op.field)
-        ? [ddl(dialect.alterColumnType(op.model, op.field, dialect.columnType(op.to)))]
-        : null;
+      return present.has(op.field) ? lowerRetype(op, dialect) : null;
 
     case "copyField": {
       if (!present.has(op.from) || !present.has(op.to)) return null;
@@ -123,4 +124,49 @@ export function changesColumns(op: MigrationOp): boolean {
     op.kind === "createModel" ||
     op.kind === "dropModel"
   );
+}
+
+const NUMERIC_OR_BOOLEAN = new Set(["integer", "float", "date", "boolean"]);
+const TEXT_FORMS = new Set(["text", "json", "scalar"]);
+
+/**
+ * A retype, as statements that leave every stored value exactly as `coerce()` would.
+ *
+ * `ALTER COLUMN … TYPE` alone keeps the stored bytes and switches how they are decoded, which is right
+ * only when the two types store a value the same way. So each pair of the widening lattice is spelled
+ * out: a number or boolean becomes its own text (the same text is also its JSON); a text value is
+ * JSON-quoted for `json`/`scalar`, which store JSON; an array is already stored as JSON. A pair not
+ * listed is refused rather than guessed at.
+ */
+function lowerRetype(op: Extract<MigrationOp, { kind: "retypeField" }>, dialect: SqlDialect): Statement[] | null {
+  const ddl = (sql: string): Statement => ({ sql: dialect.finalize(sql), params: [] });
+  const alter = (to: string): Statement => ddl(dialect.alterColumnType(op.model, op.field, dialect.columnType(to)));
+  const table = dialect.ref(op.model);
+  const column = dialect.column(op.field);
+
+  if (op.from === undefined) return [alter(op.to)]; // the legacy alias: its historical behaviour
+  if (op.from === op.to) return [];
+  if (op.from === "integer" && op.to === "float") return [alter("float")];
+
+  if (NUMERIC_OR_BOOLEAN.has(op.from) && TEXT_FORMS.has(op.to)) {
+    const statements = [alter(op.to)];
+    // MySQL stores a boolean as tinyint, so its text form is "1"/"0", where coerce() says "true"/"false".
+    if (op.from === "boolean" && dialect.name === "mysql") {
+      statements.push(ddl(`UPDATE ${table} SET ${column} = CASE ${column} WHEN '1' THEN 'true' WHEN '0' THEN 'false' ELSE ${column} END`));
+    }
+    return statements;
+  }
+
+  if (op.from === "text" && (op.to === "json" || op.to === "scalar")) {
+    const quote = dialect.name === "mysql" ? `JSON_QUOTE(${column})` : `to_json(${column})::text`;
+    const statements = dialect.columnType("text") === dialect.columnType(op.to) ? [] : [alter(op.to)];
+    statements.push(ddl(`UPDATE ${table} SET ${column} = ${quote} WHERE ${column} IS NOT NULL`));
+    return statements;
+  }
+
+  if (op.from === "array" && (op.to === "json" || op.to === "scalar")) {
+    return dialect.columnType("array") === dialect.columnType(op.to) ? [] : [alter(op.to)];
+  }
+
+  return null;
 }

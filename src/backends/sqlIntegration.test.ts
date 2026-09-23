@@ -8,7 +8,7 @@
  * operators, so nested-path push-down can only be verified against a real engine here.
  */
 import { describe, it, beforeAll, afterAll, expect } from "vitest";
-import { requireLiveDb } from "../testing/liveDb.testutil.js";
+import { exclusiveLiveDbs, requireLiveDb } from "../testing/liveDb.testutil.js";
 import pg from "pg";
 import { createPool, type Pool as MySqlPool } from "mysql2/promise";
 import type { MigrationBuilder } from "../migrations/types.js";
@@ -77,6 +77,14 @@ async function idsFor(be: Backend, where: Expression): Promise<string[]> {
 
 const PG_URL = process.env.PG_URL ?? "postgres://test:test@127.0.0.1:5432/test";
 const MYSQL_URL = process.env.MYSQL_URL ?? "mysql://test:test@127.0.0.1:3306/test";
+
+let releaseLiveDbs: () => Promise<void> = async () => {};
+beforeAll(async () => {
+  releaseLiveDbs = await exclusiveLiveDbs(PG_URL, MYSQL_URL);
+}, 700_000);
+afterAll(async () => {
+  await releaseLiveDbs();
+});
 
 const DATA = [
   { name: "Ann", age: 30, city: "eu" },

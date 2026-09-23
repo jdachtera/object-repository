@@ -3,7 +3,7 @@
  * the reference executor are both held to, so every case is pinned explicitly.
  */
 import { describe, it, expect } from "vitest";
-import { coerce } from "./coerce.js";
+import { coerce, CoercionError } from "./coerce.js";
 import type { JsonValue } from "../core/types.js";
 import type { StoredType } from "./types.js";
 
@@ -19,15 +19,14 @@ describe("coerce", () => {
     // numeric
     [3, "float", 3],
     ["3.5", "float", 3.5],
-    [3.7, "integer", 3],
-    [-3.7, "integer", -3], // truncates toward zero, not floor
     ["7", "integer", 7],
 
     // boolean
     [true, "boolean", true],
     [1, "boolean", true],
     [0, "boolean", false],
-    ["", "boolean", false],
+    ["false", "boolean", false],
+    ["1", "boolean", true],
 
     // date is stored as epoch milliseconds
     [1700000000000, "date", 1700000000000],
@@ -37,8 +36,9 @@ describe("coerce", () => {
     [[1] as unknown as JsonValue, "array", [1] as unknown as JsonValue],
     ["solo", "array", ["solo"] as unknown as JsonValue],
 
-    // json and scalar impose no representation
-    [{ a: 1 } as unknown as JsonValue, "json", { a: 1 } as unknown as JsonValue],
+    // json stores the value's JSON text; scalar holds any value as-is
+    [{ a: 1 } as unknown as JsonValue, "json", '{"a":1}'],
+    [42, "json", "42"],
     ["x", "scalar", "x"]
   ];
 
@@ -55,7 +55,24 @@ describe("coerce", () => {
 
   it("returns the input unchanged when no conversion is needed, so the executor can skip the write", () => {
     const value = { nested: true } as unknown as JsonValue;
-    expect(coerce(value, "json")).toBe(value); // identity, not a copy
+    expect(coerce(value, "scalar")).toBe(value); // identity, not a copy
     expect(coerce("x", "text")).toBe("x");
+    expect(coerce('{"a":1}', "json")).toBe('{"a":1}'); // already JSON text: not encoded twice
+  });
+
+  it("quotes a known text value into json, so it decodes back to the same string", () => {
+    expect(coerce("hello", "json", "text")).toBe('"hello"');
+    expect(JSON.parse(coerce("42", "json", "text") as string)).toBe("42"); // stays a string
+  });
+
+  it.each([
+    ["abc", "float"],
+    ["", "float"],
+    [3.7, "integer"], // SQL would round, JS would truncate: neither is exact
+    ["maybe", "boolean"],
+    ["", "boolean"],
+    [{}, "date"]
+  ] as Array<[JsonValue, StoredType]>)("refuses %j → %s rather than store a guess", (value, to) => {
+    expect(() => coerce(value, to)).toThrow(CoercionError);
   });
 });

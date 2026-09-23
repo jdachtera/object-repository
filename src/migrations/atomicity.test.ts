@@ -26,13 +26,21 @@ import { runMigrations, rollbackMigrations } from "./run.js";
 import { acquireLock, BackendJournal, LOCK_LEASE_MS, LOCK_RENEW_MS, MigrationLockedError, SCHEMA_STATE_MODEL } from "./journal.js";
 import { everything } from "./paging.js";
 import type { Migration } from "./types.js";
-import { requireLiveDb } from "../testing/liveDb.testutil.js";
+import { exclusiveLiveDbs, requireLiveDb } from "../testing/liveDb.testutil.js";
 
 const ctx = SYSTEM_CONTEXT;
 const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
 
 const PG_URL = process.env.PG_URL ?? "postgres://test:test@127.0.0.1:5432/test";
 const MYSQL_URL = process.env.MYSQL_URL ?? "mysql://test:test@127.0.0.1:3306/test";
+
+let releaseLiveDbs: () => Promise<void> = async () => {};
+beforeAll(async () => {
+  releaseLiveDbs = await exclusiveLiveDbs(PG_URL, MYSQL_URL);
+}, 700_000);
+afterAll(async () => {
+  await releaseLiveDbs();
+});
 let pgPool: pg.Pool | undefined;
 let myPool: MySqlPool | undefined;
 let mongoServer: MongoMemoryServer | undefined;

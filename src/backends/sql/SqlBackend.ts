@@ -36,7 +36,7 @@ import { generateUuid } from "../../core/uuid.ts";
 import { reduceAggregatePlan } from "../../expressions/aggregateReduce.ts";
 import { scan } from "../util/scan.ts";
 import { compileAggregate, compileWhere, compileWindow } from "./compile.ts";
-import { OVERFLOW_COLUMN, physicalIndexName, type SqlDialect } from "./dialect.ts";
+import { encodeValue, OVERFLOW_COLUMN, physicalIndexName, type SqlDialect } from "./dialect.ts";
 import { runMigrations, rollbackMigrations, MIGRATIONS_TABLE } from "./migrate.ts";
 import type { MigratableBackend, Migration, MigrationReport } from "./migrate.ts";
 import { UniqueConstraintError, uniqueKey, uniqueKeySets, sameBatchConflict } from "../util/unique.ts";
@@ -745,23 +745,6 @@ export class SqlBackend
     if (!fields) return records;
     const keep = ["uuid", ...fields.filter((f) => f !== "uuid")];
     return records.map((record) => Object.fromEntries(keep.filter((f) => f in record).map((f) => [f, record[f]])) as JsonObject);
-  }
-}
-
-/** Encode a stored value for its column. Scalars go in typed columns; JSON-ish fields are text. */
-function encodeValue(type: string, value: JsonValue | undefined, dialect: SqlDialect): unknown {
-  if (value === undefined || value === null) return null;
-  switch (type) {
-    case "boolean":
-      return dialect.name === "postgres" ? Boolean(value) : value ? 1 : 0;
-    case "json": // the json() codec already produced a JSON string — keep it opaque
-      return typeof value === "string" ? value : JSON.stringify(value);
-    case "array": // native array → JSON string
-    case "embedded": // native subdocument → JSON string (queryable via a JSON extraction)
-    case "scalar": // custom stored type → JSON-encode so any JsonValue round-trips
-      return JSON.stringify(value);
-    default: // text / integer / float / date pass straight through
-      return value;
   }
 }
 

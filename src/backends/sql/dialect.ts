@@ -8,6 +8,7 @@
  * table / index / upsert / paging DDL.
  */
 import type { FieldSpec } from "../../core/Backend.ts";
+import type { JsonValue } from "../../core/types.ts";
 
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -263,4 +264,21 @@ export const mysqlDialect: SqlDialect = {
  */
 export function physicalIndexName(model: string, name: string): string {
   return `${model}_${name}`.replace(/[^A-Za-z0-9_]/g, "_");
+}
+
+/** Encode a stored value for its column. Scalars go in typed columns; JSON-ish fields are text. */
+export function encodeValue(type: string, value: JsonValue | undefined, dialect: SqlDialect): unknown {
+  if (value === undefined || value === null) return null;
+  switch (type) {
+    case "boolean":
+      return dialect.name === "postgres" ? Boolean(value) : value ? 1 : 0;
+    case "json": // the json() codec already produced a JSON string — keep it opaque
+      return typeof value === "string" ? value : JSON.stringify(value);
+    case "array": // native array → JSON string
+    case "embedded": // native subdocument → JSON string (queryable via a JSON extraction)
+    case "scalar": // custom stored type → JSON-encode so any JsonValue round-trips
+      return JSON.stringify(value);
+    default: // text / integer / float / date pass straight through
+      return value;
+  }
 }

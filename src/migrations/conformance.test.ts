@@ -15,7 +15,7 @@
  * on PostgreSQL passed every test here.
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { requireLiveDb } from "../testing/liveDb.testutil.js";
+import { exclusiveLiveDbs, requireLiveDb } from "../testing/liveDb.testutil.js";
 import { newDb } from "pg-mem";
 import pg from "pg";
 import { createPool, type Pool as MySqlPool } from "mysql2/promise";
@@ -45,10 +45,10 @@ const MODEL = "Rec";
 
 /** The pre-migration rows every case starts from — deliberately ragged, to exercise absent fields. */
 const SEED: JsonObject[] = [
-  { uuid: "a", legacy: "L-a", canonical: "C-a", n: 1, keep: true },
-  { uuid: "b", legacy: "L-b", n: 2, keep: false },
+  { uuid: "a", legacy: "L-a", canonical: "C-a", n: 1, keep: true, qty: 1, ratio: 1.5, tags: ["x"], note: "hello" },
+  { uuid: "b", legacy: "L-b", n: 2, keep: false, qty: 2, ratio: 0.25, tags: [], note: "42" },
   { uuid: "c", n: 3, keep: true },
-  { uuid: "d", legacy: "L-d", canonical: "C-d", n: 4, keep: true }
+  { uuid: "d", legacy: "L-d", canonical: "C-d", n: 4, keep: true, qty: -7, ratio: 2, tags: ["y", "z"], note: 'say "hi"' }
 ];
 
 /**
@@ -61,8 +61,16 @@ const BEFORE: FieldSpec[] = [
   { name: "legacy", type: "text" },
   { name: "canonical", type: "text" },
   { name: "n", type: "scalar" },
-  { name: "keep", type: "boolean" }
+  { name: "keep", type: "boolean" },
+  { name: "qty", type: "integer" },
+  { name: "ratio", type: "float" },
+  { name: "tags", type: "array" },
+  { name: "note", type: "text" }
 ];
+
+/** `BEFORE` with one field's type changed — the layout after a retype. */
+const retyped = (field: string, type: string): FieldSpec[] =>
+  BEFORE.map((spec) => (spec.name === field ? { name: field, type } : spec));
 
 interface Case {
   label: string;
@@ -99,6 +107,54 @@ async function acceptsDuplicate(backend: Backend): Promise<string> {
 const UNIQUE_N: IndexSpec = { name: "uniq_n", fields: [{ path: "n" }], unique: true };
 
 const CASES: Case[] = [
+  // --- values: every fill and retype has to land as the same stored value everywhere ------------
+  {
+    label: "addField fills an array",
+    migration: { name: "m", up: (m) => m.addField(MODEL, "list", "array", { fill: ["x"] }) },
+    after: [...BEFORE, { name: "list", type: "array" }]
+  },
+  {
+    label: "addField fills an empty array",
+    migration: { name: "m", up: (m) => m.addField(MODEL, "list", "array", { fill: [] }) },
+    after: [...BEFORE, { name: "list", type: "array" }]
+  },
+  {
+    label: "addField fills json",
+    migration: { name: "m", up: (m) => m.addField(MODEL, "meta", "json", { fill: { a: 1 } }) },
+    after: [...BEFORE, { name: "meta", type: "json" }]
+  },
+  {
+    label: "addField fills a scalar with a string",
+    migration: { name: "m", up: (m) => m.addField(MODEL, "sc", "scalar", { fill: "s" }) },
+    after: [...BEFORE, { name: "sc", type: "scalar" }]
+  },
+  ...(
+    [
+      ["qty", "integer", "float"],
+      ["qty", "integer", "text"],
+      ["qty", "integer", "json"],
+      ["ratio", "float", "text"],
+      ["keep", "boolean", "text"],
+      ["keep", "boolean", "scalar"],
+      ["note", "text", "json"],
+      ["note", "text", "scalar"],
+      ["tags", "array", "json"],
+      ["tags", "array", "scalar"]
+    ] as const
+  ).map(
+    ([field, from, to]): Case => ({
+      label: `retypeField ${from} → ${to}`,
+      migration: { name: "m", up: (m) => m.retypeField(MODEL, field, from, to) },
+      after: retyped(field, to),
+      ...(from === "text"
+        ? { skip: { "Postgres (pg-mem)": "pg-mem has no to_json(); real Postgres runs this case" } }
+        : {})
+    })
+  ),
+  {
+    label: "copyField into a text field converts the value",
+    migration: { name: "m", up: (m) => m.copyField(MODEL, "qty", "note", "text", { overwrite: true }) }
+  },
   {
     label: "addIndex (unique) not declared by the model",
     // MySQL's upsert (`ON DUPLICATE KEY UPDATE`) turns the unique-key conflict into an update of the
@@ -229,6 +285,14 @@ function normalize(row: JsonObject): JsonObject {
 
 const PG_URL = process.env.PG_URL ?? "postgres://test:test@127.0.0.1:5432/test";
 const MYSQL_URL = process.env.MYSQL_URL ?? "mysql://test:test@127.0.0.1:3306/test";
+
+let releaseLiveDbs: () => Promise<void> = async () => {};
+beforeAll(async () => {
+  releaseLiveDbs = await exclusiveLiveDbs(PG_URL, MYSQL_URL);
+}, 700_000);
+afterAll(async () => {
+  await releaseLiveDbs();
+});
 let pgPool: pg.Pool | undefined;
 let myPool: MySqlPool | undefined;
 
