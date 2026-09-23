@@ -170,6 +170,15 @@ Withheld by the version gate (1):
 | `retypeField` (narrowing) | **refused** | add a new field of the new type and convert values with a `transform`. A rename's window can't change a type: both halves must match |
 | `sql()` | author-declared, defaults to expand | SQL backends only |
 
+A `transform` rewrites records in place. It may not change a record's `uuid` (the run fails
+rather than insert a duplicate); a `uuid` it leaves out is kept. What it changed is found by comparing
+each record before and after, so a field it forgot to list in `fields` is still written on every store.
+It sees every physical column, including one the model has stopped declaring.
+
+A value converted by a retype, a fill or a typed copy lands as the same stored value on every
+store. One that can't be converted exactly (`"abc"` to a number, `3.7` to an integer) fails the run
+rather than being stored as a guess.
+
 An operation kind the runtime doesn't recognise classifies as **contract**. Withholding something
 harmless is recoverable; running something destructive is not.
 

@@ -171,7 +171,7 @@ async function rewrite(
 ): Promise<OpResult> {
   await reregister(backend, op.model, options);
   const removeOnNull = op.kind === "transform";
-  const dirty = ["uuid", ...fields.filter((field) => field !== "uuid")];
+  const declared = ["uuid", ...fields.filter((field) => field !== "uuid")];
   let rows = 0;
 
   for await (const page of pageByUuid(
@@ -199,7 +199,19 @@ async function rewrite(
           written += 1;
           continue;
         }
-        backend.save(op.model, next, options.ctx, dirty);
+        if (op.kind === "transform") {
+          // A record's identity is not the transform's to change: a new uuid would insert a duplicate
+          // that the keyset scan then reaches again, and a missing one a record with a fresh identity.
+          if (next.uuid === undefined) next.uuid = row.uuid!;
+          else if (next.uuid !== row.uuid) {
+            throw new Error(
+              `Transform "${op.transform}" on "${op.model}" changed a record's uuid (${JSON.stringify(row.uuid)} → ${JSON.stringify(next.uuid)}). A transform rewrites records in place; create new records in a separate step.`
+            );
+          }
+        }
+        // The fields that actually changed, by diff: a transform's declared list is a hint that may be
+        // incomplete, and a store that writes only dirty fields would drop whatever it left out.
+        backend.save(op.model, next, options.ctx, op.kind === "transform" ? changedFields(row, next) : declared);
         written += 1;
       }
     } catch (error) {
@@ -245,7 +257,15 @@ async function reregister(
   // migration that makes it valid. The runner restores the full registration when the run ends.
   const indexes = withUnique ? schema.indexes : schema.indexes.filter((index) => !index.unique);
   options.registered?.add(model);
-  await register(backend, model, schema.fields, indexes);
+  // Physical columns the model has stopped declaring stay visible to the pass (a transform reading the
+  // old column must see its values, not `undefined`); the declared type wins where both exist.
+  let fields = schema.fields;
+  const live = (backend as Partial<{ liveFieldSpecs(model: string): Promise<FieldSpec[]> }>).liveFieldSpecs;
+  if (typeof live === "function") {
+    const declared = new Set(fields.map((field) => field.name));
+    fields = [...fields, ...(await live.call(backend, model)).filter((field) => !declared.has(field.name))];
+  }
+  await register(backend, model, fields, indexes);
 }
 
 async function register(backend: Backend, model: string, fields: FieldSpec[], indexes: IndexSpec[]): Promise<void> {
@@ -260,4 +280,13 @@ function report(options: ExecuteOptions, op: MigrationOp, rows: number): void {
     op,
     rows
   });
+}
+
+/** `uuid` plus every top-level field whose value differs between `before` and `after`, or was removed. */
+function changedFields(before: Readonly<JsonObject>, after: JsonObject): string[] {
+  const changed = ["uuid"];
+  for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    if (key !== "uuid" && JSON.stringify(before[key]) !== JSON.stringify(after[key])) changed.push(key);
+  }
+  return changed;
 }

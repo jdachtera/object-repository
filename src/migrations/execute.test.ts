@@ -11,7 +11,8 @@ import { SYSTEM_CONTEXT } from "../core/types.js";
 import { eq } from "../expressions/index.js";
 import type { Backend, FieldSpec, IndexSpec, PersistedChange } from "../core/Backend.js";
 import type { Context, JsonObject } from "../core/types.js";
-import type { MigrationOp, RecordTransform } from "./types.js";
+import type { Migration, MigrationOp, RecordTransform } from "./types.js";
+import { runMigrations } from "./run.js";
 
 const ctx = SYSTEM_CONTEXT;
 
@@ -249,4 +250,38 @@ describe("idempotence", () => {
       expect(await readAll(backend)).toEqual(afterFirst);
     });
   }
+});
+
+describe("a transform keeps each record's identity", () => {
+  async function seededItems() {
+    const backend = new InMemoryBackend();
+    backend.save("Item", { uuid: "a", n: 1 }, SYSTEM_CONTEXT);
+    backend.save("Item", { uuid: "b", n: 2 }, SYSTEM_CONTEXT);
+    await backend.persist(SYSTEM_CONTEXT);
+    return backend;
+  }
+  const items = { Item: { fields: [], indexes: [] } };
+
+  it("refuses to change a uuid, which would insert a duplicate the scan then revisits", async () => {
+    const backend = await seededItems();
+    const migration: Migration = {
+      name: "m",
+      transforms: { rekey: (row) => ({ ...row, uuid: `${String(row.uuid)}-new` }) },
+      up: (m) => m.transform("Item", "rekey", [])
+    };
+    await expect(runMigrations(backend, [migration], { models: items })).rejects.toThrow(/changed a record's uuid/);
+    expect((await backend.query({ model: "Item", where: { type: "all" }, order: [], paging: { start: 0 } }, SYSTEM_CONTEXT)).map((r) => r.uuid).sort()).toEqual(["a", "b"]);
+  });
+
+  it("keeps the uuid a transform leaves out", async () => {
+    const backend = await seededItems();
+    const migration: Migration = {
+      name: "m",
+      transforms: { strip: (row) => ({ n: Number(row.n) * 10 }) },
+      up: (m) => m.transform("Item", "strip", ["n"])
+    };
+    await runMigrations(backend, [migration], { models: items });
+    const rows = await backend.query({ model: "Item", where: { type: "all" }, order: [{ property: "uuid", descending: false }], paging: { start: 0 } }, SYSTEM_CONTEXT);
+    expect(rows).toEqual([{ uuid: "a", n: 10 }, { uuid: "b", n: 20 }]);
+  });
 });

@@ -375,6 +375,24 @@ describe("a phase on a transactional store", () => {
     expect(columns.map((row) => row.column_name)).not.toContain("tier");
   });
 
+  it("keeps the known columns when a replayed createModel finds the table already there", async (context) => {
+    if (!pgPool) return context.skip(); // pg-mem can't plan CREATE TABLE IF NOT EXISTS over an existing table
+    for (const table of ["Person", "_object_repository_migration_log", "_object_repository_schema_state"]) {
+      await pgPool.query(`DROP TABLE IF EXISTS "${table}"`);
+    }
+    const backend = new PostgresBackend(pgPool);
+    await backend.registerModel("Person", [], personModels.Person.fields);
+    backend.save("Person", { uuid: "p1", name: "Ann", tier: "gold" }, ctx);
+    await backend.persist(ctx);
+
+    await runMigrations(backend, [{ name: "0035_replay", up: (m) => m.createModel("Person", [{ name: "name", type: "text" }]) }], {
+      models: personModels,
+      skipLock: true
+    });
+    const [person] = await backend.query({ model: "Person", where: everything(), order: [], paging: { start: 0 } }, ctx);
+    expect(person).toMatchObject({ name: "Ann", tier: "gold" }); // `tier` didn't vanish from reads
+  });
+
   it("adds a field that define() already provisioned", async () => {
     const backend = pgBackend();
     await backend.registerModel("Person", [], personModels.Person.fields); // auto-provisioned, tier included

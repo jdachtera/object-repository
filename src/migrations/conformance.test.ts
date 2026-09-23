@@ -151,6 +151,30 @@ const CASES: Case[] = [
         : {})
     })
   ),
+  // --- what a record pass sees and writes -------------------------------------------------------
+  {
+    label: "a transform reads a column the model no longer declares",
+    migration: {
+      name: "m",
+      transforms: { move: (row) => ({ ...row, moved: row.legacy ?? null }) },
+      up: (m) => m.transform(MODEL, "move", ["moved"], undefined, { phase: "expand" })
+    },
+    // The application's layout has dropped `legacy` and gained `moved`; the column is still there.
+    after: [...BEFORE.filter((field) => field.name !== "legacy"), { name: "moved", type: "text" }]
+  },
+  {
+    label: "a transform changing a field it didn't declare",
+    migration: {
+      name: "m",
+      transforms: { both: (row) => ({ ...row, n: Number(row.n) + 100, note: "rewritten" }) },
+      up: (m) => m.transform(MODEL, "both", ["n"])
+    }
+  },
+  {
+    label: "a replayed createModel over an existing table",
+    migration: { name: "m", up: (m) => m.createModel(MODEL, [{ name: "legacy", type: "text" }]) },
+    skip: { "Postgres (pg-mem)": "pg-mem can't plan CREATE TABLE IF NOT EXISTS over an existing table; real Postgres runs this case" }
+  },
   {
     label: "copyField into a text field converts the value",
     migration: { name: "m", up: (m) => m.copyField(MODEL, "qty", "note", "text", { overwrite: true }) }
@@ -213,7 +237,8 @@ const CASES: Case[] = [
   },
   {
     label: "retypeField (widening)",
-    migration: { name: "m", up: (m) => m.retypeField(MODEL, "n", "integer", "text") }
+    migration: { name: "m", up: (m) => m.retypeField(MODEL, "n", "integer", "text") },
+    after: retyped("n", "text")
   },
   {
     label: "transform (rewrite and remove)",
@@ -257,12 +282,21 @@ async function outcome(backend: Backend, testCase: Case, minSupported = 0): Prom
 
   // Verified on the store itself: a decorator above it is the application's, not the migration's.
   const store = migrationTarget(backend);
+  // The probe first: it tests the registration the run left behind, which the read-back below replaces.
+  const probed = testCase.probe ? { probe: (await testCase.probe(store)) as JsonValue } : null;
+  // Read back every column either layout names, so a column the application stopped declaring is
+  // compared too rather than hidden by the post-run registration.
+  if (isSchemaAware(store)) {
+    const after = testCase.after ?? BEFORE;
+    const names = new Set(after.map((field) => field.name));
+    await store.registerModel(MODEL, (testCase.indexesAfter ?? []) as never[], [...after, ...BEFORE.filter((field) => !names.has(field.name))]);
+  }
   const rows = await store.query(
     { model: MODEL, where: everything(), order: [{ property: "uuid", descending: false }], paging: { start: 0 } },
     ctx
   );
   const records = rows.map(normalize).sort((x, y) => String(x.uuid).localeCompare(String(y.uuid)));
-  return testCase.probe ? [...records, { probe: (await testCase.probe(store)) as JsonValue }] : records;
+  return probed ? [...records, probed] : records;
 }
 
 function isSchemaAware(backend: object): backend is { registerModel(m: string, i: never[], f: FieldSpec[]): Promise<void> | void } {

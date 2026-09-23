@@ -36,7 +36,7 @@ import { generateUuid } from "../../core/uuid.ts";
 import { reduceAggregatePlan } from "../../expressions/aggregateReduce.ts";
 import { scan } from "../util/scan.ts";
 import { compileAggregate, compileWhere, compileWindow } from "./compile.ts";
-import { encodeValue, OVERFLOW_COLUMN, physicalIndexName, type SqlDialect } from "./dialect.ts";
+import { encodeValue, fieldTypeOfColumn, OVERFLOW_COLUMN, physicalIndexName, type SqlDialect } from "./dialect.ts";
 import { runMigrations, rollbackMigrations, MIGRATIONS_TABLE } from "./migrate.ts";
 import type { MigratableBackend, Migration, MigrationReport } from "./migrate.ts";
 import { UniqueConstraintError, uniqueKey, uniqueKeySets, sameBatchConflict } from "../util/unique.ts";
@@ -182,6 +182,19 @@ export class SqlBackend
   }
 
   /**
+   * The table's physical columns as field specs — including ones the model no longer declares. A
+   * migration pass registers these alongside the declared layout, so a transform reading a column
+   * the application has since stopped declaring sees its values instead of `undefined`.
+   */
+  async liveFieldSpecs(model: string): Promise<FieldSpec[]> {
+    const probe = this.dialect.columnTypesQuery(model);
+    const rows = await this.exec.run(probe.sql, probe.params);
+    return rows
+      .map((row) => ({ name: String(row.column_name), type: fieldTypeOfColumn(String(row.data_type)) }))
+      .filter((field) => field.name !== "uuid" && field.name !== OVERFLOW_COLUMN);
+  }
+
+  /**
    * Drop a model's index by its declared name. Provisioning names it `<model>_<name>`; an index made by
    * the original SQL-only migration builder carries the bare name. Look up which of the two this table
    * actually has, so neither a legacy index is missed nor another table's same-named index dropped.
@@ -291,9 +304,13 @@ export class SqlBackend
 
     const fields = this.schemas.get(op.model);
     switch (op.kind) {
-      case "createModel":
-        this.schemas.set(op.model, [...op.fields]);
+      case "createModel": {
+        // `CREATE TABLE IF NOT EXISTS` may have been a no-op on an existing table: keep the columns
+        // already known, or they vanish from reads and writes to them go to the overflow.
+        const known = new Set(op.fields.map((field) => field.name));
+        this.schemas.set(op.model, [...op.fields, ...(fields ?? []).filter((field) => !known.has(field.name))]);
         break;
+      }
       case "dropModel":
         this.schemas.delete(op.model);
         this.indexes.delete(op.model);
