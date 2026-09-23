@@ -53,3 +53,4 @@ export {
   type SchemaState
 } from "./journal.ts";
 export { planMigrations, formatPlan } from "./plan.ts";
+export { validateMigrationNames, MAX_MIGRATION_NAME_LENGTH } from "./journal.ts";

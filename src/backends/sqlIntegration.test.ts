@@ -8,8 +8,10 @@
  * operators, so nested-path push-down can only be verified against a real engine here.
  */
 import { describe, it, beforeAll, afterAll, expect } from "vitest";
+import { requireLiveDb } from "../testing/liveDb.testutil.js";
 import pg from "pg";
 import { createPool, type Pool as MySqlPool } from "mysql2/promise";
+import type { MigrationBuilder } from "../migrations/types.js";
 import { PostgresBackend } from "./sql/PostgresBackend.js";
 import { MySqlBackend } from "./sql/MySqlBackend.js";
 import { InMemoryBackend } from "./memory/InMemoryBackend.js";
@@ -89,7 +91,8 @@ describe("Postgres (real engine)", () => {
     try {
       pool = new pg.Pool({ connectionString: PG_URL });
       for (const t of ["int_person", "int_tx", "nested_m", "iso_pg", "uniq_pg", "types_pg", "emb_pg", "win_pg", "cd_pg", "dirty_pg", "null_pg", "prechk_pg", "prechk2_pg", "soft_pg", "rel_cust_pg", "rel_ord_pg"]) await pool.query(`DROP TABLE IF EXISTS "${t}"`);
-    } catch {
+    } catch (error) {
+      requireLiveDb(error);
       pool = undefined;
     }
   });
@@ -481,6 +484,52 @@ describe("Postgres (real engine)", () => {
     expect((cErr as UniqueConstraintError).fields).toEqual(["day", "room"]);
   });
 
+  it("migrates, journals, and is a no-op on re-run — against a real server", async () => {
+    // pg-mem accepts a NUL byte in text; PostgreSQL rejects it. A journal id containing one was written
+    // by every test here and could never be written in production, so this has to run on the real engine.
+    if (!pool) return;
+    await pool.query(`DROP TABLE IF EXISTS "mig_pg", "_object_repository_migration_log", "_object_repository_schema_state"`);
+    const orm = new RepositoryManager({ backend: new PostgresBackend(pool) });
+    const migrations = [
+      { name: "m1_create", up: (m: MigrationBuilder) => m.createTable("mig_pg", [{ name: "n", type: "integer" }]) },
+      { name: "m2_addcol", up: (m: MigrationBuilder) => m.addColumn("mig_pg", "label", "text") },
+      { name: "m3_rename", up: (m: MigrationBuilder) => m.renameColumn("mig_pg", "label", "tag") }
+    ];
+    expect((await orm.migrate(migrations)).applied).toEqual(["m1_create", "m2_addcol", "m3_rename"]);
+    await orm.raw({ sql: `INSERT INTO "mig_pg" ("uuid", "n", "tag", "_extra") VALUES ($1, $2, $3, $4)`, params: ["r1", 5, "hi", null] });
+    expect(await orm.raw<{ tag: string }>({ sql: `SELECT "tag" FROM "mig_pg"` })).toEqual([{ tag: "hi" }]);
+
+    const again = await orm.migrate(migrations);
+    expect(again.applied).toEqual([]);
+    expect(again.skipped).toEqual(["m1_create", "m2_addcol", "m3_rename"]);
+  });
+
+  it("runs the documented rename timeline against a real server", async () => {
+    if (!pool) return;
+    await pool.query(`DROP TABLE IF EXISTS "tl_pg", "_object_repository_migration_log", "_object_repository_schema_state"`);
+    const migrations = [
+      { name: "tl_rename", schemaVersion: 7, up: (m: MigrationBuilder) => m.renameField("tl_pg", "name", "fullName", "text") }
+    ];
+    const v6 = new RepositoryManager({ backend: new PostgresBackend(pool) });
+    const users = v6.define({ name: "tl_pg", properties: { name: text() } });
+    users.save(users.createInstance({ uuid: "u1", name: "Ann" }));
+    await users.persist();
+
+    const shipped = await new RepositoryManager({
+      backend: new PostgresBackend(pool),
+      schema: { schemaVersion: 7, minSupportedSchemaVersion: 5 }
+    }).migrate(migrations);
+    expect(shipped.expanded).toEqual(["tl_rename"]);
+    expect(shipped.deferred).toHaveLength(1);
+
+    const released = await new RepositoryManager({
+      backend: new PostgresBackend(pool),
+      schema: { schemaVersion: 7, minSupportedSchemaVersion: 7 }
+    }).migrate(migrations, { applyContracts: true });
+    expect(released.contracted).toEqual(["tl_rename"]);
+    expect(await pool.query(`SELECT "fullName" FROM "tl_pg"`).then((r) => r.rows)).toEqual([{ fullName: "Ann" }]);
+  });
+
   it("round-trips scalar types faithfully (int / float / date / bool)", async () => {
     if (!pool) return;
     const orm = new RepositoryManager({ backend: new PostgresBackend(pool) });
@@ -505,7 +554,8 @@ describe("MySQL (real engine)", () => {
     try {
       pool = createPool(MYSQL_URL);
       for (const t of ["int_person_my", "nested_m", "uniq_my", "upsert_my", "mig_my", "types_my", "_object_repository_migrations", "emb_my", "win_my", "cd_my", "dirty_my", "null_my", "longtext_my", "idxtext_my", "prechk_my"]) await pool.query(`DROP TABLE IF EXISTS \`${t}\``);
-    } catch {
+    } catch (error) {
+      requireLiveDb(error);
       pool = undefined;
     }
   });
@@ -816,18 +866,32 @@ describe("MySQL (real engine)", () => {
 
   it("applies a migration (add + rename column) against a real schema", async () => {
     if (!pool) return;
+    // The journal persists in the database, so a previous run's rows would make this one a no-op.
+    await pool.query("DROP TABLE IF EXISTS `mig_my`, `_object_repository_migration_log`, `_object_repository_schema_state`");
     const orm = new RepositoryManager({ backend: new MySqlBackend(pool) });
-    const report = await orm.migrate([
-      { name: "m1_create", up: (m) => m.createTable("mig_my", [{ name: "n", type: "integer" }]) },
-      { name: "m2_addcol", up: (m) => m.addColumn("mig_my", "label", "text") },
-      { name: "m3_rename", up: (m) => m.renameColumn("mig_my", "label", "tag") }
-    ]);
+    const migrations = [
+      { name: "m1_create", up: (m: MigrationBuilder) => m.createTable("mig_my", [{ name: "n", type: "integer" }]) },
+      { name: "m2_addcol", up: (m: MigrationBuilder) => m.addColumn("mig_my", "label", "text") },
+      { name: "m3_rename", up: (m: MigrationBuilder) => m.renameColumn("mig_my", "label", "tag") }
+    ];
+    const report = await orm.migrate(migrations);
     expect(report.applied).toEqual(["m1_create", "m2_addcol", "m3_rename"]);
     // the renamed column exists and accepts data
     await orm.raw({ sql: "INSERT INTO `mig_my` (`uuid`, `n`, `tag`, `_extra`) VALUES (?, ?, ?, ?)", params: ["r1", 5, "hi", null] });
     expect(await orm.raw<{ tag: string }>({ sql: "SELECT `tag` FROM `mig_my`" })).toEqual([{ tag: "hi" }]);
-    // re-running is a no-op
-    expect((await orm.migrate([{ name: "m1_create", up: () => {} }])).applied).toEqual([]);
+    // re-running the same set is a no-op. (It must be the same bodies: an applied migration whose
+    // body changed is refused as CHECKSUM_DRIFT, so an empty stand-in no longer works here.)
+    expect((await orm.migrate(migrations)).applied).toEqual([]);
+  });
+
+  it("journals a migration name longer than the key column, which only a hashed id can fit", async () => {
+    if (!pool) return;
+    await pool.query("DROP TABLE IF EXISTS `mig_long_my`, `_object_repository_migration_log`, `_object_repository_schema_state`");
+    const orm = new RepositoryManager({ backend: new MySqlBackend(pool) });
+    const name = `0042_${"a_rather_descriptive_migration_name_".repeat(3)}`; // well past varchar(64)
+    const migrations = [{ name, up: (m: MigrationBuilder) => m.createTable("mig_long_my", [{ name: "n", type: "integer" }]) }];
+    expect((await orm.migrate(migrations)).applied).toEqual([name]);
+    expect((await orm.migrate(migrations)).skipped).toEqual([name]);
   });
 
   it("round-trips scalar types faithfully (int / float / date / bool)", async () => {
@@ -894,13 +958,15 @@ describe("cross-engine parity vs the in-memory reference", () => {
     try {
       pg_ = new pg.Pool({ connectionString: PG_URL });
       for (const t of PARITY_TABLES) await pg_.query(`DROP TABLE IF EXISTS "${t}"`);
-    } catch {
+    } catch (error) {
+      requireLiveDb(error);
       pg_ = undefined;
     }
     try {
       my_ = createPool({ uri: MYSQL_URL });
       for (const t of PARITY_TABLES) await my_.query(`DROP TABLE IF EXISTS \`${t}\``);
-    } catch {
+    } catch (error) {
+      requireLiveDb(error);
       my_ = undefined;
     }
   });

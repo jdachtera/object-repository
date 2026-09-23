@@ -10,7 +10,7 @@ import { isMigrationLowering } from "../core/Backend.ts";
 import { SYSTEM_CONTEXT } from "../core/types.ts";
 import { BackendJournal, indexRows, rowId } from "./journal.ts";
 import { OpRecorder, opsHash, splitPhases } from "./ops.ts";
-import { gateOpen, type RunnerOptions } from "./run.ts";
+import { assertUniqueNames, gateOpen, type RunnerOptions } from "./run.ts";
 import type {
   DeferredContract,
   Migration,
@@ -25,6 +25,7 @@ export async function planMigrations(
   migrations: Migration[],
   options: RunnerOptions = {}
 ): Promise<MigrationPlan> {
+  assertUniqueNames(migrations);
   const ctx = options.ctx ?? SYSTEM_CONTEXT;
   const journal = options.journal ?? new BackendJournal(backend, ctx);
   const stored = await journal.readSchemaState();

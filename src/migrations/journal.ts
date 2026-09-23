@@ -64,8 +64,59 @@ export interface MigrationJournal {
   writeSchemaState(state: SchemaState): Promise<void>;
 }
 
-/** The composite key, flattened into the single `uuid` every backend indexes. */
-export const rowId = (name: string, phase: Phase): string => `${name}\0${phase}`;
+/**
+ * The composite `(name, phase)` key, flattened into the single `uuid` every backend indexes.
+ *
+ * Deliberately a fixed-width hash rather than the name itself. The id lands in a backend's key column,
+ * which has two hard limits the name can violate: PostgreSQL rejects a NUL byte anywhere in text (so no
+ * control-character separator), and MySQL's key column is `varchar(64)` (so no unbounded name). Three
+ * independently-seeded FNV-1a passes give 96 bits — collisions among a project's migration names are
+ * not merely unlikely but *checked*: `validateMigrationNames` refuses a declared set in which two names
+ * share an id, before anything runs. The readable name is stored alongside, in its own column.
+ */
+export const rowId = (name: string, phase: Phase): string => `${nameHash(name)}-${phase === "expand" ? "e" : "c"}`;
+
+function nameHash(name: string): string {
+  const pass = (seed: number): string => {
+    let hash = seed;
+    for (let i = 0; i < name.length; i++) {
+      hash ^= name.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return (hash >>> 0).toString(16).padStart(8, "0");
+  };
+  return pass(0x811c9dc5) + pass(0x01000193) + pass(0x050c5d1f);
+}
+
+/** The longest migration name accepted — comfortably inside every backend's text column. */
+export const MAX_MIGRATION_NAME_LENGTH = 255;
+
+/**
+ * Refuse a migration set whose names could not be journalled faithfully — checked before *anything*
+ * runs, because discovering it at the journal write means the migration's operations already ran and
+ * the store now holds work it has no record of.
+ */
+export function validateMigrationNames(names: readonly string[]): void {
+  const seen = new Map<string, string>();
+  for (const name of names) {
+    if (typeof name !== "string" || name.trim().length === 0) {
+      throw new Error(`Migration names must be non-empty strings; got ${JSON.stringify(name)}.`);
+    }
+    if (name.length > MAX_MIGRATION_NAME_LENGTH) {
+      throw new Error(`Migration name ${JSON.stringify(name.slice(0, 40))}… exceeds ${MAX_MIGRATION_NAME_LENGTH} characters.`);
+    }
+    // eslint-disable-next-line no-control-regex
+    if (/[\u0000-\u001f\u007f]/.test(name)) {
+      throw new Error(`Migration name ${JSON.stringify(name)} contains a control character.`);
+    }
+    const id = nameHash(name);
+    const clash = seen.get(id);
+    if (clash !== undefined && clash !== name) {
+      throw new Error(`Migration names ${JSON.stringify(clash)} and ${JSON.stringify(name)} share a journal id; rename one.`);
+    }
+    seen.set(id, name);
+  }
+}
 
 /**
  * A journal stored as ordinary records through the `Backend` interface.

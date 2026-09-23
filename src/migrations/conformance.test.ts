@@ -8,17 +8,24 @@
  * regression net for the failure that motivated this whole subsystem: a migration that quietly did
  * nothing at all on a store with no DDL.
  *
- * Mongo runs against a real `mongod` when one is reachable and skips otherwise, matching the existing
- * integration suites.
+ * The real engines — PostgreSQL, MySQL and `mongod` — run whenever one is reachable (`PG_URL`,
+ * `MYSQL_URL`, `MONGO_URL`, defaulting to the same local addresses the integration suites use) and skip
+ * otherwise. They matter more than the in-process stand-ins: pg-mem accepts things a real server
+ * rejects (a NUL byte in text, for one), which is how a migration journal that could never be written
+ * on PostgreSQL passed every test here.
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { requireLiveDb } from "../testing/liveDb.testutil.js";
 import { newDb } from "pg-mem";
+import pg from "pg";
+import { createPool, type Pool as MySqlPool } from "mysql2/promise";
 import { MongoClient, type Db } from "mongodb";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { InMemoryBackend } from "../backends/memory/InMemoryBackend.js";
 import { SQLiteBackend } from "../backends/sqlite/SQLiteBackend.js";
 import { IndexedDBBackend } from "../backends/indexeddb/IndexedDBBackend.js";
 import { PostgresBackend } from "../backends/sql/PostgresBackend.js";
+import { MySqlBackend } from "../backends/sql/MySqlBackend.js";
 import { MongoBackend } from "../backends/mongo/MongoBackend.js";
 import { runMigrations } from "./run.js";
 import { everything } from "./paging.js";
@@ -111,7 +118,7 @@ const CASES: Case[] = [
     // pg-mem leaves the implicit primary-key index behind when a table is dropped, so the re-provision
     // that the following read triggers fails with "relation Rec_pkey already exists". Its own quirk,
     // not a divergence — real Postgres is covered by the env-gated integration suite.
-    skip: { Postgres: "pg-mem does not drop a table's implicit primary-key index with the table" }
+    skip: { "Postgres (pg-mem)": "pg-mem does not drop a table's implicit primary-key index with the table" }
   },
   {
     label: "a gated rename, window still open",
@@ -162,6 +169,14 @@ function normalize(row: JsonObject): JsonObject {
   return out;
 }
 
+const PG_URL = process.env.PG_URL ?? "postgres://test:test@127.0.0.1:5432/test";
+const MYSQL_URL = process.env.MYSQL_URL ?? "mysql://test:test@127.0.0.1:3306/test";
+let pgPool: pg.Pool | undefined;
+let myPool: MySqlPool | undefined;
+
+/** The tables a case touches, dropped before each real-engine case so cases can't see each other. */
+const TABLES = [MODEL, "_object_repository_migration_log", "_object_repository_schema_state"];
+
 let mongoServer: MongoMemoryServer | undefined;
 let mongoClient: MongoClient | undefined;
 let mongoDb: Db | undefined;
@@ -176,22 +191,64 @@ beforeAll(async () => {
     mongoClient = new MongoClient(url);
     await mongoClient.connect();
     mongoDb = mongoClient.db("migration_conformance");
-  } catch {
+  } catch (error) {
+      requireLiveDb(error);
     mongoDb = undefined; // unreachable here → that backend's cases skip
+  }
+  try {
+    const pool = new pg.Pool({ connectionString: PG_URL, connectionTimeoutMillis: 2000 });
+    await pool.query("SELECT 1");
+    pgPool = pool;
+  } catch (error) {
+      requireLiveDb(error);
+    pgPool = undefined;
+  }
+  try {
+    const pool = createPool({ uri: MYSQL_URL, connectTimeout: 2000 });
+    await pool.query("SELECT 1");
+    myPool = pool;
+  } catch (error) {
+      requireLiveDb(error);
+    myPool = undefined;
   }
 }, 120_000);
 
 afterAll(async () => {
+  await pgPool?.end().catch(() => {});
+  await myPool?.end().catch(() => {});
   await mongoClient?.close().catch(() => {});
   await mongoServer?.stop().catch(() => {});
 });
 
 let dbSeq = 0;
-const BACKENDS: Array<[string, () => Backend | null]> = [
-  ["SQLite", () => new SQLiteBackend(new DatabaseSync(":memory:"))],
-  ["IndexedDB", () => new IndexedDBBackend({ name: `conformance-${dbSeq++}` })],
-  ["Postgres", () => new PostgresBackend(new (newDb().adapters.createPg().Pool)())],
-  ["Mongo", () => (mongoDb ? new MongoBackend(mongoDb as never) : null)]
+const BACKENDS: Array<[string, () => Promise<Backend | null>]> = [
+  ["SQLite", async () => new SQLiteBackend(new DatabaseSync(":memory:"))],
+  ["IndexedDB", async () => new IndexedDBBackend({ name: `conformance-${dbSeq++}` })],
+  ["Postgres (pg-mem)", async () => new PostgresBackend(new (newDb().adapters.createPg().Pool)())],
+  [
+    "Postgres (real)",
+    async () => {
+      if (!pgPool) return null;
+      await pgPool.query(`DROP TABLE IF EXISTS ${TABLES.map((t) => `"${t}"`).join(", ")} CASCADE`);
+      return new PostgresBackend(pgPool);
+    }
+  ],
+  [
+    "MySQL (real)",
+    async () => {
+      if (!myPool) return null;
+      await myPool.query(`DROP TABLE IF EXISTS ${TABLES.map((t) => `\`${t}\``).join(", ")}`);
+      return new MySqlBackend(myPool);
+    }
+  ],
+  [
+    "Mongo",
+    async () => {
+      if (!mongoDb) return null;
+      await mongoDb.dropDatabase();
+      return new MongoBackend(mongoDb as never);
+    }
+  ]
 ];
 
 describe("migration conformance across backends", () => {
@@ -199,9 +256,8 @@ describe("migration conformance across backends", () => {
     for (const [name, make] of BACKENDS) {
       it(`${name}: ${testCase.label} matches the in-memory reference`, async (context) => {
         if (testCase.skip?.[name]) return context.skip();
-        const backend = make();
+        const backend = await make();
         if (!backend) return context.skip();
-        if (name === "Mongo" && mongoDb) await mongoDb.dropDatabase();
 
         const reference = await outcome(new InMemoryBackend(), testCase);
         const actual = await outcome(backend, testCase);

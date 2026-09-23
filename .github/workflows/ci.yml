@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test" --health-interval 5s --health-timeout 5s --health-retries 20
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_USER: test
+          MYSQL_PASSWORD: test
+          MYSQL_DATABASE: test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot" --health-interval 5s --health-timeout 5s --health-retries 30
+      mongo:
+        image: mongo:8
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 })'" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PG_URL: postgres://test:test@127.0.0.1:5432/test
+      MYSQL_URL: mysql://test:test@127.0.0.1:3306/test
+      MONGO_URL: mongodb://127.0.0.1:27017
+      # An unreachable server fails the run instead of silently skipping the live-engine suites.
+      REQUIRE_LIVE_DBS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run typecheck
+      # The full suite, live engines included — the pre-commit hook excludes them, so this is the only
+      # place they gate anything.
+      - run: pnpm exec vitest run --coverage --coverage.reporter=text
+      - run: pnpm run build

@@ -17,7 +17,7 @@ import { SYSTEM_CONTEXT } from "../core/types.ts";
 import { generateUuid } from "../core/uuid.ts";
 import { applyOp, type ExecuteOptions } from "./execute.ts";
 import { MigrationBlockedError, SchemaVersionError } from "./errors.ts";
-import { acquireLock, BackendJournal, indexRows, rowId, type JournalRow, type MigrationJournal, type SchemaState } from "./journal.ts";
+import { acquireLock, BackendJournal, indexRows, rowId, validateMigrationNames, type JournalRow, type MigrationJournal, type SchemaState } from "./journal.ts";
 import { assertNoNarrowingRetype, downOps, opsHash, splitPhases, OpRecorder } from "./ops.ts";
 import type {
   DeferredContract,
@@ -419,7 +419,8 @@ function describe(migration: Migration, ops: MigrationOp[], minSupported: number
   return `"${migration.name}" ${what} at schema version ${gate}; minSupportedSchemaVersion is ${minSupported}.`;
 }
 
-function assertUniqueNames(migrations: Migration[]): void {
+export function assertUniqueNames(migrations: Migration[]): void {
+  validateMigrationNames(migrations.map((migration) => migration.name));
   const seen = new Set<string>();
   for (const migration of migrations) {
     if (seen.has(migration.name)) throw new Error(`Duplicate migration name: ${JSON.stringify(migration.name)}`);
