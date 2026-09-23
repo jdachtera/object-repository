@@ -120,12 +120,13 @@ describe("SQL transactions", () => {
     pool.log.length = 0;
     be.save("T", { uuid: "a", n: 1 }, ctx);
     await be.persist(ctx);
-    expect(pool.log).toEqual(["BEGIN", "INSERT", "COMMIT", "RELEASE"]);
+    // The existence check (which uuids to update vs insert) runs inside the transaction, before the insert.
+    expect(pool.log).toEqual(["BEGIN", "SELECT", "INSERT", "COMMIT", "RELEASE"]);
 
     pool.log.length = 0;
     pool.failInsert = true;
     be.save("T", { uuid: "b", n: 2 }, ctx);
     await expect(be.persist(ctx)).rejects.toThrow(/mysql dup/);
-    expect(pool.log).toEqual(["BEGIN", "INSERT", "ROLLBACK", "RELEASE"]);
+    expect(pool.log).toEqual(["BEGIN", "SELECT", "INSERT", "ROLLBACK", "RELEASE"]);
   });
 });

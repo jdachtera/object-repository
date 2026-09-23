@@ -480,6 +480,10 @@ export class SqlBackend
         const columns = this.columns(model);
         for (const { updateColumns, items } of this.bucketByDirtyColumns(model, changes)) {
           for (const chunk of chunked(items, MAX_BATCH_ROWS)) {
+            if (this.dialect.name === "mysql") {
+              await this.writeMySqlChunk(exec, model, columns, updateColumns, chunk);
+              continue;
+            }
             const params = chunk.flatMap((c) => this.encodeRow(model, c.record));
             await exec.run(this.dialect.upsertMany(model, columns, chunk.length, updateColumns), params);
           }
@@ -506,6 +510,58 @@ export class SqlBackend
   discardPending(): void {
     this.saveQueue = [];
     this.removeQueue = [];
+  }
+
+  /**
+   * MySQL has no upsert keyed on one constraint: `ON DUPLICATE KEY UPDATE` fires on *any* unique key,
+   * so a new record colliding with another row on a secondary unique field silently overwrote that
+   * other row. Split the paths instead: rows whose uuid already exists are updated by uuid, the rest
+   * are plainly inserted — and a collision on another unique key is then an error, not a rewrite.
+   */
+  private async writeMySqlChunk(
+    exec: SqlExecutor,
+    model: string,
+    columns: string[],
+    updateColumns: string[] | undefined,
+    chunk: PersistedChange[]
+  ): Promise<void> {
+    // The last write to a uuid within one batch wins, as it did under the upsert.
+    const byUuid = new Map(chunk.map((change) => [String(change.record.uuid), change]));
+    const uuids = [...byUuid.keys()];
+    const found = await exec.run(
+      `SELECT \`uuid\` AS uuid FROM ${this.dialect.ref(model)} WHERE \`uuid\` IN (${uuids.map(() => "?").join(", ")}) FOR UPDATE`,
+      uuids
+    );
+    const existing = new Set(found.map((row) => String(row.uuid)));
+
+    const inserts = [...byUuid.values()].filter((change) => !existing.has(String(change.record.uuid)));
+    if (inserts.length) {
+      const tuple = `(${columns.map(() => "?").join(", ")})`;
+      await exec.run(
+        `INSERT INTO ${this.dialect.ref(model)} (${columns.map((c) => this.dialect.column(c)).join(", ")}) VALUES ${inserts.map(() => tuple).join(", ")}`,
+        inserts.flatMap((change) => this.encodeRow(model, change.record))
+      );
+    }
+
+    const setColumns = updateColumns ?? columns.filter((column) => column !== "uuid");
+    const updates = [...byUuid.values()].filter((change) => existing.has(String(change.record.uuid)));
+    if (!setColumns.length || !updates.length) return;
+    // One statement for the whole chunk, keyed by uuid: `col = CASE uuid WHEN ? THEN ? … END`.
+    const rows = updates.map((change) => ({ uuid: String(change.record.uuid), values: this.encodeRow(model, change.record) }));
+    const params: unknown[] = [];
+    const sets = setColumns.map((column) => {
+      const index = columns.indexOf(column);
+      const cases = rows.map((row) => {
+        params.push(row.uuid, row.values[index]);
+        return "WHEN ? THEN ?";
+      });
+      return `${this.dialect.column(column)} = CASE \`uuid\` ${cases.join(" ")} END`;
+    });
+    params.push(...rows.map((row) => row.uuid));
+    await exec.run(
+      `UPDATE ${this.dialect.ref(model)} SET ${sets.join(", ")} WHERE \`uuid\` IN (${rows.map(() => "?").join(", ")})`,
+      params
+    );
   }
 
   /**

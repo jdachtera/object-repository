@@ -371,15 +371,10 @@ write-batching — which still fans out.
 The library targets exact parity across backends, but a few things are genuinely engine-specific and
 are pinned by live-engine tests (`src/backends/sqlIntegration.test.ts`) so any change is deliberate:
 
-- **Secondary `unique` indexes under `persist()` diverge between Postgres and MySQL.** The declared
-  index is created on both. But `persist()` upserts by `uuid`, and the two engines scope that upsert
-  differently: Postgres uses `ON CONFLICT (uuid) DO UPDATE`, so a *different* row colliding on a
-  secondary unique field is **not** caught by the conflict target and the write **rejects** (you see
-  the violation). MySQL's `INSERT … ON DUPLICATE KEY UPDATE` can't be scoped to one key — it matches
-  on *every* unique key, so the same collision is absorbed as a no-op UPDATE of the existing row: no
-  error, the new record is silently dropped, and the row count is unchanged. If you rely on secondary
-  unique constraints to surface conflicting writes, do it on Postgres, or validate uniqueness in a
-  command/middleware before `persist()`.
+- **Secondary `unique` indexes are enforced the same way on Postgres and MySQL.** A new record whose
+  unique field collides with a *different* row is rejected on both. (MySQL's `INSERT … ON DUPLICATE
+  KEY UPDATE` fires on every unique key, so `persist()` doesn't use it there: new uuids are plainly
+  inserted and existing ones updated by uuid.)
 
 ## Commands (task-based RPC)
 

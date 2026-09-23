@@ -181,9 +181,6 @@ const CASES: Case[] = [
   },
   {
     label: "addIndex (unique) not declared by the model",
-    // MySQL's upsert (`ON DUPLICATE KEY UPDATE`) turns the unique-key conflict into an update of the
-    // *other* row, so the probe sees "accepted" — the pre-existing F330, not an index divergence.
-    skip: { "MySQL (real)": "F330: MySQL upsert overwrites the conflicting row instead of rejecting" },
     migration: { name: "m", up: (m) => m.addIndex(MODEL, UNIQUE_N) },
     probe: acceptsDuplicate,
     expect: "rejected"
@@ -197,9 +194,6 @@ const CASES: Case[] = [
   },
   {
     label: "addIndex with a name that isn't an identifier",
-    // MySQL's upsert (`ON DUPLICATE KEY UPDATE`) turns the unique-key conflict into an update of the
-    // *other* row, so the probe sees "accepted" — the pre-existing F330, not an index divergence.
-    skip: { "MySQL (real)": "F330: MySQL upsert overwrites the conflicting row instead of rejecting" },
     migration: { name: "m", up: (m) => m.addIndex(MODEL, { name: "by-n", fields: [{ path: "n" }], unique: true }) },
     probe: acceptsDuplicate,
     expect: "rejected"

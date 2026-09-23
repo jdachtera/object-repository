@@ -744,11 +744,11 @@ describe("MySQL (real engine)", () => {
     users.save(ann).save(bob).save(cy);
     await users.persist();
 
-    const updates = seen.filter((s) => s.includes("ON DUPLICATE KEY UPDATE"));
-    const ageOnly = updates.filter((s) => s.includes("ON DUPLICATE KEY UPDATE `age` = VALUES(`age`)") && !s.includes("`name` = VALUES"));
-    const cityOnly = updates.filter((s) => s.includes("ON DUPLICATE KEY UPDATE `city` = VALUES(`city`)") && !s.includes("`age` = VALUES"));
-    expect(ageOnly).toHaveLength(1); // ann + bob batched into one multi-row statement
-    expect(ageOnly[0]).toContain("), ("); // two value tuples in that one statement, one round trip
+    const updates = seen.filter((s) => s.startsWith("UPDATE `dirty_my`"));
+    const ageOnly = updates.filter((s) => s.includes("SET `age` = CASE") && !s.includes("`name` = CASE"));
+    const cityOnly = updates.filter((s) => s.includes("SET `city` = CASE") && !s.includes("`age` = CASE"));
+    expect(ageOnly).toHaveLength(1); // ann + bob batched into one statement
+    expect(ageOnly[0]!.match(/WHEN \?/g)).toHaveLength(2); // both rows in that one statement, one round trip
     expect(cityOnly).toHaveLength(1); // cy, alone (different dirty signature)
 
     // Re-read through a fresh, unrelated repository — a real query, not the identity-map cache.
@@ -835,34 +835,32 @@ describe("MySQL (real engine)", () => {
     expect((await items.get(r.uuid))!.name).toBe("y");
   });
 
-  // A declared unique index IS created on MySQL, but persist()'s upsert semantics diverge from Postgres:
-  // MySQL's `INSERT … ON DUPLICATE KEY UPDATE` matches on *every* unique key (it can't be scoped to the
-  // uuid primary key the way Postgres's `ON CONFLICT (uuid)` is), so a colliding secondary-unique value
-  // is absorbed as a no-op UPDATE of the existing row rather than raised as an error. The upshot: on
-  // MySQL a save whose unique field collides with a different row is silently dropped (the existing row
-  // wins, count stays 1, no throw) — whereas the same save rejects on Postgres. This is a documented
-  // engine divergence (see README "Cross-engine caveats"); the test pins the real behavior so a future
-  // change to the write strategy is a deliberate, visible edit.
-  it("creates the UNIQUE index; a secondary-key collision is absorbed by upsert (MySQL divergence)", async () => {
+  // `INSERT … ON DUPLICATE KEY UPDATE` fires on *every* unique key, so persisting a new record whose
+  // unique field collided with a different row used to overwrite that row. New uuids are now plainly
+  // inserted and existing ones updated by uuid, so the collision is an error — as on Postgres.
+  it("creates the UNIQUE index, and a secondary-key collision is refused — never another row rewritten", async () => {
     if (!pool) return;
     const orm = new RepositoryManager({ backend: new MySqlBackend(pool) });
-    const users = orm.define({ name: "uniq_my", properties: { email: text({ unique: true }) } });
-    await orm.transaction(async () => users.save(users.createInstance({ email: "a@x.io" })));
+    const users = orm.define({ name: "uniq_my", properties: { email: text({ unique: true }), name: text() } });
+    const alice = users.createInstance({ email: "a@x.io", name: "Alice" });
+    await orm.transaction(async () => users.save(alice));
 
     // the index really exists and is UNIQUE (Non_unique = 0)
     const idx = (await pool.query("SHOW INDEX FROM `uniq_my` WHERE `Key_name` = 'uniq_my_email'"))[0] as { Non_unique: number }[];
     expect(idx[0]?.Non_unique).toBe(0);
 
-    // a *different* record with the same email does not throw and is not inserted — the existing row wins
-    users.save(users.createInstance({ email: "a@x.io" }));
-    await expect(users.persist()).resolves.toBeDefined();
-    expect(await users.all().count()).toBe(1);
+    // a *different* record with the same email is refused, and Alice's row is untouched
+    users.save(users.createInstance({ email: "a@x.io", name: "Mallory" }));
+    await expect(users.persist()).rejects.toThrow();
+    const fresh = new RepositoryManager({ backend: new MySqlBackend(pool) }).define({ name: "uniq_my", properties: { email: text(), name: text() } });
+    expect(await fresh.all().count()).toBe(1);
+    expect((await fresh.get(alice.uuid))!.name).toBe("Alice");
   });
 
   it("the pre-write unique check closes the MySQL secondary-unique divergence (opt-in)", async () => {
     if (!pool) return;
-    // Default OFF: a colliding secondary-unique value is silently absorbed (pinned above). With the
-    // flag ON, it raises the same UniqueConstraintError as every other engine, before the write.
+    // Default OFF: the database refuses the colliding insert (above). With the flag ON, it raises the
+    // same friendly UniqueConstraintError as every other engine, before the write.
     const orm = new RepositoryManager({ backend: new MySqlBackend(pool, undefined, { uniquePreCheck: true }) });
     const users = orm.define({ name: "prechk_my", properties: { email: text({ unique: true }) } });
     await orm.transaction(async () => users.save(users.createInstance({ email: "a@x.io" })));
