@@ -27,6 +27,7 @@ export type {
 
 export {
   MigrationBlockedError,
+  MigrationInterruptedError,
   MigrationNotSupportedError,
   SchemaUnknownError,
   SchemaVersionError

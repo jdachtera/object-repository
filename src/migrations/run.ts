@@ -15,8 +15,8 @@ import { isMigrationLowering, isSchemaAware, isTransactional, migrationTarget } 
 import type { Context } from "../core/types.ts";
 import { SYSTEM_CONTEXT } from "../core/types.ts";
 import { generateUuid } from "../core/uuid.ts";
-import { applyOp, type ExecuteOptions } from "./execute.ts";
-import { MigrationBlockedError, SchemaVersionError } from "./errors.ts";
+import { applyOp, reappliesSafely, type ExecuteOptions } from "./execute.ts";
+import { MigrationBlockedError, MigrationInterruptedError, SchemaVersionError } from "./errors.ts";
 import {
   acquireLock,
   BackendJournal,
@@ -478,8 +478,11 @@ async function runPhase(
 
   const progress = record.progress;
   const at = (op: number) => (cursor: string) => progress!(encodeResume({ op, after: cursor }));
+  // A marker staged with its page shares the page's flush — atomic only where that flush is (not a
+  // Mongo bulkWrite per collection, say).
+  const sharedFlush = !!journal.stage && backend.capabilities.transactions;
   await executeOps(backend, migration, ops, phase, options, record.resume, (index) =>
-    progress && journal.stage
+    progress && sharedFlush
       ? {
           // Queued now, persisted with the page it describes.
           checkpoint: async (cursor) => journal.stage!(at(index)(cursor)),
@@ -487,8 +490,15 @@ async function runPhase(
         }
       : progress
         ? {
-            // A journal kept elsewhere can't share the page's flush. Record the marker after the page
-            // lands: an interruption between the two re-applies that one page rather than skipping it.
+            // The marker can't share the page's flush. Record it after the page lands; and for an op
+            // that must not run twice, mark the page in flight first, so a resume knows which records
+            // it can't vouch for instead of silently applying them again.
+            ...(reappliesSafely(ops[index]!)
+              ? {}
+              : {
+                  beforePage: async (after: string | null, through: string) =>
+                    journal.write(progress(encodeResume({ op: index, after, inFlight: { through } })))
+                }),
             heartbeat: async (cursor) => {
               await journal.write(at(index)(cursor));
               await lease?.renew();
@@ -504,7 +514,7 @@ async function settle(journal: MigrationJournal, record: PhaseRecord): Promise<v
   for (const entry of record.forget ?? []) await journal.remove(entry.name, entry.phase);
 }
 
-type PageHooks = Pick<ExecuteOptions, "checkpoint"> & { heartbeat?: (cursor: string) => Promise<void> };
+type PageHooks = Pick<ExecuteOptions, "checkpoint" | "beforePage"> & { heartbeat?: (cursor: string) => Promise<void> };
 
 /** Run `ops` in order, preferring a backend's native lowering and falling back to the reference. */
 async function executeOps(
@@ -524,7 +534,13 @@ async function executeOps(
       continue; // the backend did it natively — same effect, lower cost
     }
 
-    const { checkpoint, heartbeat } = typeof hooks === "function" ? hooks(index) : hooks;
+    const { checkpoint, heartbeat, beforePage } = typeof hooks === "function" ? hooks(index) : hooks;
+    let after = resume && index === resume.op ? resume.after : null;
+    if (resume?.inFlight && index === resume.op && !reappliesSafely(op)) {
+      // The interrupted run may have written some, all or none of this page: only the operator can say.
+      if (!options.interruptedPage) throw new MigrationInterruptedError(migration.name, op, resume.after, resume.inFlight.through);
+      if (options.interruptedPage === "skip") after = resume.inFlight.through;
+    }
     let cursor = "";
     await applyOp(backend, op, {
       ctx: options.ctx,
@@ -535,7 +551,8 @@ async function executeOps(
       transforms: migration.transforms ?? {},
       ...(options.onProgress ? { onProgress: options.onProgress } : {}),
       backendName: backend.constructor?.name ?? "this backend",
-      after: resume && index === resume.op ? resume.after : null,
+      after,
+      ...(beforePage ? { beforePage } : {}),
       ...(checkpoint
         ? {
             checkpoint: async (at: string) => {

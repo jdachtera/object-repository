@@ -215,7 +215,10 @@ export class RepositoryManager {
    * offers no uncommitted-read isolation.
    */
   async transaction<T>(fn: (tx: TransactionScope) => Promise<T>): Promise<T> {
-    await this.windows.ready; // so no write inside `fn` has to wait for the journal to be read
+    // So no write inside `fn` has to wait for the journal to be read, and saves held until it was are
+    // committed with the transaction.
+    await this.windows.release();
+    await this.windows.ready;
     const prevMode = this.txState.mode;
     if (isTransactional(this.backend)) {
       return this.backend.transaction(async (txBackend) => {

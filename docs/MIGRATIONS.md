@@ -267,10 +267,19 @@ is recognised as already done. Migration statements run on the transaction's own
 the executor's per-statement timeout, so a long backfill can't time out on the client while it
 commits on the server.
 
-On other stores, each page of a record pass is persisted together with a resume marker in the journal.
-An interrupted pass continues from its last persisted page instead of starting over, so a
-non-idempotent `transform` (`price * 100`) is never applied to a record twice. A page that failed part
-way is discarded, not committed by whatever persists next.
+On other stores, a record pass keeps a resume marker in the journal and an interrupted pass continues
+from its last persisted page instead of starting over, so a non-idempotent `transform` (`price * 100`)
+is never silently applied to a record twice. A page that failed part way is discarded, not committed by
+whatever persists next.
+
+Where a single persist is atomic (in-memory, IndexedDB), each page is persisted together with its
+marker, and a resume is exact. Where it isn't (Mongo writes each collection separately, and a journal
+kept in another store can't share the page's flush), the marker is written after the page lands. For
+most operations re-applying that one page is harmless. Two are not safe to apply twice: a `transform`,
+and a `retypeField` to `json` (the JSON text would be quoted again). Before each page of those, the page
+is marked in flight. A run that resumes onto an in-flight page stops with `MigrationInterruptedError`,
+naming the records it can't vouch for. Check them, then re-run with `interruptedPage: "reapply"` if
+they weren't rewritten or `interruptedPage: "skip"` if they were.
 
 Run migrations from **one place** — a deploy step, not application startup. Pass `skipLock: true` only
 if you already guarantee that.

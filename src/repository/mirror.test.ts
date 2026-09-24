@@ -284,6 +284,16 @@ describe("a window closes when its contract runs — not when the floor rises", 
     }
   });
 
+  it("writes a save held before the journal was read on any repository's persist", async () => {
+    const backend = new InMemoryBackend();
+    const { orm, users } = build(backend, 5);
+    const posts = orm.define({ name: "Post", properties: { title: text() } });
+    users.save(users.createInstance({ uuid: "u1", fullName: "Ann" })); // held: the journal isn't read yet
+    await posts.save(posts.createInstance({ uuid: "p1", title: "Hi" })).persist();
+    const stored = await backend.query({ model: "User", where: { type: "all" }, order: [], paging: { start: 0 } }, ctx);
+    expect(stored.map((row) => row.uuid)).toEqual(["u1"]);
+  });
+
   it("provisions the legacy column while the window is open, whatever the floor", async () => {
     const registered: FieldSpec[][] = [];
     const backend = Object.assign(new InMemoryBackend(), {

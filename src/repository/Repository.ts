@@ -98,8 +98,6 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
   /** Which declared windows the store has closed; shared with the manager. */
   private readonly windows: WindowState | null;
   private activeMirrors: { version: number; mirrors: Mirrors } | null = null;
-  /** Saves made before the journal was read, held until `persist` (see `enqueueSave`). */
-  private readonly deferred: Record_[] = [];
 
   constructor(
     modelName: string,
@@ -338,23 +336,11 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
   }
 
   async persist(): Promise<this> {
-    await this.flushDeferred();
+    // Saves held back while the journal was being read — this repository's and any other's, since a
+    // save cascades across models — go out now that it's known which windows are open.
+    await this.windows?.release();
     await this.backend.persist(this.ctx);
     return this;
-  }
-
-  /**
-   * Hand the backend the saves held back while the journal was being read, now that this process
-   * knows which windows are open: serialized then, a save would still write a legacy field whose
-   * window has closed.
-   */
-  private async flushDeferred(): Promise<void> {
-    if (this.deferred.length === 0) return;
-    await this.windows?.ready;
-    for (const instance of this.deferred.splice(0)) {
-      if (this.mirrors.size > 0) this.syncMirrors(instance);
-      this.write(instance);
-    }
   }
 
   /**
@@ -1168,9 +1154,13 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     const uuid = instance.uuid as Uuid;
     this.cache.setInstance(uuid, instance as InferModel<P>);
     this.maintainInverse(instance, visited);
-    // Until the journal is read, which windows are open isn't known: hold the write for `persist`.
+    // Until the journal is read, which windows are open isn't known: hold the write for `persist`, and
+    // serialize it then — serialized now, it would still write a legacy field whose window has closed.
     if (this.mirrors.size > 0 && this.windows && !this.windows.known) {
-      if (!this.deferred.includes(instance)) this.deferred.push(instance);
+      this.windows.hold(instance, () => {
+        if (this.mirrors.size > 0) this.syncMirrors(instance);
+        this.write(instance);
+      });
       return;
     }
     this.write(instance);

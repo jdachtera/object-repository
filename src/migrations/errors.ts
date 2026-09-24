@@ -59,3 +59,28 @@ export class SchemaVersionError extends Error {
     this.name = "SchemaVersionError";
   }
 }
+
+/**
+ * An earlier run was interrupted while writing a page of an op that is not safe to apply twice (a
+ * `transform`, or a retype to `json`), on a store that can't commit a page together with its resume
+ * marker. The records after `after`, up to and including `through`, may already have the op applied —
+ * all, some or none of them. Inspect them, then re-run with `interruptedPage: "reapply"` (none were
+ * written) or `"skip"` (all were).
+ */
+export class MigrationInterruptedError extends Error {
+  constructor(
+    readonly migration: string,
+    readonly op: MigrationOp,
+    readonly after: string | null,
+    readonly through: string
+  ) {
+    const model = "model" in op ? ` on "${op.model}"` : "";
+    const from = after === null ? "the first record" : `the record after ${JSON.stringify(after)}`;
+    super(
+      `Migration "${migration}" was interrupted while writing ${op.kind}${model}, which is not safe to apply twice. ` +
+        `Records from ${from} through ${JSON.stringify(through)} may or may not have been rewritten. ` +
+        `Check them, then re-run with interruptedPage: "reapply" or "skip".`
+    );
+    this.name = "MigrationInterruptedError";
+  }
+}

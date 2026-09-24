@@ -47,6 +47,11 @@ export interface ExecuteOptions {
   checkpoint?: (cursor: string) => void | Promise<void>;
   /** Called after each persisted page — the runner renews its lease here. */
   heartbeat?: () => Promise<void>;
+  /**
+   * Called before a page's writes are queued, with the cursor it starts after and its last uuid. The
+   * runner records the page as in flight here when the store can't persist it with its marker.
+   */
+  beforePage?: (after: string | null, through: string) => Promise<void>;
   /** Collects the models a pass registered with a reduced index set, so the runner can restore them. */
   registered?: Set<string>;
 }
@@ -59,10 +64,21 @@ export interface OpResult {
 /**
  * Apply one operation using only the portable `Backend` surface.
  *
- * Every op but `transform` is idempotent: re-running a completed pass is a no-op. A transform need not
- * be (`price * 100`), so an interrupted pass resumes from its last persisted page (`after`) instead of
- * starting over.
+ * Every op but `transform` and a retype to `json` is idempotent: re-running a completed pass is a no-op
+ * (see `reappliesSafely`). The other two need not be (`price * 100`; JSON text quoted again), so an
+ * interrupted pass resumes from its last persisted page (`after`) instead of starting over.
  */
+/**
+ * Whether applying `op` to a record that already has it applied leaves the record as it is. A transform
+ * is arbitrary code. A retype to `json` stores the value's JSON text, and can't tell text it already
+ * encoded from text it hasn't: applied twice, `"abc"` becomes `"\"abc\""`.
+ */
+export function reappliesSafely(op: MigrationOp): boolean {
+  if (op.kind === "transform") return false;
+  if (op.kind === "retypeField") return !(op.to === "json" && op.from !== undefined && op.from !== "json");
+  return true;
+}
+
 export async function applyOp(backend: Backend, op: MigrationOp, options: ExecuteOptions): Promise<OpResult> {
   switch (op.kind) {
     case "createModel":
@@ -173,6 +189,7 @@ async function rewrite(
   const removeOnNull = op.kind === "transform";
   const declared = ["uuid", ...fields.filter((field) => field !== "uuid")];
   let rows = 0;
+  let after = options.after ?? null;
 
   for await (const page of pageByUuid(
     backend,
@@ -183,6 +200,9 @@ async function rewrite(
     options.after ?? null
   )) {
     let written = 0;
+    // Every change is worked out before any is queued, so the page can be marked in flight (a write
+    // that persists whatever is queued) before its own writes are.
+    const writes: Array<{ remove: JsonObject } | { save: JsonObject; dirty: string[] }> = [];
     try {
       for (const row of page.rows) {
         const next = change(row);
@@ -195,8 +215,7 @@ async function rewrite(
               `Transform "${op.transform}" on "${op.model}" is declared phase "expand" but deleted record ${JSON.stringify(row.uuid)}. A transform that deletes must be a contract.`
             );
           }
-          backend.remove(op.model, row, options.ctx);
-          written += 1;
+          writes.push({ remove: row });
           continue;
         }
         if (op.kind === "transform") {
@@ -211,7 +230,12 @@ async function rewrite(
         }
         // The fields that actually changed, by diff: a transform's declared list is a hint that may be
         // incomplete, and a store that writes only dirty fields would drop whatever it left out.
-        backend.save(op.model, next, options.ctx, op.kind === "transform" ? changedFields(row, next) : declared);
+        writes.push({ save: next, dirty: op.kind === "transform" ? changedFields(row, next) : declared });
+      }
+      if (writes.length) await options.beforePage?.(after, page.cursor);
+      for (const write of writes) {
+        if ("remove" in write) backend.remove(op.model, write.remove, options.ctx);
+        else backend.save(op.model, write.save, options.ctx, write.dirty);
         written += 1;
       }
     } catch (error) {
@@ -225,6 +249,7 @@ async function rewrite(
       rows += written;
       report(options, op, rows);
     }
+    after = page.cursor;
   }
   return { rows };
 }

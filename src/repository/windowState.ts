@@ -25,6 +25,25 @@ export class WindowState {
    * released contract dropped, and a write would put values back into it.
    */
   known = true;
+  /**
+   * Saves made while the journal was being read, in order, each ready to write itself once it has
+   * been. Shared by every repository of a manager: a save cascades across models (an inverse relation
+   * queues the related record on its own repository), and any one `persist` must write them all.
+   */
+  private readonly held = new Map<object, () => void>();
+
+  hold(instance: object, write: () => void): void {
+    if (!this.held.has(instance)) this.held.set(instance, write);
+  }
+
+  /** Once the journal is read, hand every held save to the backend. */
+  async release(): Promise<void> {
+    if (this.held.size === 0) return;
+    await this.ready;
+    const writes = [...this.held.values()];
+    this.held.clear();
+    for (const write of writes) write();
+  }
 
   isClosed(model: string, legacy: string): boolean {
     return this.closed.has(key(model, legacy));

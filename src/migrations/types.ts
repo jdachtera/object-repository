@@ -164,6 +164,12 @@ export interface MigrateOptions {
   models?: Record<string, { fields: FieldSpec[]; indexes: IndexSpec[] }>;
   /** Overrides the manager's declared value, for a migration run with no model definitions loaded. */
   minSupportedSchemaVersion?: number;
+  /**
+   * How to resume a page an earlier run was interrupted writing, when its op is not safe to apply
+   * twice and the store couldn't commit the page with its resume marker (see `MigrationInterruptedError`).
+   * `"reapply"` runs the page again; `"skip"` treats it as done. Unset, such a resume refuses.
+   */
+  interruptedPage?: "reapply" | "skip";
 }
 
 export interface MigrationProgress {

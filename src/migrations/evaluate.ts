@@ -46,6 +46,11 @@ export interface MigrationDecision {
 export interface ResumePoint {
   op: number;
   after: string | null;
+  /**
+   * Set while a page was being written on a store that can't commit a page together with its marker:
+   * the records after `after`, up to and including `through`, may be written, partly written, or not.
+   */
+  inFlight?: { through: string };
 }
 
 export function encodeResume(point: ResumePoint): string {
@@ -57,7 +62,9 @@ function decodeResume(cursor: string | null): ResumePoint | null {
   try {
     const parsed = JSON.parse(cursor) as Partial<ResumePoint>;
     if (typeof parsed.op !== "number") return null;
-    return { op: parsed.op, after: typeof parsed.after === "string" ? parsed.after : null };
+    const point: ResumePoint = { op: parsed.op, after: typeof parsed.after === "string" ? parsed.after : null };
+    if (typeof parsed.inFlight?.through === "string") point.inFlight = { through: parsed.inFlight.through };
+    return point;
   } catch {
     return null;
   }

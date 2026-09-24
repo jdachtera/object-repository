@@ -23,6 +23,7 @@ import { MongoClient, type Db } from "mongodb";
 import { isLeasing, type Backend, type LeasingBackend } from "../core/Backend.js";
 import { SYSTEM_CONTEXT, type JsonObject } from "../core/types.js";
 import { runMigrations, rollbackMigrations } from "./run.js";
+import { MigrationInterruptedError } from "./errors.js";
 import { acquireLock, BackendJournal, LOCK_LEASE_MS, LOCK_RENEW_MS, MigrationLockedError, SCHEMA_STATE_MODEL } from "./journal.js";
 import { everything } from "./paging.js";
 import type { Migration } from "./types.js";
@@ -199,6 +200,93 @@ function cents(failOn?: string): Migration {
     up: (m) => m.transform("Item", "cents", ["price"])
   };
 }
+
+/**
+ * A store whose persist is not atomic across models (Mongo's bulkWrite per collection), with a crash
+ * injected at the `crashAt`-th persist.
+ */
+class NonAtomicStore extends InMemoryBackend {
+  override readonly capabilities = { ...new InMemoryBackend().capabilities, transactions: false };
+  persists = 0;
+  crashAt = 0;
+  override async persist(c: typeof ctx) {
+    this.persists += 1;
+    if (this.persists === this.crashAt) {
+      this.discardPending();
+      throw new Error("crash");
+    }
+    return super.persist(c);
+  }
+}
+
+async function nonAtomic(prices: number[]): Promise<NonAtomicStore> {
+  const backend = new NonAtomicStore();
+  prices.forEach((price, i) => backend.save("Item", { uuid: `i${i}`, price }, ctx));
+  await backend.persist(ctx);
+  return backend;
+}
+
+describe("an interrupted page on a store that can't persist it with its marker", () => {
+  // Per page of a transform: the in-flight marker, the page, the marker after it.
+  const crashAfterSecondPage = async (backend: NonAtomicStore) => {
+    backend.persists = 0;
+    let marker = 0;
+    const persist = backend.persist.bind(backend);
+    backend.persist = async (c) => {
+      const result = await persist(c);
+      // Crash right after page 2 lands, before its marker is written.
+      const done = await backend.query({ model: "Item", where: everything(), order: [], paging: { start: 0 } }, ctx);
+      if (done.filter((row) => Number(row.price) >= 100).length === 4 && marker++ === 0) throw new Error("crash");
+      return result;
+    };
+    await expect(runMigrations(backend, [cents()], { models, batchSize: 2, skipLock: true })).rejects.toThrow("crash");
+    backend.persist = persist;
+  };
+
+  it("refuses to guess whether the page was written", async () => {
+    const backend = await nonAtomic([1, 2, 3, 4]);
+    await crashAfterSecondPage(backend);
+    await expect(runMigrations(backend, [cents()], { models, batchSize: 2, skipLock: true })).rejects.toBeInstanceOf(
+      MigrationInterruptedError
+    );
+    expect(await prices(backend)).toEqual([100, 200, 300, 400]); // nothing applied twice
+  });
+
+  it("treats the page as done when told to skip it", async () => {
+    const backend = await nonAtomic([1, 2, 3, 4]);
+    await crashAfterSecondPage(backend);
+    const report = await runMigrations(backend, [cents()], { models, batchSize: 2, skipLock: true, interruptedPage: "skip" });
+    expect(report.applied).toEqual(["0030_cents"]);
+    expect(await prices(backend)).toEqual([100, 200, 300, 400]);
+  });
+
+  it("writes the page again when told it wasn't written", async () => {
+    const backend = await nonAtomic([1, 2, 3, 4]);
+    backend.crashAt = 5; // 1 in-flight, 2 page, 3 marker; 4 in-flight, 5 the second page
+    await expect(runMigrations(backend, [cents()], { models, batchSize: 2, skipLock: true })).rejects.toThrow("crash");
+    expect(await prices(backend)).toEqual([100, 200, 3, 4]);
+    backend.crashAt = 0;
+    await runMigrations(backend, [cents()], { models, batchSize: 2, skipLock: true, interruptedPage: "reapply" });
+    expect(await prices(backend)).toEqual([100, 200, 300, 400]);
+  });
+
+  it("guards a retype to json the same way: its JSON text is never quoted twice", async () => {
+    const backend = new NonAtomicStore();
+    ["a", "b", "c", "d"].forEach((name, i) => backend.save("Item", { uuid: `i${i}`, name }, ctx));
+    await backend.persist(ctx);
+    const retype: Migration = { name: "0040_json", up: (m) => m.retypeField("Item", "name", "text", "json") };
+    backend.persists = 0;
+    backend.crashAt = 6; // the second page's marker, after the page landed
+    await expect(runMigrations(backend, [retype], { models, batchSize: 2, skipLock: true })).rejects.toThrow("crash");
+    await expect(runMigrations(backend, [retype], { models, batchSize: 2, skipLock: true })).rejects.toBeInstanceOf(
+      MigrationInterruptedError
+    );
+    backend.crashAt = 0;
+    await runMigrations(backend, [retype], { models, batchSize: 2, skipLock: true, interruptedPage: "skip" });
+    const rows = await backend.query({ model: "Item", where: everything(), order: [{ property: "uuid", descending: false }], paging: { start: 0 } }, ctx);
+    expect(rows.map((row) => row.name)).toEqual(['"a"', '"b"', '"c"', '"d"']);
+  });
+});
 
 describe("an interrupted record pass", () => {
   it("resumes from its last persisted page instead of re-applying a transform", async () => {
