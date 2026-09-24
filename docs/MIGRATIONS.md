@@ -259,20 +259,22 @@ alongside its successor. Releasing checks the owner, so a late runner can't free
 
 ### Interrupted runs
 
-On a store with real transactions (Postgres, MySQL), each phase's operations and its journal rows
-commit together. A failure leaves either the whole phase recorded or none of it. On Postgres the DDL
-rolls back with it. MySQL commits DDL implicitly, so there the lowered DDL is written to be safe to
-re-run instead: `addField` onto an existing column only fills it, and a repeated index create or drop
-is recognised as already done. Migration statements run on the transaction's own connection, outside
-the executor's per-statement timeout, so a long backfill can't time out on the client while it
-commits on the server.
+On a store whose transactions cover schema changes (Postgres), each phase's operations and its
+journal rows commit together. A failure leaves either the whole phase recorded or none of it, DDL
+included. Migration statements run on the transaction's own connection, outside the executor's
+per-statement timeout, so a long backfill can't time out on the client while it commits on the server.
+
+MySQL commits implicitly on any DDL, which would commit a phase's earlier writes and run the rest
+outside the transaction. So on MySQL a phase is not wrapped in one: it is journalled page by page, as
+below, and its lowered DDL is written to be safe to re-run: `addField` onto an existing column only
+fills it, and a repeated index create or drop is recognised as already done.
 
 On other stores, a record pass keeps a resume marker in the journal and an interrupted pass continues
 from its last persisted page instead of starting over, so a non-idempotent `transform` (`price * 100`)
 is never silently applied to a record twice. A page that failed part way is discarded, not committed by
 whatever persists next.
 
-Where a single persist is atomic (in-memory, IndexedDB), each page is persisted together with its
+Where a single persist is atomic (in-memory, IndexedDB, MySQL), each page is persisted together with its
 marker, and a resume is exact. Where it isn't (Mongo writes each collection separately, and a journal
 kept in another store can't share the page's flush), the marker is written after the page lands. For
 most operations re-applying that one page is harmless. Two are not safe to apply twice: a `transform`,

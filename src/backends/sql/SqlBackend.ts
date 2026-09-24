@@ -140,6 +140,7 @@ export class SqlBackend
       sortPushdown: true,
       joins: false,
       transactions: typeof executor.transaction === "function",
+      transactionalDdl: dialect.name !== "mysql", // MySQL commits implicitly on DDL
       changeFeed: true
     };
   }
@@ -288,10 +289,30 @@ export class SqlBackend
     return rows.map((row) => String(row.name));
   }
 
-  /** The rendered SQL for a plan preview. Never executed. */
-  previewMigrationOp(op: MigrationOp): string[] {
-    const present = "model" in op ? (this.liveColumnCache.get(op.model) ?? new Set<string>()) : new Set<string>();
-    return (lowerToSql(op, this.dialect, present) ?? []).map((statement) => statement.sql);
+  /**
+   * The rendered SQL for a plan preview. Never executed. The columns come from the table itself — not
+   * the run's cache, which a plan never fills and a later run must not inherit — and follow each op.
+   */
+  async previewMigrationOps(ops: MigrationOp[]): Promise<string[][]> {
+    const tables = new Map<string, Set<string>>();
+    const columnsOf = async (model: string): Promise<Set<string>> => {
+      let columns = tables.get(model);
+      if (!columns) {
+        const probe = this.dialect.columnsQuery(model);
+        columns = new Set((await this.exec.run(probe.sql, probe.params)).map((row) => String(row.column_name)));
+        tables.set(model, columns);
+      }
+      return columns;
+    };
+    const previews: string[][] = [];
+    for (const op of ops) {
+      const present = "model" in op ? await columnsOf(op.model) : new Set<string>();
+      const types = "model" in op ? await this.indexColumnTypes(op) : undefined;
+      const statements = lowerToSql(op, this.dialect, present, types) ?? [];
+      previews.push(statements.map((statement) => statement.sql));
+      if ("model" in op) followColumns(present, op);
+    }
+    return previews;
   }
 
   /** Read (and cache for this run) the columns a table actually has. */
@@ -906,6 +927,32 @@ function coerce(params: JsonValue[]): unknown[] {
     if (value !== null && typeof value === "object") return JSON.stringify(value);
     return value;
   });
+}
+
+/** A table's columns after `op`, for a preview that runs nothing. */
+function followColumns(columns: Set<string>, op: MigrationOp): void {
+  switch (op.kind) {
+    case "createModel":
+      if (columns.size === 0) for (const name of ["uuid", ...op.fields.map((field) => field.name), OVERFLOW_COLUMN]) columns.add(name);
+      break;
+    case "dropModel":
+      columns.clear();
+      break;
+    case "addField":
+      if (columns.size > 0) columns.add(op.field);
+      break;
+    case "dropField":
+      columns.delete(op.field);
+      break;
+    case "renameField":
+      if (columns.has(op.from) && !columns.has(op.to)) {
+        columns.delete(op.from);
+        columns.add(op.to);
+      }
+      break;
+    default:
+      break;
+  }
 }
 
 /** MySQL: `CREATE INDEX` (standalone, or a replayed `createModel`'s) on a name that exists (1061), `DROP INDEX` on one that doesn't (1091). */

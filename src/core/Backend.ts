@@ -148,8 +148,12 @@ export function isSchemaAware(backend: object): backend is SchemaAwareBackend {
 export interface MigrationLoweringBackend {
   /** Realize `op` natively, or resolve `null` to decline and let the reference executor handle it. */
   lowerMigrationOp(op: MigrationOp, ctx: Context): Promise<{ rows: number } | null>;
-  /** Render the native form for a plan preview. Never executes. */
-  previewMigrationOp?(op: MigrationOp): string[];
+  /**
+   * Render the native form of each op, in order, for a plan preview — `[]` for one that would run
+   * generically. Reads the store's current shape and follows the ops' effect on it, so a later op sees
+   * what an earlier one did. Never changes anything.
+   */
+  previewMigrationOps?(ops: MigrationOp[]): Promise<string[][]>;
   /**
    * Apply structural operations inside whatever exclusive window this store requires.
    *

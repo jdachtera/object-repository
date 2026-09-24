@@ -273,6 +273,8 @@ describe("a window closes when its contract runs — not when the floor rises", 
     // writes the legacy field.
     const early = build(backend, 7);
     await early.users.save(early.users.createInstance({ uuid: "u2", fullName: "Bo" })).persist();
+    const patched = build(backend, 7); // a patch as the very first thing a process does
+    await patched.users.patch("u2", { fullName: set("Bo") });
     const rows = await backend.query({ model: "User", where: { type: "all" }, order: [], paging: { start: 0 } }, ctx);
     expect(rows.find((r) => r.uuid === "u2")).toEqual({ uuid: "u2", fullName: "Bo" });
     if (backend instanceof PostgresBackend) {

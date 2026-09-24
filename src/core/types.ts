@@ -105,6 +105,11 @@ export interface Capabilities {
   joins: boolean;
   /** Supports atomic multi-write transactions. */
   transactions: boolean;
+  /**
+   * `false` when a schema change commits the open transaction (MySQL): such a transaction can't make
+   * a migration phase atomic, so the runner journals its progress page by page instead. Unset: true.
+   */
+  transactionalDdl?: boolean;
   /** Can emit a server→client change feed (see `Backend.changes`). */
   changeFeed: boolean;
 }

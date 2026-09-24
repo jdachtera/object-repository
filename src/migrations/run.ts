@@ -446,7 +446,9 @@ async function runPhase(
   // Always prove the lease before a contract: that is the step that must never run twice.
   await lease?.renew(phase === "contract");
 
-  if (isTransactional(backend) && backend.capabilities.transactions) {
+  // MySQL commits on DDL — the phase's own, or a re-registration's — taking whatever is queued with it
+  // and running the rest outside any transaction. There, journal page by page like any other store.
+  if (isTransactional(backend) && backend.capabilities.transactions && backend.capabilities.transactionalDdl !== false) {
     // What this phase registers, and how it moves the run's layouts, count only once it commits. Each
     // phase commits on its own, so an earlier phase's registration stands even when a later one fails,
     // and must still be restored when the run ends.
@@ -526,6 +528,9 @@ async function executeOps(
   resume: ResumePoint | null,
   hooks: PageHooks | ((index: number) => PageHooks)
 ): Promise<void> {
+  // The ops before the resume point ran in an earlier attempt: this run's layouts must still follow
+  // them, or a re-registration would re-provision a field one of them dropped.
+  for (let index = 0; index < (resume?.op ?? 0); index++) followLayout(options, ops[index]!);
   for (let index = resume?.op ?? 0; index < ops.length; index++) {
     const op = ops[index]!;
     const lowered = isMigrationLowering(backend) ? await backend.lowerMigrationOp(op, options.ctx) : null;

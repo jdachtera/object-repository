@@ -54,7 +54,8 @@ export async function planMigrations(
         phase: "expand",
         op,
         status: decision.expand ? "pending" : "applied",
-        ...describeLowering(backend, op)
+        lowering: "generic",
+        preview: []
       });
     }
 
@@ -64,7 +65,8 @@ export async function planMigrations(
         phase: "contract",
         op,
         status: decision.contract === "run" ? "pending" : "deferred",
-        ...describeLowering(backend, op)
+        lowering: "generic",
+        preview: []
       });
     }
 
@@ -87,6 +89,8 @@ export async function planMigrations(
     }
   }
 
+  await describeLowering(backend, steps);
+
   return {
     schema: { schemaVersion: versions.schemaVersion, minSupportedSchemaVersion: minSupported },
     stored,
@@ -98,13 +102,21 @@ export async function planMigrations(
   };
 }
 
-/** Would this op be realized natively, and what would that look like? */
-function describeLowering(backend: Backend, op: PlanStep["op"]): Pick<PlanStep, "lowering" | "preview"> {
-  if (isMigrationLowering(backend) && backend.previewMigrationOp) {
-    const preview = backend.previewMigrationOp(op);
-    if (preview.length) return { lowering: "native", preview };
-  }
-  return { lowering: "generic", preview: [] };
+/**
+ * Which steps would be realized natively, and what that would look like. Those still to run are
+ * previewed in order against the store's current shape; one already applied stays as recorded.
+ */
+async function describeLowering(backend: Backend, steps: PlanStep[]): Promise<void> {
+  if (!isMigrationLowering(backend) || !backend.previewMigrationOps) return;
+  const toRun = steps.filter((step) => step.status !== "applied");
+  const previews = await backend.previewMigrationOps(toRun.map((step) => step.op));
+  toRun.forEach((step, index) => {
+    const preview = previews[index] ?? [];
+    if (preview.length) {
+      step.lowering = "native";
+      step.preview = preview;
+    }
+  });
 }
 
 /** Render a plan for a human — what runs, what is withheld, and what a release would destroy. */

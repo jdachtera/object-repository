@@ -380,6 +380,9 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
 
   async patch(uuid: Uuid, spec: PatchSpecFor<InferModel<P>>): Promise<InferModel<P> | null> {
     this.assertImmediateWriteAllowed("patch()");
+    // Which windows are open decides the fields written — and a model declaring one is registered only
+    // once that's known.
+    if (this.mirrors.size > 0) await this.windows?.ready;
     const ops = this.mirrorOps(normalizePatch(spec));
     this.stampUpdatedAt(ops);
     if (isPatching(this.backend)) {
@@ -405,6 +408,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
    */
   async patchWhere(filter: Expression, spec: PatchSpecFor<InferModel<P>>): Promise<number> {
     this.assertImmediateWriteAllowed("patchWhere()");
+    if (this.mirrors.size > 0) await this.windows?.ready;
     const ops = this.mirrorOps(normalizePatch(spec));
     this.stampUpdatedAt(ops);
     const pre = await this.preprocessWhere(filter.serialize());

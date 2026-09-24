@@ -13,6 +13,7 @@ import pg from "pg";
 import { createPool, type Pool as MySqlPool } from "mysql2/promise";
 import type { MigrationBuilder } from "../migrations/types.js";
 import { runMigrations } from "../migrations/run.js";
+import { planMigrations } from "../migrations/plan.js";
 import { PostgresBackend } from "./sql/PostgresBackend.js";
 import { MySqlBackend } from "./sql/MySqlBackend.js";
 import { InMemoryBackend } from "./memory/InMemoryBackend.js";
@@ -913,6 +914,87 @@ describe("MySQL (real engine)", () => {
     expect(report.applied).toEqual(["0001_tier"]);
     const [rows] = (await pool.query("SELECT `tier` FROM `livecols_my`")) as unknown as [Array<{ tier: string }>];
     expect(rows).toEqual([{ tier: "free" }]);
+  });
+
+  const cents = (failOn?: string) => ({
+    name: "0001_cents",
+    transforms: {
+      cents: (row: Record<string, unknown>) => {
+        if (row.uuid === failOn) throw new Error(`boom on ${failOn}`);
+        return { ...row, price: Number(row.price) * 100 };
+      }
+    }
+  });
+  const pricesIn = async (table: string) =>
+    ((await pool!.query(`SELECT \`price\` FROM \`${table}\` ORDER BY \`uuid\``)) as unknown as [Array<{ price: number }>])[0].map((row) => Number(row.price));
+
+  it("a phase whose DDL commits mid-way resumes instead of re-applying a transform", async () => {
+    if (!pool) return;
+    await dropMigrationTables("ddlcommit_my");
+    const backend = new MySqlBackend(pool);
+    const models = { ddlcommit_my: { fields: [{ name: "price", type: "integer" as const }], indexes: [] } };
+    await backend.registerModel("ddlcommit_my", [], models.ddlcommit_my.fields);
+    [1, 2, 3, 4].forEach((price, i) => backend.save("ddlcommit_my", { uuid: `i${i}`, price }, ctx));
+    await backend.persist(ctx);
+
+    const migration = (failOn?: string) => ({
+      ...cents(failOn),
+      up: (m: MigrationBuilder) => {
+        m.addField("ddlcommit_my", "note", "text"); // DDL: MySQL commits whatever is open
+        m.transform("ddlcommit_my", "cents", ["price"], undefined, { phase: "expand" });
+      }
+    });
+    await expect(runMigrations(backend, [migration("i2")], { models, batchSize: 2 })).rejects.toThrow("boom on i2");
+    await runMigrations(backend, [migration()], { models, batchSize: 2 });
+    expect(await pricesIn("ddlcommit_my")).toEqual([100, 200, 300, 400]);
+  });
+
+  it("a resumed phase doesn't re-provision a column an op before the resume point dropped", async () => {
+    if (!pool) return;
+    await dropMigrationTables("resumedrop_my");
+    const backend = new MySqlBackend(pool);
+    const models = {
+      resumedrop_my: { fields: [{ name: "price", type: "integer" as const }, { name: "legacy", type: "text" as const }], indexes: [] }
+    };
+    await backend.registerModel("resumedrop_my", [], models.resumedrop_my.fields);
+    [1, 2, 3, 4].forEach((price, i) => backend.save("resumedrop_my", { uuid: `i${i}`, price, legacy: "x" }, ctx));
+    await backend.persist(ctx);
+
+    const migration = (failOn?: string) => ({
+      ...cents(failOn),
+      up: (m: MigrationBuilder) => {
+        m.dropField("resumedrop_my", "legacy");
+        m.transform("resumedrop_my", "cents", ["price"], undefined, { phase: "contract" });
+      }
+    });
+    await expect(runMigrations(backend, [migration("i2")], { models, batchSize: 2, applyContracts: true })).rejects.toThrow("boom on i2");
+    // A fresh process: its layouts still declare `legacy`.
+    await runMigrations(new MySqlBackend(pool), [migration()], { models, batchSize: 2, applyContracts: true });
+    const [columns] = (await pool.query("SHOW COLUMNS FROM `resumedrop_my`")) as unknown as [Array<{ Field: string }>];
+    expect(columns.map((column) => column.Field)).not.toContain("legacy");
+    expect(await pricesIn("resumedrop_my")).toEqual([100, 200, 300, 400]);
+  });
+
+  it("a plan previews the SQL a run will execute, following earlier ops", async () => {
+    if (!pool) return;
+    await dropMigrationTables("preview_my");
+    await pool.query("CREATE TABLE `preview_my` (`uuid` varchar(36) PRIMARY KEY, `name` longtext, `_extra` longtext)");
+    const plan = await planMigrations(new MySqlBackend(pool), [
+      {
+        name: "0001_preview",
+        up: (m) => {
+          m.renameField("preview_my", "name", "fullName", "text");
+          m.addField("preview_my", "nick", "text");
+          m.copyField("preview_my", "fullName", "nick", "text");
+        }
+      }
+    ]);
+    expect(plan.steps.map((step) => [step.op.kind, step.lowering])).toEqual([
+      ["renameField", "native"],
+      ["addField", "native"],
+      ["copyField", "native"]
+    ]);
+    expect(plan.steps[0]!.preview).toEqual(["ALTER TABLE `preview_my` RENAME COLUMN `name` TO `fullName`"]);
   });
 
   it("a unique-key clash whose value mentions the primary key is still refused", async () => {
