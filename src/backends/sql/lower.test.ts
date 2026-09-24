@@ -22,7 +22,22 @@ describe("lowering to Postgres", () => {
       })
     ).toEqual([
       `CREATE TABLE IF NOT EXISTS "User" ("uuid" text PRIMARY KEY, "name" text, "_extra" text)`,
-      `CREATE INDEX IF NOT EXISTS "by_name" ON "User" ("name")`
+      `CREATE INDEX IF NOT EXISTS "User_by_name" ON "User" ("name")` // scoped: index names are schema-global
+    ]);
+  });
+
+  it("creates a table's indexes the way provisioning does: table-scoped, and prefix-lengthed on MySQL", () => {
+    const op: MigrationOp = {
+      kind: "createModel",
+      model: "User",
+      fields: [{ name: "email", type: "text" }],
+      indexes: [
+        { name: "email", fields: [{ path: "email" }], unique: true },
+        { name: "nested", fields: [{ path: "profile.city" }] } // no column: skipped, as provisioning skips it
+      ]
+    };
+    expect((lowerToSql(op, mysqlDialect, new Set()) ?? []).map((s) => s.sql).slice(1)).toEqual([
+      "CREATE UNIQUE INDEX `User_email` ON `User` (`email`(255))"
     ]);
   });
 

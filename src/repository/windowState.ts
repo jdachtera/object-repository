@@ -19,6 +19,12 @@ export class WindowState {
   private generation = 0;
   /** Settles once the store's journal has been read; until then every declared window counts as open. */
   ready: Promise<void> = Promise.resolve();
+  /**
+   * False while the journal is being read. A model declaring a window is neither registered nor written
+   * until then: registered with every window open, a SQL store would re-create a legacy column a
+   * released contract dropped, and a write would put values back into it.
+   */
+  known = true;
 
   isClosed(model: string, legacy: string): boolean {
     return this.closed.has(key(model, legacy));

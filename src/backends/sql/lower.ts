@@ -38,11 +38,15 @@ export function lowerToSql(
   switch (op.kind) {
     case "createModel": {
       const statements = [ddl(dialect.createTable(op.model, op.fields))];
+      // Named and typed as provisioning makes them: scoped to the table (Postgres index names are
+      // schema-global, so two models' `email` indexes would collide and the second silently not exist),
+      // and with the field types, so MySQL can prefix-length a TEXT column instead of refusing it.
+      const types = new Map(op.fields.map((field) => [field.name, field.type as string]));
       for (const index of op.indexes ?? []) {
         if (index.text || index.ttlSeconds !== undefined) continue; // Mongo-only index kinds
-        statements.push(
-          ddl(dialect.createIndex(op.model, index.name, index.fields.map((f) => f.path), !!index.unique))
-        );
+        const paths = index.fields.map((f) => f.path);
+        if (!paths.every((path) => path === "uuid" || types.has(path))) continue; // no column to index
+        statements.push(ddl(dialect.createIndex(op.model, physicalIndexName(op.model, index.name), paths, !!index.unique, types)));
       }
       return statements;
     }

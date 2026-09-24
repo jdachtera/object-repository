@@ -268,16 +268,31 @@ describe("a window closes when its contract runs — not when the floor rises", 
     // A fresh process that still declares the property learns the window is closed from the journal.
     const restarted = build(backend, 7);
     expect((await restarted.users.all().filter(eq("fullName", "Ann Lee-Smith")).list())).toHaveLength(1);
+
+    // …and neither its registration nor a save made before it has read the journal re-creates or
+    // writes the legacy field.
+    const early = build(backend, 7);
+    await early.users.save(early.users.createInstance({ uuid: "u2", fullName: "Bo" })).persist();
+    const rows = await backend.query({ model: "User", where: { type: "all" }, order: [], paging: { start: 0 } }, ctx);
+    expect(rows.find((r) => r.uuid === "u2")).toEqual({ uuid: "u2", fullName: "Bo" });
+    if (backend instanceof PostgresBackend) {
+      const columns = await backend.raw(
+        { sql: `SELECT column_name FROM information_schema.columns WHERE table_name = $1`, params: ["User"] },
+        ctx
+      );
+      expect(columns.map((c) => c.column_name)).not.toContain("name");
+    }
   });
 
   it("provisions the legacy column while the window is open, whatever the floor", async () => {
     const registered: FieldSpec[][] = [];
     const backend = Object.assign(new InMemoryBackend(), {
-      registerModel: (_model: string, _indexes: unknown[], fields?: FieldSpec[]) => {
-        registered.push(fields ?? []);
+      registerModel: (model: string, _indexes: unknown[], fields?: FieldSpec[]) => {
+        if (model === "User") registered.push(fields ?? []);
       }
     }) as unknown as Backend;
-    build(backend, 7);
+    const { orm } = build(backend, 7);
+    await (orm as unknown as { windows: { ready: Promise<void> } }).windows.ready; // registered once the journal is read
     expect(registered[0]!.map((field) => field.name).sort()).toEqual(["fullName", "name"]);
   });
 });

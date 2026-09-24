@@ -116,11 +116,10 @@ async function withLease<T>(
     backend.discardPending?.();
     throw error;
   } finally {
-    // After a failed run on a transactional store, the reduced registration was made in the rolled-back
-    // transaction's scope and never reached this backend — and re-registering here would re-provision
-    // the very columns the rollback just removed.
-    const rolledBack = failed && isTransactional(backend) && backend.capabilities.transactions;
-    if (!rolledBack) await restoreRegistrations(backend, registered, options);
+    // On a transactional store `registered` holds only what committed phases registered: a failed
+    // phase's registration was made in its rolled-back scope and never reached this backend, and
+    // re-registering it here would re-provision the very columns the rollback just removed.
+    await restoreRegistrations(backend, registered, options);
     try {
       await lease?.release();
     } catch (releaseError) {
@@ -448,17 +447,31 @@ async function runPhase(
   await lease?.renew(phase === "contract");
 
   if (isTransactional(backend) && backend.capabilities.transactions) {
+    // What this phase registers, and how it moves the run's layouts, count only once it commits. Each
+    // phase commits on its own, so an earlier phase's registration stands even when a later one fails,
+    // and must still be restored when the run ends.
+    const registered = new Set<string>();
+    const layouts = options.models ? { ...options.models } : undefined;
     let journalled = false;
-    await backend.transaction(async (tx) => {
-      await executeOps(tx, migration, ops, phase, options, null, {
-        heartbeat: async () => lease?.renew(false, tx)
-      });
-      const scoped = journal.within?.(tx);
-      if (scoped) {
-        await settle(scoped, record);
-        journalled = true;
+    try {
+      await backend.transaction(async (tx) => {
+        await executeOps(tx, migration, ops, phase, { ...options, registered }, null, {
+          heartbeat: async () => lease?.renew(false, tx)
+        });
+        const scoped = journal.within?.(tx);
+        if (scoped) {
+          await settle(scoped, record);
+          journalled = true;
+        }
+      }, options.ctx);
+    } catch (error) {
+      if (options.models && layouts) {
+        for (const model of Object.keys(options.models)) delete options.models[model];
+        Object.assign(options.models, layouts);
       }
-    }, options.ctx);
+      throw error;
+    }
+    for (const model of registered) options.registered.add(model);
     if (!journalled) await settle(journal, record);
     return;
   }

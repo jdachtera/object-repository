@@ -98,6 +98,8 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
   /** Which declared windows the store has closed; shared with the manager. */
   private readonly windows: WindowState | null;
   private activeMirrors: { version: number; mirrors: Mirrors } | null = null;
+  /** Saves made before the journal was read, held until `persist` (see `enqueueSave`). */
+  private readonly deferred: Record_[] = [];
 
   constructor(
     modelName: string,
@@ -336,8 +338,23 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
   }
 
   async persist(): Promise<this> {
+    await this.flushDeferred();
     await this.backend.persist(this.ctx);
     return this;
+  }
+
+  /**
+   * Hand the backend the saves held back while the journal was being read, now that this process
+   * knows which windows are open: serialized then, a save would still write a legacy field whose
+   * window has closed.
+   */
+  private async flushDeferred(): Promise<void> {
+    if (this.deferred.length === 0) return;
+    await this.windows?.ready;
+    for (const instance of this.deferred.splice(0)) {
+      if (this.mirrors.size > 0) this.syncMirrors(instance);
+      this.write(instance);
+    }
   }
 
   /**
@@ -601,6 +618,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
 
   /** Run a (already-preprocessed) plan: fetch, materialize into the identity map, load relations. */
   private async execute(plan: QueryPlan): Promise<InferModel<P>[]> {
+    if (this.mirrors.size > 0) await this.windows?.ready; // registered, and decoding the right fields
     const rows = await this.backend.query(plan, this.ctx);
     // Two phases so every result is in the identity map before any relation loading begins —
     // that is what makes the eager cross-repository loading below cycle-safe.
@@ -797,6 +815,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     }
 
     if (missing.length > 0) {
+      if (this.mirrors.size > 0) await this.windows?.ready;
       const where = this.liveWhere(inList("uuid", missing).serialize(), options?.includeDeleted);
       const rows = await this.backend.query({ model: this.modelName, where, order: [], paging: { start: 0 } }, this.ctx);
       const created = rows.map((row) => this.materialize(row));
@@ -1149,6 +1168,16 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     const uuid = instance.uuid as Uuid;
     this.cache.setInstance(uuid, instance as InferModel<P>);
     this.maintainInverse(instance, visited);
+    // Until the journal is read, which windows are open isn't known: hold the write for `persist`.
+    if (this.mirrors.size > 0 && this.windows && !this.windows.known) {
+      if (!this.deferred.includes(instance)) this.deferred.push(instance);
+      return;
+    }
+    this.write(instance);
+  }
+
+  private write(instance: Record_): void {
+    const uuid = instance.uuid as Uuid;
     const record = this.serialize(instance);
     this.backend.save(this.modelName, record, this.ctx, this.computeDirty(uuid, record));
   }

@@ -170,17 +170,23 @@ export class RepositoryManager {
       indexes: config.indexes
     });
 
-    // Let schema-aware backends (IndexedDB, SQL) provision stores/indexes/columns from the metadata.
-    // Registered now, with every window open, so a write issued before the journal is read still
-    // lands in real columns; re-registered below once any window turns out to be closed.
-    this.register(config.name);
     if (declaresWindow(typed) && !this.windowsLoaded) {
       this.windowsLoaded = true;
-      this.windows.ready = this.refreshSchemaState().catch(() => {
-        // An unreadable journal leaves every window open: right until the contract runs, and the
-        // same state this process would have without the journal at all.
-      });
+      this.windows.known = false;
+      this.windows.ready = this.refreshSchemaState()
+        .catch(() => {
+          // An unreadable journal leaves every window open: right until the contract runs, and the
+          // same state this process would have without the journal at all.
+        })
+        .then(() => {
+          this.windows.known = true;
+          for (const [name, def] of this.defs) if (declaresWindow(def.properties)) this.register(name);
+        });
     }
+    // Let schema-aware backends (IndexedDB, SQL) provision stores/indexes/columns from the metadata.
+    // A model declaring a window waits for the journal (registered just above, once it is read):
+    // registered with every window open, it would re-create a legacy column a contract has dropped.
+    if (!declaresWindow(typed) || this.windows.known) this.register(config.name);
 
     return repository;
   }
@@ -209,6 +215,7 @@ export class RepositoryManager {
    * offers no uncommitted-read isolation.
    */
   async transaction<T>(fn: (tx: TransactionScope) => Promise<T>): Promise<T> {
+    await this.windows.ready; // so no write inside `fn` has to wait for the journal to be read
     const prevMode = this.txState.mode;
     if (isTransactional(this.backend)) {
       return this.backend.transaction(async (txBackend) => {

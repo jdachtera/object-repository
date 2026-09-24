@@ -12,6 +12,7 @@ import { exclusiveLiveDbs, requireLiveDb } from "../testing/liveDb.testutil.js";
 import pg from "pg";
 import { createPool, type Pool as MySqlPool } from "mysql2/promise";
 import type { MigrationBuilder } from "../migrations/types.js";
+import { runMigrations } from "../migrations/run.js";
 import { PostgresBackend } from "./sql/PostgresBackend.js";
 import { MySqlBackend } from "./sql/MySqlBackend.js";
 import { InMemoryBackend } from "./memory/InMemoryBackend.js";
@@ -856,6 +857,62 @@ describe("MySQL (real engine)", () => {
     expect(raced).toBe(true);
     const [rows] = (await pool.query("SELECT `uuid`, `name` FROM `race2_my`")) as unknown as [Array<{ uuid: string; name: string }>];
     expect(rows).toEqual([{ uuid: "r1", name: "mine" }]);
+  });
+
+  const dropMigrationTables = async (table: string) => {
+    for (const t of [table, "_object_repository_migration_log", "_object_repository_schema_state"]) await pool!.query(`DROP TABLE IF EXISTS \`${t}\``);
+  };
+
+  it("a migration indexes a TEXT column before the model is defined in this process", async () => {
+    if (!pool) return;
+    await dropMigrationTables("idxmig_my");
+    await pool.query("CREATE TABLE `idxmig_my` (`uuid` varchar(36) PRIMARY KEY, `email` longtext, `_extra` longtext)");
+    const backend = new MySqlBackend(pool); // fresh: nothing registered, as at a deploy step
+    const index = { name: "email", fields: [{ path: "email" }], unique: true };
+    await runMigrations(backend, [{ name: "0001_idx", up: (m) => m.addIndex("idxmig_my", index) }], {
+      models: { idxmig_my: { fields: [{ name: "email", type: "text" }], indexes: [index] } }
+    });
+    const [rows] = (await pool.query("SHOW INDEX FROM `idxmig_my` WHERE Key_name = 'idxmig_my_email'")) as unknown as [Array<{ Sub_part: number }>];
+    expect(rows.map((row) => row.Sub_part)).toEqual([255]);
+  });
+
+  it("a migration creates a model's indexes table-scoped and prefix-lengthed", async () => {
+    if (!pool) return;
+    await dropMigrationTables("newmodel_my");
+    const index = { name: "email", fields: [{ path: "email" }], unique: true };
+    await runMigrations(
+      new MySqlBackend(pool),
+      [{ name: "0001_create", up: (m) => m.createModel("newmodel_my", [{ name: "email", type: "text" }], [index]) }],
+      { models: { newmodel_my: { fields: [{ name: "email", type: "text" }], indexes: [index] } } }
+    );
+    const [rows] = (await pool.query("SHOW INDEX FROM `newmodel_my` WHERE Column_name = 'email'")) as unknown as [Array<{ Key_name: string; Sub_part: number }>];
+    expect(rows.map((row) => [row.Key_name, row.Sub_part])).toEqual([["newmodel_my_email", 255]]);
+  });
+
+  it("a field add after a registration in the same phase finds the column registration added", async () => {
+    if (!pool) return;
+    await dropMigrationTables("livecols_my");
+    await pool.query("CREATE TABLE `livecols_my` (`uuid` varchar(36) PRIMARY KEY, `name` longtext, `_extra` longtext)");
+    await pool.query("INSERT INTO `livecols_my` (`uuid`, `name`) VALUES ('l1', 'Ann')");
+    const models = { livecols_my: { fields: [{ name: "name", type: "text" as const }, { name: "tier", type: "text" as const }], indexes: [] } };
+    const report = await runMigrations(
+      new MySqlBackend(pool),
+      [
+        {
+          name: "0001_tier",
+          transforms: { touch: (row) => row },
+          up: (m) => {
+            m.addIndex("livecols_my", { name: "name", fields: [{ path: "name" }] }); // reads the columns
+            m.transform("livecols_my", "touch", ["name"]); // registers the layout: provisions `tier`
+            m.addField("livecols_my", "tier", "text", { fill: "free" });
+          }
+        }
+      ],
+      { models }
+    );
+    expect(report.applied).toEqual(["0001_tier"]);
+    const [rows] = (await pool.query("SELECT `tier` FROM `livecols_my`")) as unknown as [Array<{ tier: string }>];
+    expect(rows).toEqual([{ tier: "free" }]);
   });
 
   it("a unique-key clash whose value mentions the primary key is still refused", async () => {

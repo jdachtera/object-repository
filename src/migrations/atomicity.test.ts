@@ -26,6 +26,7 @@ import { runMigrations, rollbackMigrations } from "./run.js";
 import { acquireLock, BackendJournal, LOCK_LEASE_MS, LOCK_RENEW_MS, MigrationLockedError, SCHEMA_STATE_MODEL } from "./journal.js";
 import { everything } from "./paging.js";
 import type { Migration } from "./types.js";
+import { UniqueConstraintError } from "../backends/util/unique.js";
 import { exclusiveLiveDbs, requireLiveDb } from "../testing/liveDb.testutil.js";
 
 const ctx = SYSTEM_CONTEXT;
@@ -351,6 +352,37 @@ describe("a phase on a transactional store", () => {
     const columns = await pgPool.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'Person'`);
     expect(columns.rows.map((row: { column_name: string }) => row.column_name)).not.toContain("tier");
     expect(await new BackendJournal(backend, ctx).load()).toEqual([]);
+  });
+
+  it("restores a committed phase's registration when a later phase fails", async () => {
+    const { Pool } = newDb().adapters.createPg();
+    const backend = new PostgresBackend(new Pool(), undefined, { uniquePreCheck: true });
+    const userModels = {
+      User: { fields: [{ name: "email", type: "text" as const }], indexes: [{ name: "email", fields: [{ path: "email" }], unique: true }] }
+    };
+    await backend.registerModel("User", userModels.User.indexes, userModels.User.fields);
+    backend.save("User", { uuid: "u1", email: "a@x" }, ctx);
+    await backend.persist(ctx);
+
+    const touch: Migration = {
+      name: "0036_touch",
+      transforms: { touch: (row: JsonObject) => row }, // a record pass: registers User without its unique index
+      up: (m) => m.transform("User", "touch", ["email"])
+    };
+    const broken: Migration = {
+      name: "0037_broken",
+      transforms: {
+        explode: () => {
+          throw new Error("backfill failed");
+        }
+      },
+      up: (m) => m.transform("User", "explode", ["email"])
+    };
+    await expect(runMigrations(backend, [touch, broken], { models: userModels })).rejects.toThrow("backfill failed");
+
+    // The pre-check still knows the unique key the first, committed phase registered User without.
+    backend.save("User", { uuid: "u2", email: "a@x" }, ctx);
+    await expect(backend.persist(ctx)).rejects.toBeInstanceOf(UniqueConstraintError);
   });
 
   it("doesn't re-provision a column a contract dropped earlier in the same run", async () => {

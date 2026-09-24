@@ -165,7 +165,7 @@ export class SqlBackend
   async lowerMigrationOp(op: MigrationOp, _ctx: Context): Promise<{ rows: number } | null> {
     const present = "model" in op ? await this.liveColumns(op.model) : new Set<string>();
     if (op.kind === "dropIndex") return this.dropIndexNamed(op.model, op.index);
-    const statements = lowerToSql(op, this.dialect, present, "model" in op ? this.columnTypes(op.model) : undefined);
+    const statements = lowerToSql(op, this.dialect, present, "model" in op ? await this.indexColumnTypes(op) : undefined);
     if (!statements) return null;
 
     let rows = 0;
@@ -182,6 +182,18 @@ export class SqlBackend
     }
     if ("model" in op && changesColumns(op)) this.refreshModel(op);
     return { rows };
+  }
+
+  /**
+   * Column types for an op's index DDL. An index added by a migration usually runs before the model is
+   * defined in this process, so the declared layout may not know the column at all: read the table's
+   * physical types too — they are what decides whether MySQL needs a key-length prefix.
+   */
+  private async indexColumnTypes(op: MigrationOp & { model: string }): Promise<Map<string, string>> {
+    const types = this.columnTypes(op.model);
+    if (op.kind !== "addIndex") return types;
+    for (const field of await this.liveFieldSpecs(op.model)) types.set(field.name, field.type);
+    return types;
   }
 
   /**
@@ -755,6 +767,9 @@ export class SqlBackend
         }
       }
     }
+    // The table's columns may have just changed: a migration lowering later in this run must re-read
+    // them, or it would add a column that registration already added.
+    this.liveColumnCache.delete(model);
 
     const known = new Set(fields.map((f) => f.name));
     for (const index of this.indexes.get(model) ?? []) {
@@ -893,10 +908,10 @@ function coerce(params: JsonValue[]): unknown[] {
   });
 }
 
-/** MySQL: `CREATE INDEX` on a name that exists (1061), `DROP INDEX` on one that doesn't (1091). */
+/** MySQL: `CREATE INDEX` (standalone, or a replayed `createModel`'s) on a name that exists (1061), `DROP INDEX` on one that doesn't (1091). */
 function alreadyInTargetState(op: MigrationOp, error: unknown): boolean {
   const errno = (error as { errno?: unknown } | null)?.errno;
-  return (op.kind === "addIndex" && errno === 1061) || (op.kind === "dropIndex" && errno === 1091);
+  return ((op.kind === "addIndex" || op.kind === "createModel") && errno === 1061) || (op.kind === "dropIndex" && errno === 1091);
 }
 
 /** MySQL's duplicate-entry error (1062) on the primary key — a uuid another writer inserted first. */
