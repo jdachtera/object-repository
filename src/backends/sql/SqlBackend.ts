@@ -538,7 +538,18 @@ export class SqlBackend
       `SELECT \`uuid\` AS uuid FROM ${this.dialect.ref(model)} WHERE \`uuid\` IN (${uuids.map(() => "?").join(", ")})`,
       uuids
     );
-    const existing = new Set(found.map((row) => String(row.uuid)));
+    let existing = new Set(found.map((row) => String(row.uuid)));
+    if (existing.size) {
+      // Lock the rows that do exist — record locks by primary key, no gap locks — so a writer deleting
+      // one before the UPDATE can't turn it into a silent no-op. A row gone by now isn't locked, drops
+      // out of the set, and is inserted instead.
+      const ids = [...existing];
+      const locked = await exec.run(
+        `SELECT \`uuid\` AS uuid FROM ${this.dialect.ref(model)} WHERE \`uuid\` IN (${ids.map(() => "?").join(", ")}) FOR UPDATE`,
+        ids
+      );
+      existing = new Set(locked.map((row) => String(row.uuid)));
+    }
 
     const inserts = [...byUuid.values()].filter((change) => !existing.has(String(change.record.uuid)));
     if (inserts.length) {
@@ -891,5 +902,7 @@ function alreadyInTargetState(op: MigrationOp, error: unknown): boolean {
 /** MySQL's duplicate-entry error (1062) on the primary key — a uuid another writer inserted first. */
 function isPrimaryKeyDuplicate(error: unknown): boolean {
   const { errno, message } = (error ?? {}) as { errno?: unknown; message?: unknown };
-  return errno === 1062 && /for key '(?:[^']*\.)?PRIMARY'/.test(String(message));
+  // Anchored to the end: the message also quotes the duplicate *value*, which could itself contain
+  // "for key 'PRIMARY'" and pass a secondary-key clash off as a uuid race.
+  return errno === 1062 && /for key '(?:[^']*\.)?PRIMARY'$/.test(String(message));
 }

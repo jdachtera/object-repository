@@ -21,6 +21,9 @@ import { substitutePlan, substituteAggregate, substituteWindow, substituteNode, 
 import type { WindowState } from "./windowState.ts";
 import type { MigrationOp } from "../migrations/types.ts";
 
+/** How many rows `reloadBaselines` asks the store for at once. */
+const RELOAD_CHUNK = 500;
+
 /** Resolves a model name to its repository (the RepositoryManager registry). */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type RelationResolver = (model: string) => Repository<any> | undefined;
@@ -912,12 +915,29 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
   }
 
   /**
-   * The stored shape changed in a way this process can't replay (another process's rollback). Drop the
-   * write baselines, so a save carries nothing forward: a record loaded before then is written as the
-   * instance holds it, not with fields the store may no longer have.
+   * The stored shape changed in a way this process can't replay (another process's rollback). Re-read
+   * every baselined row from the store, so a save carries forward what the store holds now — not
+   * fields it may no longer have, and still the undeclared ones it kept. A row that has gone loses its
+   * baseline. If the store can't be read, the baselines are dropped: carrying nothing is safe, carrying
+   * stale fields is not.
    */
-  forgetBaselines(): void {
-    this.cache.clearBaselines();
+  async reloadBaselines(): Promise<void> {
+    const uuids = this.cache.baselineUuids();
+    try {
+      const found = new Map<string, JsonObject>();
+      for (let i = 0; i < uuids.length; i += RELOAD_CHUNK) {
+        const where = inList("uuid", uuids.slice(i, i + RELOAD_CHUNK)).serialize();
+        const rows = await this.backend.query({ model: this.modelName, where, order: [], paging: { start: 0 } }, this.ctx);
+        for (const row of rows) found.set(String(row.uuid), row);
+      }
+      for (const uuid of uuids) {
+        const row = found.get(uuid);
+        if (row) this.cache.setBaseline(uuid, row);
+        else this.cache.deleteBaseline(uuid);
+      }
+    } catch {
+      this.cache.clearBaselines();
+    }
     this.cache.invalidateResults();
   }
 

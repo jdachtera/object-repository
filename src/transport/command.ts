@@ -1,3 +1,4 @@
+import type { SchemaAdvertisement } from "../core/schema.ts";
 /**
  * Typed commands — the task-based RPC seam that rides the existing transport (ARCHITECTURE.md §10).
  *
@@ -94,6 +95,11 @@ export interface CommandClientOptions {
   context?: Context;
   /** Receives the change events a command produced — wire this to your data system to invalidate caches. */
   onChanges?: (changes: ChangeEvent[]) => void;
+  /**
+   * This client's schema advertisement, sent with every call. A server that declares a schema version
+   * judges each request by it; a call without one is judged as version 0.
+   */
+  schema?: SchemaAdvertisement;
 }
 
 /** Send one command over a transport, apply its change events via `onChanges`, and return the handler's value. */
@@ -102,9 +108,10 @@ export async function invokeCommand(
   name: string,
   input: unknown,
   ctx: Context,
-  onChanges?: (changes: ChangeEvent[]) => void
+  onChanges?: (changes: ChangeEvent[]) => void,
+  schema?: SchemaAdvertisement
 ): Promise<unknown> {
-  const response = await transport.request({ method: "command", params: { name, input } }, ctx);
+  const response = await transport.request({ method: "command", params: { name, input }, ...(schema ? { schema } : {}) }, ctx);
   if (!response.ok) {
     throw new CommandError(response.error?.code ?? "COMMAND_ERROR", response.error?.message ?? "Command failed.");
   }
@@ -122,7 +129,7 @@ export function commandClient<M extends CommandMap>(transport: Transport, option
   return new Proxy({} as CommandClient<M>, {
     get(_target, name) {
       if (typeof name !== "string") return undefined;
-      return (input: unknown) => invokeCommand(transport, name, input, ctx, options.onChanges);
+      return (input: unknown) => invokeCommand(transport, name, input, ctx, options.onChanges, options.schema);
     }
   });
 }

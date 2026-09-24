@@ -81,13 +81,13 @@ describe("a field dropped by another process's migration", () => {
     }
   });
 
-  it("stops carrying fields forward for a model another process rolled back", async () => {
+  it("follows another process's rollback: drops what it removed, keeps what it didn't touch", async () => {
     const dir = mkdtempSync(join(tmpdir(), "stale-baseline-"));
     try {
       const file = join(dir, "db.sqlite");
       const processA = new SQLiteBackend(new DatabaseSync(file));
       const processB = new SQLiteBackend(new DatabaseSync(file));
-      processA.save("Doc", { uuid: "d1", title: "t" }, SYSTEM_CONTEXT);
+      processA.save("Doc", { uuid: "d1", title: "t", keep: "k" }, SYSTEM_CONTEXT); // `keep` is undeclared
       await processA.persist(SYSTEM_CONTEXT);
 
       const migration = {
@@ -109,7 +109,7 @@ describe("a field dropped by another process's migration", () => {
       doc.title = "edited";
       await docs.save(doc).persist();
       const [stored] = await processB.query({ model: "Doc", where: { type: "all" }, order: [], paging: { start: 0 } }, SYSTEM_CONTEXT);
-      expect(stored).toEqual({ uuid: "d1", title: "edited" });
+      expect(stored).toEqual({ uuid: "d1", title: "edited", keep: "k" });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

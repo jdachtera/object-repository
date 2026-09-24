@@ -821,6 +821,55 @@ describe("MySQL (real engine)", () => {
     expect(idx[0]?.Sub_part).toBe(255);
   });
 
+  it("a row another writer deletes between the check and the update is written, not silently lost", async () => {
+    if (!pool) return;
+    await pool.query("DROP TABLE IF EXISTS `race2_my`");
+    const plain = new MySqlBackend(pool);
+    await plain.registerModel("race2_my", [], [{ name: "name", type: "text" }]);
+    plain.save("race2_my", { uuid: "r1", name: "old" }, ctx);
+    await plain.persist(ctx);
+
+    let raced = false;
+    const racing = new MySqlBackend({
+      query: (sql: string, params: unknown[]) => pool!.query(sql, params),
+      getConnection: async () => {
+        const conn = await pool!.getConnection();
+        return {
+          query: async (sql: string, params: unknown[]) => {
+            const result = await conn.query(sql, params);
+            if (!raced && sql.startsWith("SELECT `uuid`") && !sql.includes("FOR UPDATE")) {
+              raced = true;
+              await pool!.query("DELETE FROM `race2_my` WHERE `uuid` = 'r1'"); // another writer
+            }
+            return result;
+          },
+          beginTransaction: () => conn.beginTransaction(),
+          commit: () => conn.commit(),
+          rollback: () => conn.rollback(),
+          release: () => conn.release()
+        };
+      }
+    } as never);
+    await racing.registerModel("race2_my", [], [{ name: "name", type: "text" }]);
+    racing.save("race2_my", { uuid: "r1", name: "mine" }, ctx);
+    await racing.persist(ctx);
+    expect(raced).toBe(true);
+    const [rows] = (await pool.query("SELECT `uuid`, `name` FROM `race2_my`")) as unknown as [Array<{ uuid: string; name: string }>];
+    expect(rows).toEqual([{ uuid: "r1", name: "mine" }]);
+  });
+
+  it("a unique-key clash whose value mentions the primary key is still refused", async () => {
+    if (!pool) return;
+    await pool.query("DROP TABLE IF EXISTS `uniq2_my`");
+    const orm = new RepositoryManager({ backend: new MySqlBackend(pool) });
+    const users = orm.define({ name: "uniq2_my", properties: { email: text({ unique: true }) } });
+    const tricky = "x' for key 'PRIMARY";
+    await users.save(users.createInstance({ email: tricky })).persist();
+    users.save(users.createInstance({ email: tricky }));
+    await expect(users.persist()).rejects.toThrow(/Duplicate entry/);
+    expect(await users.all().count()).toBe(1);
+  });
+
   it("a concurrent writer inserting the same new uuid first settles as last-write-wins, not an error", async () => {
     if (!pool) return;
     await pool.query("DROP TABLE IF EXISTS `race_my`");

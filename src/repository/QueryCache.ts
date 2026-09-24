@@ -50,6 +50,10 @@ export class QueryCache<T> {
   editBaselines(edit: (record: JsonObject) => void): void {
     for (const record of this.baseline.values()) edit(record);
   }
+  /** The uuids that have a write baseline. */
+  baselineUuids(): Uuid[] {
+    return [...this.baseline.keys()];
+  }
   clearBaselines(): void {
     this.baseline.clear();
   }

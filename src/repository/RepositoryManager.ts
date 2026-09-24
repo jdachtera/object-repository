@@ -332,12 +332,14 @@ export class RepositoryManager {
       }
       // A row that has gone was rolled back — elsewhere, since this process's own rollbacks report
       // each reverted migration as it goes. Its `down` isn't journalled, so what it changed can't be
-      // replayed: stop carrying anything forward for the models it touched.
+      // replayed: re-read what the store now holds for the models it touched.
       const current = new Set(applied.map(journalKey));
+      const touched = new Set<string>();
       for (const [key, row] of this.seenApplied) {
         if (current.has(key)) continue;
-        for (const op of row.ops) if ("model" in op) this.registry.get(op.model)?.forgetBaselines();
+        for (const op of row.ops) if ("model" in op) touched.add(op.model);
       }
+      for (const model of touched) await this.registry.get(model)?.reloadBaselines();
     }
     this.seenApplied = new Map(applied.map((row) => [journalKey(row), row]));
     const changed = this.windows.update(rows);
@@ -438,6 +440,8 @@ export class RepositoryManager {
   commands<M extends CommandMap>(transport: Transport): CommandClient<M> {
     return commandClient<M>(transport, {
       context: this.ctx,
+      // A server that declares a schema version checks every request, commands included.
+      schema: { fingerprint: this.fingerprint(), ...(this.schema ?? {}) },
       onChanges: (events) => {
         // Route into the backend's change feed when it can receive them (a RemoteBackend); for an
         // in-process backend the command already ran against it, so its own feed fired the events.

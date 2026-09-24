@@ -144,3 +144,22 @@ describe("per-request enforcement over the backend transport", () => {
     await expect(query).rejects.toBeInstanceOf(SchemaMismatchError); // one instanceof catches every refusal
   });
 });
+
+describe("commands under a versioned server", () => {
+  it("are served for an up-to-date client, and refused for a stale one", async () => {
+    const { BackendAdapter } = await import("./BackendAdapter.js");
+    const { InProcessTransport } = await import("./InProcessTransport.js");
+    const { InMemoryBackend } = await import("../backends/memory/InMemoryBackend.js");
+    const { RepositoryManager } = await import("../repository/RepositoryManager.js");
+    const { command } = await import("./command.js");
+    const commands = { ping: command({ handler: async () => "pong" }) };
+    const adapter = new BackendAdapter(new InMemoryBackend(), undefined, commands, undefined, undefined, { schemaVersion: 3 });
+    const transport = new InProcessTransport(adapter);
+
+    const current = new RepositoryManager({ schema: { schemaVersion: 3 } }).commands<typeof commands>(transport);
+    await expect(current.ping(undefined)).resolves.toBe("pong");
+
+    const stale = new RepositoryManager({ schema: { schemaVersion: 1 } }).commands<typeof commands>(transport);
+    await expect(stale.ping(undefined)).rejects.toMatchObject({ code: "SCHEMA_TOO_OLD" });
+  });
+});
