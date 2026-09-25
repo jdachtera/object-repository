@@ -197,13 +197,15 @@ export class SqlBackend
       data = deferred;
       result = { rows: await this.runStatements(op, statements.filter((statement) => !deferred.includes(statement)), this.exec) };
     }
+    // The DDL has run (and, on MySQL, committed): follow the table's new shape now, before anything
+    // that can still fail — a stale layout would name a dropped column on every later write.
+    if ("model" in op && changesColumns(op)) this.refreshModel(op);
     if (record) {
       await this.transaction(async (tx) => {
         result!.rows += await this.runStatements(op, data, (tx as SqlBackend).exec);
         await record(tx);
       }, ctx);
     }
-    if ("model" in op && changesColumns(op)) this.refreshModel(op);
     return result;
   }
 

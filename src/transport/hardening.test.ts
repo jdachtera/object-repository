@@ -145,6 +145,32 @@ describe("a current client's change feed, end to end", () => {
     }
   });
 
+  it("over WebSocket, after the connection drops and reconnects", async () => {
+    const adapter = serve();
+    const store = (adapter as unknown as { backend: InMemoryBackend }).backend;
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    attachWebSocketServer(wss, adapter);
+    await new Promise<void>((r) => wss.on("listening", r));
+    const transport = new WebSocketTransport(`ws://127.0.0.1:${(wss.address() as AddressInfo).port}`, { WebSocket: WsClient as never });
+    const remote = new RemoteBackend(transport, store.capabilities);
+    try {
+      const seen: string[] = [];
+      remote.changes((event) => seen.push(event.uuid), SYSTEM_CONTEXT);
+      await remote.handshake("fp", SYSTEM_CONTEXT, schema);
+      for (const socket of wss.clients) socket.terminate();
+      await new Promise((r) => setTimeout(r, 50));
+      await remote.query({ model: "Note", where: { type: "all" }, order: [], paging: { start: 0 } }, SYSTEM_CONTEXT); // reconnects
+      await new Promise((r) => setTimeout(r, 50));
+      store.save("Note", { uuid: "n2" }, SYSTEM_CONTEXT);
+      await store.persist(SYSTEM_CONTEXT);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(seen).toEqual(["n2"]);
+    } finally {
+      transport.close();
+      wss.close();
+    }
+  });
+
   it("over HTTP", async () => {
     const adapter = serve();
     const store = (adapter as unknown as { backend: InMemoryBackend }).backend;

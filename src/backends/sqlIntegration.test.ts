@@ -1038,6 +1038,28 @@ describe("MySQL (real engine)", () => {
     expect(copy.lowering).toBe("native"); // the rename's drop of `name` is withheld: `name` is still there
   });
 
+  it("follows a committed column drop even when journalling it then fails", async () => {
+    if (!pool) return;
+    await dropMigrationTables("stalecols_my");
+    const backend = new MySqlBackend(pool);
+    const models = { stalecols_my: { fields: [{ name: "name", type: "text" as const }, { name: "legacy", type: "text" as const }], indexes: [] } };
+    await backend.registerModel("stalecols_my", [], models.stalecols_my.fields);
+    backend.save("stalecols_my", { uuid: "s1", name: "a", legacy: "x" }, ctx);
+    await backend.persist(ctx);
+
+    const transaction = backend.transaction.bind(backend);
+    backend.transaction = async () => {
+      throw new Error("connection lost"); // the journal write after the DDL
+    };
+    await expect(
+      runMigrations(backend, [{ name: "0001_drop", up: (m) => m.dropField("stalecols_my", "legacy") }], { models, applyContracts: true, skipLock: true })
+    ).rejects.toThrow("connection lost");
+    backend.transaction = transaction;
+
+    backend.save("stalecols_my", { uuid: "s2", name: "b" }, ctx);
+    await expect(backend.persist(ctx)).resolves.toBeDefined(); // not "Unknown column 'legacy'"
+  });
+
   it("a unique-key clash whose value mentions the primary key is still refused", async () => {
     if (!pool) return;
     await pool.query("DROP TABLE IF EXISTS `uniq2_my`");
