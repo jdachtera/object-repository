@@ -210,7 +210,10 @@ async function rewrite(
     const writes: Array<{ remove: JsonObject } | { save: JsonObject; dirty: string[] }> = [];
     try {
       for (const row of page.rows) {
-        const next = change(row);
+        // A transform gets its own copy: one that edits a nested value in place would otherwise edit
+        // `row` too, and the diff against it — what a store that writes only changed fields relies
+        // on — would find nothing to write.
+        const next = change(op.kind === "transform" ? structuredClone(row) : row);
         if (next === null) {
           if (!removeOnNull) continue; // unchanged — skip, which is what makes a re-run free
           if (op.kind === "transform" && op.phase === "expand") {

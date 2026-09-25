@@ -116,9 +116,12 @@ describe("a current client's change feed, end to end", () => {
   const schema = { schemaVersion: 7, minSupportedSchemaVersion: 7 };
   const serve = () => new BackendAdapter(new InMemoryBackend(), undefined, undefined, undefined, undefined, schema);
   const receive = async (remote: RemoteBackend, store: InMemoryBackend) => {
-    await remote.handshake("fp", SYSTEM_CONTEXT, schema);
+    // The documented order: a repository subscribes when it is defined, before the handshake that needs
+    // every model defined for its fingerprint.
     const seen: string[] = [];
     const stop = remote.changes((event) => seen.push(event.uuid), SYSTEM_CONTEXT);
+    await new Promise((r) => setTimeout(r, 50));
+    await remote.handshake("fp", SYSTEM_CONTEXT, schema);
     await new Promise((r) => setTimeout(r, 50));
     store.save("Note", { uuid: "n1" }, SYSTEM_CONTEXT);
     await store.persist(SYSTEM_CONTEXT);

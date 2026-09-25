@@ -248,6 +248,35 @@ describe("a model created by the migration itself", () => {
   });
 });
 
+describe("a transform that edits a nested value in place", () => {
+  it("is written, not lost to a diff against the value it edited", async () => {
+    const { Pool } = newDb().adapters.createPg();
+    const backend = new PostgresBackend(new Pool());
+    const models = { Doc: { fields: [{ name: "meta", type: "embedded" as const }], indexes: [] } };
+    await backend.registerModel("Doc", [], models.Doc.fields);
+    backend.save("Doc", { uuid: "d1", meta: { count: 1 } }, ctx);
+    await backend.persist(ctx);
+    await runMigrations(
+      backend,
+      [
+        {
+          name: "0060_bump",
+          transforms: {
+            bump: (row: JsonObject) => {
+              (row.meta as { count: number }).count += 1; // in place
+              return row;
+            }
+          },
+          up: (m) => m.transform("Doc", "bump", ["meta"])
+        }
+      ],
+      { models, skipLock: true }
+    );
+    const [doc] = await backend.query({ model: "Doc", where: everything(), order: [], paging: { start: 0 } }, ctx);
+    expect(doc!.meta).toEqual({ count: 2 });
+  });
+});
+
 describe("a plan against a store that has never been migrated", () => {
   it("creates nothing on SQL, so a read-only login can run it", async () => {
     const statements: string[] = [];

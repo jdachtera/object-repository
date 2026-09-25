@@ -57,6 +57,14 @@ export class RemoteBackend implements Backend {
     const params: SchemaAdvertisement = { fingerprint, ...(schema ?? {}) };
     this.advertisement = params;
     expect(await this.transport.request({ method: "handshake", params: { ...params } }, ctx));
+    // A change feed opened before this (a repository subscribes when it is defined, and the fingerprint
+    // needs every model defined) went out without the advertisement, and a versioned server refused
+    // it. Reopen it with the advertisement, so it delivers events from here on.
+    if (this.subscription) {
+      this.subscription();
+      this.subscription = undefined;
+      this.openFeed(ctx);
+    }
   }
 
   private send(request: WireRequest, ctx: Context): Promise<WireResponse> {
@@ -110,13 +118,7 @@ export class RemoteBackend implements Backend {
     // One shared upstream subscription fans out to every listener; opened lazily, closed when the
     // last listener leaves. Transports without push (plain HTTP) simply never deliver upstream events
     // — but `deliverChanges` (command replies) still reaches the listeners.
-    if (!this.subscription && this.transport.subscribe) {
-      this.subscription = this.transport.subscribe(
-        { method: "changes", params: {}, ...(this.advertisement ? { schema: this.advertisement } : {}) },
-        (event) => this.fanout(event as ChangeEvent),
-        ctx
-      );
-    }
+    if (!this.subscription) this.openFeed(ctx);
     return () => {
       this.listeners.delete(listener);
       if (this.listeners.size === 0 && this.subscription) {
@@ -124,6 +126,16 @@ export class RemoteBackend implements Backend {
         this.subscription = undefined;
       }
     };
+  }
+
+  /** Open the one upstream subscription, carrying this client's schema advertisement once known. */
+  private openFeed(ctx: Context): void {
+    if (!this.transport.subscribe) return;
+    this.subscription = this.transport.subscribe(
+      { method: "changes", params: {}, ...(this.advertisement ? { schema: this.advertisement } : {}) },
+      (event) => this.fanout(event as ChangeEvent),
+      ctx
+    );
   }
 
   /**
