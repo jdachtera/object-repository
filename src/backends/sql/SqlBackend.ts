@@ -30,7 +30,7 @@ import type {
 } from "../../core/Backend.ts";
 import type { Capabilities, Context, JsonObject, JsonValue, Uuid } from "../../core/types.ts";
 import type { MigrationOp } from "../../migrations/types.ts";
-import { changesColumns, lowerToSql, type Statement } from "./lower.ts";
+import { changesColumns, lowerToSql, retypeThenRewrite, type Statement } from "./lower.ts";
 import type { AggregatePlan, AggregateResultRow, QueryPlan, WindowPlan } from "../../core/QueryPlan.ts";
 import { generateUuid } from "../../core/uuid.ts";
 import { reduceAggregatePlan } from "../../expressions/aggregateReduce.ts";
@@ -197,6 +197,13 @@ export class SqlBackend
     } else {
       const statements = lowerToSql(op, this.dialect, present, "model" in op ? await this.indexColumnTypes(op) : undefined);
       if (!statements) return null;
+      if (retypeThenRewrite(op)) {
+        // Convert the column natively, then decline: the reference pass rewrites each value into
+        // `coerce()`'s text form (safe to repeat, so no journalling needed here).
+        await this.runStatements(op, statements, this.exec);
+        if ("model" in op) this.refreshModel(op);
+        return null;
+      }
       const deferred = record && this.exec.transaction ? statements.filter(isDataStatement) : [];
       data = deferred;
       result = { rows: await this.runStatements(op, statements.filter((statement) => !deferred.includes(statement)), this.exec) };
@@ -230,13 +237,14 @@ export class SqlBackend
   }
 
   /**
-   * Column types for an op's index DDL. An index added by a migration usually runs before the model is
-   * defined in this process, so the declared layout may not know the column at all: read the table's
-   * physical types too — they are what decides whether MySQL needs a key-length prefix.
+   * Column types an op's lowering depends on. An index added by a migration usually runs before the
+   * model is defined in this process, so the declared layout may not know the column at all: read the
+   * table's physical types too — they decide whether MySQL needs a key-length prefix, and whether a
+   * copy between two columns is a plain assignment or needs converting value by value.
    */
   private async indexColumnTypes(op: MigrationOp & { model: string }): Promise<Map<string, string>> {
     const types = this.columnTypes(op.model);
-    if (op.kind !== "addIndex") return types;
+    if (op.kind !== "addIndex" && op.kind !== "copyField") return types;
     for (const field of await this.liveFieldSpecs(op.model)) types.set(field.name, field.type);
     return types;
   }

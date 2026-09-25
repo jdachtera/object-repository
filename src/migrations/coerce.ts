@@ -43,7 +43,11 @@ export function coerce(value: JsonValue, to: StoredType, from?: StoredType): Jso
   if (from === to) return value;
   switch (to) {
     case "text":
-      return typeof value === "string" ? value : stringify(value);
+      if (typeof value !== "string") return stringify(value);
+      // Already text, but a float an engine rendered its own way (`1e+15`, `1e-07`): the text form is
+      // JavaScript's, whoever converted it — and normalising again changes nothing.
+      if (from === "float" && value.trim() !== "" && Number.isFinite(Number(value))) return String(Number(value));
+      return value;
     case "float":
     case "date":
       return toNumber(value, to);

@@ -48,7 +48,10 @@ const SEED: JsonObject[] = [
   { uuid: "a", legacy: "L-a", canonical: "C-a", n: 1, keep: true, qty: 1, ratio: 1.5, tags: ["x"], note: "hello" },
   { uuid: "b", legacy: "L-b", n: 2, keep: false, qty: 2, ratio: 0.25, tags: [], note: "42" },
   { uuid: "c", n: 3, keep: true },
-  { uuid: "d", legacy: "L-d", canonical: "C-d", n: 4, keep: true, qty: -7, ratio: 2, tags: ["y", "z"], note: 'say "hi"' }
+  { uuid: "d", legacy: "L-d", canonical: "C-d", n: 4, keep: true, qty: -7, ratio: 2, tags: ["y", "z"], note: 'say "hi"', code: "12" },
+  // Floats an engine renders as text its own way (`1e+15`, `1e-07`), where `String()` doesn't.
+  { uuid: "e", n: 5, keep: false, ratio: 1e15, code: "5" },
+  { uuid: "f", n: 6, keep: false, ratio: 1e-7 }
 ];
 
 /**
@@ -65,7 +68,8 @@ const BEFORE: FieldSpec[] = [
   { name: "qty", type: "integer" },
   { name: "ratio", type: "float" },
   { name: "tags", type: "array" },
-  { name: "note", type: "text" }
+  { name: "note", type: "text" },
+  { name: "code", type: "text" }
 ];
 
 /** `BEFORE` with one field's type changed — the layout after a retype. */
@@ -174,6 +178,10 @@ const CASES: Case[] = [
     label: "a replayed createModel over an existing table",
     migration: { name: "m", up: (m) => m.createModel(MODEL, [{ name: "legacy", type: "text" }]) },
     skip: { "Postgres (pg-mem)": "pg-mem can't plan CREATE TABLE IF NOT EXISTS over an existing table; real Postgres runs this case" }
+  },
+  {
+    label: "copyField from text into an integer field converts each value",
+    migration: { name: "m", up: (m) => m.copyField(MODEL, "code", "qty", "integer", { overwrite: true }) }
   },
   {
     label: "copyField into a text field converts the value",

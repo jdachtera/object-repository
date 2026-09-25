@@ -85,6 +85,10 @@ export function lowerToSql(
 
     case "copyField": {
       if (!present.has(op.from) || !present.has(op.to)) return null;
+      // Between columns of different types a plain assignment is the engine's cast, not `coerce()`:
+      // it refuses text → bigint, rounds 1.5 into an integer, or reads 'abc' as 0. Let the reference
+      // convert each value instead.
+      if (columnTypes && columnTypes.get(op.from) !== columnTypes.get(op.to)) return null;
       const from = dialect.column(op.from);
       const to = dialect.column(op.to);
       // `from IS NOT NULL` mirrors the reference, which skips a record whose source field is absent —
@@ -118,6 +122,15 @@ export function lowerToSql(
       // A user-supplied JavaScript function has no SQL form.
       return null;
   }
+}
+
+/**
+ * A retype whose DDL converts the column but whose stored values then need the reference pass: a
+ * float's text as the engine renders it (`1e+15`, `1e-07`) isn't `coerce()`'s `String(value)`. The
+ * backend runs the returned DDL and declines the op, so the reference rewrites each value.
+ */
+export function retypeThenRewrite(op: MigrationOp): boolean {
+  return op.kind === "retypeField" && op.from === "float" && op.to === "text";
 }
 
 /** Which ops change a table's column set, so the backend must refresh what it thinks the layout is. */
