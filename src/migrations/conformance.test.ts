@@ -51,7 +51,10 @@ const SEED: JsonObject[] = [
   { uuid: "d", legacy: "L-d", canonical: "C-d", n: 4, keep: true, qty: -7, ratio: 2, tags: ["y", "z"], note: 'say "hi"', code: "12" },
   // Floats an engine renders as text its own way (`1e+15`, `1e-07`), where `String()` doesn't.
   { uuid: "e", n: 5, keep: false, ratio: 1e15, code: "5" },
-  { uuid: "f", n: 6, keep: false, ratio: 1e-7 }
+  { uuid: "f", n: 6, keep: false, ratio: 1e-7 },
+  // Stored nulls: unset, as a NULL column is — a null target is filled, a null source copies nothing.
+  { uuid: "g", n: 7, keep: true, legacy: null, canonical: "C-g", note: null },
+  { uuid: "h", n: 8, keep: true, legacy: "L-h", canonical: null }
 ];
 
 /**

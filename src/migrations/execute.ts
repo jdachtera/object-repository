@@ -106,8 +106,9 @@ export async function applyOp(backend: Backend, op: MigrationOp, options: Execut
     case "addField":
       // Without a fill there is nothing to write: an absent field already reads as absent everywhere.
       if (op.fill === undefined) return { rows: 0 };
+      // A stored null is unset, as SQL's `WHERE col IS NULL` has it: filled like an absent field.
       return rewrite(backend, op, options, [op.field], (record) => {
-        if (record[op.field] !== undefined) return null;
+        if (record[op.field] != null) return null;
         return { ...record, [op.field]: coerce(cloneValue(op.fill as JsonValue), op.type) };
       });
 
@@ -120,9 +121,11 @@ export async function applyOp(backend: Backend, op: MigrationOp, options: Execut
       });
 
     case "copyField":
+      // Null and absent are one state, as in a SQL column (`IS NULL`): a null target is unset and gets
+      // the copy, and a null source is nothing to copy.
       return rewrite(backend, op, options, [op.to], (record) => {
-        if (!op.overwrite && record[op.to] !== undefined) return null;
-        if (record[op.from] === undefined) {
+        if (!op.overwrite && record[op.to] != null) return null;
+        if (record[op.from] == null) {
           if (!op.exact || record[op.to] === undefined) return null;
           const next = { ...record };
           delete next[op.to]; // an older build cleared the source: the copy is cleared with it
@@ -134,6 +137,12 @@ export async function applyOp(backend: Backend, op: MigrationOp, options: Execut
     case "renameField":
       return rewrite(backend, op, options, [op.from, op.to], (record) => {
         if (record[op.from] === undefined) return null;
+        if (record[op.from] === null) {
+          // Unset, as a NULL column is: the old key goes, and nothing is carried to the new one.
+          const next = { ...record };
+          delete next[op.from];
+          return next;
+        }
         const next = { ...record, [op.to]: coerce(cloneValue(record[op.from] as JsonValue), op.type) };
         delete next[op.from];
         return next;

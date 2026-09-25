@@ -90,12 +90,13 @@ describe("applyOp — reference semantics", () => {
     ]);
   });
 
-  it("copyField distinguishes a stored null from an absent key", async () => {
-    const backend = await seeded([{ uuid: "a", from: null }, { uuid: "b" }]);
+  it("copyField treats a stored null as unset, as a SQL column's NULL is", async () => {
+    const backend = await seeded([{ uuid: "a", from: null }, { uuid: "b" }, { uuid: "c", from: "x", to: null }]);
     await applyOp(backend, { kind: "copyField", model: "M", from: "from", to: "to", type: "text", overwrite: false }, options());
 
-    // `null` is a value and copies; an absent key has nothing to copy.
-    expect(await readAll(backend)).toEqual([{ uuid: "a", from: null, to: null }, { uuid: "b" }]);
+    // A null source has nothing to copy; a null target is unset, so it is filled. SQL can't tell null
+    // from absent (a NULL column reads back as absent), so this is the only semantics every store shares.
+    expect(await readAll(backend)).toEqual([{ uuid: "a", from: null }, { uuid: "b" }, { uuid: "c", from: "x", to: "x" }]);
   });
 
   it("renameField moves the value and removes the old key", async () => {
