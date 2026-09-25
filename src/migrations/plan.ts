@@ -103,12 +103,13 @@ export async function planMigrations(
 }
 
 /**
- * Which steps would be realized natively, and what that would look like. Those still to run are
- * previewed in order against the store's current shape; one already applied stays as recorded.
+ * Which steps would be realized natively, and what that would look like. Only the steps this run
+ * will execute are previewed, in order, against the store's current shape: a withheld contract
+ * changes nothing, so its effect must not reach the steps after it.
  */
 async function describeLowering(backend: Backend, steps: PlanStep[]): Promise<void> {
   if (!isMigrationLowering(backend) || !backend.previewMigrationOps) return;
-  const toRun = steps.filter((step) => step.status !== "applied");
+  const toRun = steps.filter((step) => step.status === "pending");
   const previews = await backend.previewMigrationOps(toRun.map((step) => step.op));
   toRun.forEach((step, index) => {
     const preview = previews[index] ?? [];

@@ -10,11 +10,123 @@ import { InMemoryBackend } from "../backends/memory/InMemoryBackend.js";
 import { BackendAdapter } from "./BackendAdapter.js";
 import { createRequestListener } from "./http/createRequestListener.js";
 import { attachWebSocketServer } from "./ws/attachWebSocketServer.js";
+import { SCHEMA_HEADER } from "../core/Transport.js";
+import { RemoteBackend } from "./RemoteBackend.js";
+import { HttpTransport } from "./http/HttpTransport.js";
+import { WebSocketTransport } from "./ws/WebSocketTransport.js";
 import { HybridLogicalClock } from "../sync/hlc.js";
 import { RepositoryManager } from "../repository/RepositoryManager.js";
 import { text } from "../properties/factories.js";
 import { eq } from "../expressions/builders.js";
 import { SYSTEM_CONTEXT } from "../core/types.js";
+
+describe("the change feed judges a subscriber's schema as a request would be judged", () => {
+  const versioned = () =>
+    new BackendAdapter(new InMemoryBackend(), undefined, undefined, undefined, undefined, { schemaVersion: 7, minSupportedSchemaVersion: 7 });
+
+  it("refuses an SSE subscriber below the floor, and streams to a current one", async () => {
+    const server: Server = createServer(createRequestListener(versioned()));
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const { port } = server.address() as AddressInfo;
+    try {
+      const stale = await fetch(`http://127.0.0.1:${port}/changes`, { headers: { [SCHEMA_HEADER]: JSON.stringify({ schemaVersion: 5 }) } });
+      expect(stale.status).toBe(409);
+      expect(await stale.json()).toMatchObject({ error: { code: "SCHEMA_TOO_OLD" } });
+      const none = await fetch(`http://127.0.0.1:${port}/changes`);
+      expect(none.status).toBe(409); // no advertisement counts as the oldest
+      const controller = new AbortController();
+      const current = await fetch(`http://127.0.0.1:${port}/changes`, {
+        headers: { [SCHEMA_HEADER]: JSON.stringify({ schemaVersion: 7 }) },
+        signal: controller.signal
+      });
+      expect(current.status).toBe(200);
+      controller.abort();
+    } finally {
+      server.closeAllConnections();
+      server.close();
+    }
+  });
+
+  it("sends a WebSocket subscriber events only once it advertises an accepted schema", async () => {
+    const store = new InMemoryBackend();
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    attachWebSocketServer(
+      wss,
+      new BackendAdapter(store, undefined, undefined, undefined, undefined, { schemaVersion: 7, minSupportedSchemaVersion: 7 })
+    );
+    await new Promise<void>((r) => wss.on("listening", r));
+    const url = `ws://127.0.0.1:${(wss.address() as AddressInfo).port}`;
+    const connect = async () => {
+      const client = new WsClient(url);
+      const frames: Array<Record<string, unknown>> = [];
+      client.on("message", (d) => frames.push(JSON.parse(String(d)) as Record<string, unknown>));
+      await new Promise<void>((r) => client.on("open", () => r()));
+      return { client, frames };
+    };
+    const settle = () => new Promise((r) => setTimeout(r, 50));
+    try {
+      const stale = await connect();
+      const current = await connect();
+      stale.client.send(JSON.stringify({ type: "subscribe", schema: { schemaVersion: 5 } }));
+      current.client.send(JSON.stringify({ type: "subscribe", schema: { schemaVersion: 7 } }));
+      await settle();
+      store.save("Note", { uuid: "n1" }, SYSTEM_CONTEXT);
+      await store.persist(SYSTEM_CONTEXT);
+      await settle();
+      expect(stale.frames).toEqual([{ type: "error", error: expect.objectContaining({ code: "SCHEMA_TOO_OLD" }) }]);
+      expect(current.frames).toEqual([{ type: "event", event: expect.objectContaining({ model: "Note", uuid: "n1" }) }]);
+      stale.client.close();
+      current.client.close();
+    } finally {
+      wss.close();
+    }
+  });
+});
+
+describe("a current client's change feed, end to end", () => {
+  const schema = { schemaVersion: 7, minSupportedSchemaVersion: 7 };
+  const serve = () => new BackendAdapter(new InMemoryBackend(), undefined, undefined, undefined, undefined, schema);
+  const receive = async (remote: RemoteBackend, store: InMemoryBackend) => {
+    await remote.handshake("fp", SYSTEM_CONTEXT, schema);
+    const seen: string[] = [];
+    const stop = remote.changes((event) => seen.push(event.uuid), SYSTEM_CONTEXT);
+    await new Promise((r) => setTimeout(r, 50));
+    store.save("Note", { uuid: "n1" }, SYSTEM_CONTEXT);
+    await store.persist(SYSTEM_CONTEXT);
+    await new Promise((r) => setTimeout(r, 50));
+    stop();
+    return seen;
+  };
+
+  it("over WebSocket", async () => {
+    const adapter = serve();
+    const store = (adapter as unknown as { backend: InMemoryBackend }).backend;
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    attachWebSocketServer(wss, adapter);
+    await new Promise<void>((r) => wss.on("listening", r));
+    const transport = new WebSocketTransport(`ws://127.0.0.1:${(wss.address() as AddressInfo).port}`, { WebSocket: WsClient as never });
+    try {
+      expect(await receive(new RemoteBackend(transport, store.capabilities), store)).toEqual(["n1"]);
+    } finally {
+      transport.close();
+      wss.close();
+    }
+  });
+
+  it("over HTTP", async () => {
+    const adapter = serve();
+    const store = (adapter as unknown as { backend: InMemoryBackend }).backend;
+    const server: Server = createServer(createRequestListener(adapter));
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    try {
+      const transport = new HttpTransport(`http://127.0.0.1:${(server.address() as AddressInfo).port}`);
+      expect(await receive(new RemoteBackend(transport, store.capabilities), store)).toEqual(["n1"]);
+    } finally {
+      server.closeAllConnections();
+      server.close();
+    }
+  });
+});
 
 describe("WebSocket server survives malformed frames (no process crash)", () => {
   it("ignores a garbage frame and still answers the next valid request", async () => {

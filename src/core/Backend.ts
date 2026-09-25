@@ -149,6 +149,16 @@ export interface MigrationLoweringBackend {
   /** Realize `op` natively, or resolve `null` to decline and let the reference executor handle it. */
   lowerMigrationOp(op: MigrationOp, ctx: Context): Promise<{ rows: number } | null>;
   /**
+   * `lowerMigrationOp`, with `record` committed in the same transaction as the op's data changes, so
+   * a runner can journal the op as done atomically with it. For a store whose transactions can't hold
+   * DDL (MySQL): the op's DDL, written to be safe to repeat, runs first; the rest can't run twice.
+   */
+  lowerMigrationOpRecorded?(
+    op: MigrationOp,
+    ctx: Context,
+    record: (tx: Backend) => Promise<void>
+  ): Promise<{ rows: number } | null>;
+  /**
    * Render the native form of each op, in order, for a plan preview — `[]` for one that would run
    * generically. Reads the store's current shape and follows the ops' effect on it, so a later op sees
    * what an earlier one did. Never changes anything.

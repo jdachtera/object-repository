@@ -997,6 +997,47 @@ describe("MySQL (real engine)", () => {
     expect(plan.steps[0]!.preview).toEqual(["ALTER TABLE `preview_my` RENAME COLUMN `name` TO `fullName`"]);
   });
 
+  it("a native JSON-quoting retype isn't run again when a later op in its phase fails", async () => {
+    if (!pool) return;
+    await dropMigrationTables("retypecrash_my");
+    const backend = new MySqlBackend(pool);
+    const before = { retypecrash_my: { fields: [{ name: "name", type: "text" as const }, { name: "price", type: "integer" as const }], indexes: [] } };
+    await backend.registerModel("retypecrash_my", [], before.retypecrash_my.fields);
+    ["a", "b", "c", "d"].forEach((name, i) => backend.save("retypecrash_my", { uuid: `i${i}`, name, price: i + 1 }, ctx));
+    await backend.persist(ctx);
+
+    const models = { retypecrash_my: { fields: [{ name: "name", type: "json" as const }, { name: "price", type: "integer" as const }], indexes: [] } };
+    const migration = (failOn?: string) => ({
+      ...cents(failOn),
+      up: (m: MigrationBuilder) => {
+        m.retypeField("retypecrash_my", "name", "text", "json"); // native: UPDATE … JSON_QUOTE
+        m.transform("retypecrash_my", "cents", ["price"], undefined, { phase: "expand" });
+      }
+    });
+    // Fails on the transform's first page: nothing after the retype has been journalled yet.
+    await expect(runMigrations(backend, [migration("i0")], { models, batchSize: 2 })).rejects.toThrow("boom on i0");
+    await runMigrations(new MySqlBackend(pool), [migration()], { models, batchSize: 2 });
+    const [rows] = (await pool.query("SELECT `name` FROM `retypecrash_my` ORDER BY `uuid`")) as unknown as [Array<{ name: string }>];
+    expect(rows.map((row) => row.name)).toEqual(['"a"', '"b"', '"c"', '"d"']);
+    expect(await pricesIn("retypecrash_my")).toEqual([100, 200, 300, 400]);
+  });
+
+  it("a plan's preview ignores a withheld contract's effect on later steps", async () => {
+    if (!pool) return;
+    await dropMigrationTables("withheld_my");
+    await pool.query("CREATE TABLE `withheld_my` (`uuid` varchar(36) PRIMARY KEY, `name` longtext, `nick` longtext, `_extra` longtext)");
+    const plan = await planMigrations(
+      new MySqlBackend(pool),
+      [
+        { name: "0001_rename", schemaVersion: 5, up: (m) => m.renameField("withheld_my", "name", "fullName", "text") },
+        { name: "0002_nick", up: (m) => m.copyField("withheld_my", "name", "nick", "text") }
+      ],
+      { schemaVersion: 5, minSupportedSchemaVersion: 0 }
+    );
+    const copy = plan.steps.find((step) => step.migration === "0002_nick")!;
+    expect(copy.lowering).toBe("native"); // the rename's drop of `name` is withheld: `name` is still there
+  });
+
   it("a unique-key clash whose value mentions the primary key is still refused", async () => {
     if (!pool) return;
     await pool.query("DROP TABLE IF EXISTS `uniq2_my`");

@@ -30,7 +30,7 @@ import type {
 } from "../../core/Backend.ts";
 import type { Capabilities, Context, JsonObject, JsonValue, Uuid } from "../../core/types.ts";
 import type { MigrationOp } from "../../migrations/types.ts";
-import { changesColumns, lowerToSql } from "./lower.ts";
+import { changesColumns, lowerToSql, type Statement } from "./lower.ts";
 import type { AggregatePlan, AggregateResultRow, QueryPlan, WindowPlan } from "../../core/QueryPlan.ts";
 import { generateUuid } from "../../core/uuid.ts";
 import { reduceAggregatePlan } from "../../expressions/aggregateReduce.ts";
@@ -163,17 +163,56 @@ export class SqlBackend
    * overflow — a relation, or anything the model never declared as a scalar — has no column to alter,
    * and emitting DDL against one would simply throw.
    */
-  async lowerMigrationOp(op: MigrationOp, _ctx: Context): Promise<{ rows: number } | null> {
-    const present = "model" in op ? await this.liveColumns(op.model) : new Set<string>();
-    if (op.kind === "dropIndex") return this.dropIndexNamed(op.model, op.index);
-    const statements = lowerToSql(op, this.dialect, present, "model" in op ? await this.indexColumnTypes(op) : undefined);
-    if (!statements) return null;
+  async lowerMigrationOp(op: MigrationOp, ctx: Context): Promise<{ rows: number } | null> {
+    return this.lowerRecorded(op, ctx, null);
+  }
 
+  async lowerMigrationOpRecorded(
+    op: MigrationOp,
+    ctx: Context,
+    record: (tx: Backend) => Promise<void>
+  ): Promise<{ rows: number } | null> {
+    return this.lowerRecorded(op, ctx, record);
+  }
+
+  /**
+   * Run an op's statements. With `record`, its data changes (not its DDL, which MySQL would commit
+   * anyway) run in one transaction with `record`: an op like a JSON-quoting retype must not run twice,
+   * and a runner that journals it as done in that same transaction guarantees it can't.
+   */
+  private async lowerRecorded(
+    op: MigrationOp,
+    ctx: Context,
+    record: ((tx: Backend) => Promise<void>) | null
+  ): Promise<{ rows: number } | null> {
+    const present = "model" in op ? await this.liveColumns(op.model) : new Set<string>();
+    let result: { rows: number } | null;
+    let data: Statement[] = [];
+    if (op.kind === "dropIndex") {
+      result = await this.dropIndexNamed(op.model, op.index);
+    } else {
+      const statements = lowerToSql(op, this.dialect, present, "model" in op ? await this.indexColumnTypes(op) : undefined);
+      if (!statements) return null;
+      const deferred = record && this.exec.transaction ? statements.filter(isDataStatement) : [];
+      data = deferred;
+      result = { rows: await this.runStatements(op, statements.filter((statement) => !deferred.includes(statement)), this.exec) };
+    }
+    if (record) {
+      await this.transaction(async (tx) => {
+        result!.rows += await this.runStatements(op, data, (tx as SqlBackend).exec);
+        await record(tx);
+      }, ctx);
+    }
+    if ("model" in op && changesColumns(op)) this.refreshModel(op);
+    return result;
+  }
+
+  private async runStatements(op: MigrationOp, statements: Statement[], exec: SqlExecutor): Promise<number> {
     let rows = 0;
     for (const statement of statements) {
       let result: unknown;
       try {
-        result = await this.exec.run(statement.sql, statement.params);
+        result = await exec.run(statement.sql, statement.params);
       } catch (error) {
         // MySQL's index DDL has no IF [NOT] EXISTS. A retry after a crash between the DDL and the
         // journal write must find the index already in its target state and carry on, not fail.
@@ -181,8 +220,7 @@ export class SqlBackend
       }
       rows += Array.isArray(result) ? result.length : 0;
     }
-    if ("model" in op && changesColumns(op)) this.refreshModel(op);
-    return { rows };
+    return rows;
   }
 
   /**
@@ -927,6 +965,11 @@ function coerce(params: JsonValue[]): unknown[] {
     if (value !== null && typeof value === "object") return JSON.stringify(value);
     return value;
   });
+}
+
+/** A statement that changes rows rather than the schema — one a transaction can hold, even on MySQL. */
+function isDataStatement(statement: Statement): boolean {
+  return /^\s*(UPDATE|INSERT|DELETE)\b/i.test(statement.sql);
 }
 
 /** A table's columns after `op`, for a preview that runs nothing. */

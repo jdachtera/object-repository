@@ -82,7 +82,7 @@ describe("renameField decomposition", () => {
       contract: [
         // The step everybody forgets: old writers kept writing `name` for the whole window, so the
         // drop must be preceded by a copy that DOES overwrite.
-        { kind: "copyField", model: "User", from: "name", to: "fullName", type: "text", overwrite: true },
+        { kind: "copyField", model: "User", from: "name", to: "fullName", type: "text", overwrite: true, exact: true },
         { kind: "dropField", model: "User", field: "name", closes: { renamedTo: "fullName" } }
       ]
     });

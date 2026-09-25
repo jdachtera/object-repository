@@ -229,7 +229,10 @@ every refusal.
 **The server enforces it on every request.** The handshake lets a client fail early, but a server that
 declares a `schemaVersion` checks the client's advertisement on every request too: `RemoteBackend`
 and `RemoteSyncTarget` send it with each one. A client that never shook hands, or one still connected
-when a redeploy raised the floor, is refused on its next request. A client that advertises no version
+when a redeploy raised the floor, is refused on its next request. The change feed is judged the same
+way: `RemoteBackend` sends its advertisement when it subscribes (an HTTP header on the SSE request, a
+`subscribe` message over a WebSocket), and a versioned server streams events only to a client it
+would serve. A client that advertises no version
 predates versioning and counts as version 0, so a server at version 1 still serves it, and raising the
 floor refuses it rather than waving it through. A server that declares no version keeps the advisory
 fingerprint check.
@@ -267,7 +270,10 @@ per-statement timeout, so a long backfill can't time out on the client while it 
 MySQL commits implicitly on any DDL, which would commit a phase's earlier writes and run the rest
 outside the transaction. So on MySQL a phase is not wrapped in one: it is journalled page by page, as
 below, and its lowered DDL is written to be safe to re-run: `addField` onto an existing column only
-fills it, and a repeated index create or drop is recognised as already done.
+fills it, and a repeated index create or drop is recognised as already done. A natively lowered op's
+data changes (a fill, a copy, a retype's value conversion) commit in one transaction with the journal
+marker recording the op as done, so a retry never runs them twice: a retype to `json` is never
+quoted again.
 
 On other stores, a record pass keeps a resume marker in the journal and an interrupted pass continues
 from its last persisted page instead of starting over, so a non-idempotent `transform` (`price * 100`)

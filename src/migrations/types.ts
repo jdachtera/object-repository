@@ -56,7 +56,20 @@ export type MigrationOp =
   | { kind: "dropModel"; model: string }
   | { kind: "addField"; model: string; field: string; type: StoredType; fill?: JsonValue }
   | { kind: "dropField"; model: string; field: string; closes?: { renamedTo: string } }
-  | { kind: "copyField"; model: string; from: string; to: string; type: StoredType; overwrite: boolean }
+  | {
+      kind: "copyField";
+      model: string;
+      from: string;
+      to: string;
+      type: StoredType;
+      overwrite: boolean;
+      /**
+       * Leave the target exactly equal to the source — cleared where the source is absent. A rename's
+       * closing re-copy: the legacy field is authoritative until then, and an older build clearing it
+       * must not leave the canonical field holding the value it cleared.
+       */
+      exact?: boolean;
+    }
   | { kind: "renameField"; model: string; from: string; to: string; type: StoredType }
   // `from` is optional because the legacy `alterColumnType` alias cannot state it — it only ever knew
   // the target type. Without it the widening check can't run, so such a retype keeps the legacy

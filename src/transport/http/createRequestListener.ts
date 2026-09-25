@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Context } from "../../core/types.ts";
 import { SYSTEM_CONTEXT } from "../../core/types.ts";
 import type { WireRequest } from "../../core/Transport.ts";
-import type { TransportAdapter } from "../../core/Transport.ts";
+import { SCHEMA_HEADER, type TransportAdapter } from "../../core/Transport.ts";
 
 export interface HttpServerOptions {
   /**
@@ -81,6 +81,12 @@ export function createRequestListener(
         .then(
           (ctx) => {
             if (req.destroyed) return; // the client left while being authenticated: nothing to stream
+            const refusal = adapter.admitSubscriber?.(schemaHeader(req)) ?? null;
+            if (refusal) {
+              res.writeHead(409, { "content-type": "application/json" });
+              res.end(JSON.stringify({ ok: false, error: refusal }));
+              return;
+            }
             res.writeHead(200, {
               "content-type": "text/event-stream",
               "cache-control": "no-cache",
@@ -100,6 +106,18 @@ export function createRequestListener(
     res.writeHead(404);
     res.end();
   };
+}
+
+/** The subscriber's schema advertisement, from its header; absent or unreadable counts as none. */
+function schemaHeader(req: IncomingMessage): WireRequest["schema"] {
+  const raw = req.headers[SCHEMA_HEADER];
+  if (typeof raw !== "string") return undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed !== null && typeof parsed === "object" ? (parsed as WireRequest["schema"]) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function unauthorized(res: ServerResponse): void {

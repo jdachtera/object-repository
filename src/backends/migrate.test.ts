@@ -130,6 +130,21 @@ describe("migrations — lifecycle (pg-mem)", () => {
     await expect(orm.rollback(history, 1, { rollbackAdopted: true })).resolves.toMatchObject({ applied: ["0002_users"] });
   });
 
+  it("finds the legacy history on a rollback before any run has adopted it", async () => {
+    const { Pool } = newDb().adapters.createPg();
+    const pool = new Pool();
+    await pool.query(`CREATE TABLE "_object_repository_migrations" ("name" text PRIMARY KEY, "applied_at" bigint)`);
+    await pool.query(`INSERT INTO "_object_repository_migrations" VALUES ('0001_base', 1)`);
+    await pool.query(`CREATE TABLE "base" ("uuid" text PRIMARY KEY, "n" bigint, "_extra" text)`);
+    const orm = new RepositoryManager({ backend: new PostgresBackend(pool) });
+    const history: Migration[] = [
+      { name: "0001_base", up: (m) => m.createTable("base", [{ name: "n", type: "integer" }]), down: (m) => m.dropTable("base") }
+    ];
+    // Not an empty report: the adopted history is there, and refused unless asked for.
+    await expect(orm.rollback(history)).rejects.toThrow(/adopted from the legacy tracking table/);
+    await expect(orm.rollback(history, 1, { rollbackAdopted: true })).resolves.toMatchObject({ applied: ["0001_base"] });
+  });
+
   it("forwards through a PolicyBackend to the inner store", async () => {
     const { Pool } = newDb().adapters.createPg();
     const orm = new RepositoryManager({ backend: new PolicyBackend(new PostgresBackend(new Pool()), {}) });

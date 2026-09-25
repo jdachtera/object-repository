@@ -1,5 +1,5 @@
 import type { Context } from "../../core/types.ts";
-import type { Transport, WireRequest, WireResponse, WireUnsubscribe } from "../../core/Transport.ts";
+import { SCHEMA_HEADER, type Transport, type WireRequest, type WireResponse, type WireUnsubscribe } from "../../core/Transport.ts";
 
 export interface HttpTransportOptions {
   /** Fetch implementation (defaults to the global). */
@@ -41,18 +41,19 @@ export class HttpTransport implements Transport {
     return (await response.json()) as WireResponse;
   }
 
-  subscribe(_op: WireRequest, onEvent: (event: unknown) => void, _ctx: Context): WireUnsubscribe {
+  subscribe(op: WireRequest, onEvent: (event: unknown) => void, _ctx: Context): WireUnsubscribe {
     const controller = new AbortController();
-    void this.stream(controller.signal, onEvent);
+    void this.stream(controller.signal, onEvent, op.schema);
     return () => controller.abort();
   }
 
-  private async stream(signal: AbortSignal, onEvent: (event: unknown) => void): Promise<void> {
+  private async stream(signal: AbortSignal, onEvent: (event: unknown) => void, schema: WireRequest["schema"]): Promise<void> {
     try {
       const response = await this.fetchImpl(this.baseUrl + this.changesPath, {
-        headers: { accept: "text/event-stream" },
+        headers: { accept: "text/event-stream", ...(schema ? { [SCHEMA_HEADER]: JSON.stringify(schema) } : {}) },
         signal
       });
+      if (!response.ok) return; // refused (a stale client) or unavailable: no events to deliver
       const body = response.body;
       if (!body) return;
 

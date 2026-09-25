@@ -112,7 +112,7 @@ export class RemoteBackend implements Backend {
     // — but `deliverChanges` (command replies) still reaches the listeners.
     if (!this.subscription && this.transport.subscribe) {
       this.subscription = this.transport.subscribe(
-        { method: "changes", params: {} },
+        { method: "changes", params: {}, ...(this.advertisement ? { schema: this.advertisement } : {}) },
         (event) => this.fanout(event as ChangeEvent),
         ctx
       );

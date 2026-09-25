@@ -122,7 +122,12 @@ export async function applyOp(backend: Backend, op: MigrationOp, options: Execut
     case "copyField":
       return rewrite(backend, op, options, [op.to], (record) => {
         if (!op.overwrite && record[op.to] !== undefined) return null;
-        if (record[op.from] === undefined) return null;
+        if (record[op.from] === undefined) {
+          if (!op.exact || record[op.to] === undefined) return null;
+          const next = { ...record };
+          delete next[op.to]; // an older build cleared the source: the copy is cleared with it
+          return next;
+        }
         return { ...record, [op.to]: coerce(cloneValue(record[op.from] as JsonValue), op.type) };
       });
 

@@ -225,7 +225,7 @@ function desugar(ops: MigrationOp[]): PhasedOps {
     if (op.kind === "renameField") {
       expand.push({ kind: "addField", model: op.model, field: op.to, type: op.type });
       expand.push({ kind: "copyField", model: op.model, from: op.from, to: op.to, type: op.type, overwrite: false });
-      contract.push({ kind: "copyField", model: op.model, from: op.from, to: op.to, type: op.type, overwrite: true });
+      contract.push({ kind: "copyField", model: op.model, from: op.from, to: op.to, type: op.type, overwrite: true, exact: true });
       contract.push({ kind: "dropField", model: op.model, field: op.from, closes: { renamedTo: op.to } });
       continue;
     }

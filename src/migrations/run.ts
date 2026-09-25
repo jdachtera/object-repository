@@ -249,7 +249,9 @@ export async function rollbackMigrations(
  */
 async function rollbackAll(backend: Backend, migrations: Migration[], count: number, options: Running): Promise<MigrationReport> {
   const { journal } = options;
-  const rows = await journal.load();
+  // A store upgraded from the SQL-only mechanism may have its history only in the legacy table: adopt
+  // it first, as a run does, or a rollback before the first run would find nothing and do nothing.
+  const rows = await adoptLegacyHistory(backend, journal, options.now);
   const report: MigrationReport = { applied: [], skipped: [], expanded: [], contracted: [], deferred: [], releasable: [] };
   const byName = new Map(migrations.map((migration) => [migration.name, migration]));
   const position = new Map(migrations.map((migration, index) => [migration.name, index]));
@@ -483,15 +485,23 @@ async function runPhase(
   // A marker staged with its page shares the page's flush — atomic only where that flush is (not a
   // Mongo bulkWrite per collection, say).
   const sharedFlush = !!journal.stage && backend.capabilities.transactions;
+  // A natively lowered op is journalled as done in the transaction that holds its data changes, so a
+  // retry resumes after it rather than running a JSON-quoting UPDATE twice.
+  const recordLowered = (index: number) => async (tx: Backend) => {
+    const scoped = journal.within?.(tx) ?? journal;
+    await scoped.write(progress!(encodeResume({ op: index + 1, after: null })));
+  };
   await executeOps(backend, migration, ops, phase, options, record.resume, (index) =>
     progress && sharedFlush
       ? {
           // Queued now, persisted with the page it describes.
           checkpoint: async (cursor) => journal.stage!(at(index)(cursor)),
-          heartbeat: async () => lease?.renew()
+          heartbeat: async () => lease?.renew(),
+          recordLowered: recordLowered(index)
         }
       : progress
         ? {
+            recordLowered: recordLowered(index),
             // The marker can't share the page's flush. Record it after the page lands; and for an op
             // that must not run twice, mark the page in flight first, so a resume knows which records
             // it can't vouch for instead of silently applying them again.
@@ -516,7 +526,11 @@ async function settle(journal: MigrationJournal, record: PhaseRecord): Promise<v
   for (const entry of record.forget ?? []) await journal.remove(entry.name, entry.phase);
 }
 
-type PageHooks = Pick<ExecuteOptions, "checkpoint" | "beforePage"> & { heartbeat?: (cursor: string) => Promise<void> };
+type PageHooks = Pick<ExecuteOptions, "checkpoint" | "beforePage"> & {
+  heartbeat?: (cursor: string) => Promise<void>;
+  /** Journal a natively lowered op as done, inside the transaction that commits its data changes. */
+  recordLowered?: (tx: Backend) => Promise<void>;
+};
 
 /** Run `ops` in order, preferring a backend's native lowering and falling back to the reference. */
 async function executeOps(
@@ -533,13 +547,17 @@ async function executeOps(
   for (let index = 0; index < (resume?.op ?? 0); index++) followLayout(options, ops[index]!);
   for (let index = resume?.op ?? 0; index < ops.length; index++) {
     const op = ops[index]!;
-    const lowered = isMigrationLowering(backend) ? await backend.lowerMigrationOp(op, options.ctx) : null;
+    const { checkpoint, heartbeat, beforePage, recordLowered } = typeof hooks === "function" ? hooks(index) : hooks;
+    const lowered = !isMigrationLowering(backend)
+      ? null
+      : recordLowered && backend.lowerMigrationOpRecorded
+        ? await backend.lowerMigrationOpRecorded(op, options.ctx, recordLowered)
+        : await backend.lowerMigrationOp(op, options.ctx);
     if (lowered) {
       followLayout(options, op);
       continue; // the backend did it natively — same effect, lower cost
     }
 
-    const { checkpoint, heartbeat, beforePage } = typeof hooks === "function" ? hooks(index) : hooks;
     let after = resume && index === resume.op ? resume.after : null;
     if (resume?.inFlight && index === resume.op && !reappliesSafely(op)) {
       // The interrupted run may have written some, all or none of this page: only the operator can say.

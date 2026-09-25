@@ -66,9 +66,15 @@ export class WebSocketTransport implements Transport {
     for (const { reject } of waiters) reject(error);
   }
 
-  subscribe(_op: WireRequest, onEvent: (event: unknown) => void, _ctx: Context): WireUnsubscribe {
+  subscribe(op: WireRequest, onEvent: (event: unknown) => void, _ctx: Context): WireUnsubscribe {
     this.listeners.add(onEvent);
-    void this.connect(); // ensure the connection is open so the server starts pushing events
+    // Open the connection so the server starts pushing events; a versioned server waits for this
+    // client's schema advertisement before it does.
+    void this.connect()
+      .then((socket) => {
+        if (op.schema) socket.send(JSON.stringify({ type: "subscribe", schema: op.schema }));
+      })
+      .catch(() => {});
     return () => {
       this.listeners.delete(onEvent);
     };

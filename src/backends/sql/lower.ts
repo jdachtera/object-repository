@@ -90,6 +90,8 @@ export function lowerToSql(
       // `from IS NOT NULL` mirrors the reference, which skips a record whose source field is absent —
       // and a NULL column decodes as absent, so the two agree exactly. Without `overwrite`, `to IS NULL`
       // is likewise the SQL spelling of "the target is still unset".
+      // `exact` copies NULL too: a cleared source clears the target.
+      if (op.exact) return [ddl(`UPDATE ${dialect.ref(op.model)} SET ${to} = ${from}`)];
       const guard = op.overwrite ? `${from} IS NOT NULL` : `${to} IS NULL AND ${from} IS NOT NULL`;
       return [ddl(`UPDATE ${dialect.ref(op.model)} SET ${to} = ${from} WHERE ${guard}`)];
     }

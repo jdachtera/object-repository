@@ -160,6 +160,11 @@ export class BackendAdapter implements TransportAdapter {
    * model, including reserved ones (the sync outbox, the migration journal and lease) and any outside
    * the allow-list; forwarding those would publish exactly what `query` refuses to return.
    */
+  admitSubscriber(schema: SchemaAdvertisement | undefined): { code: string; message: string } | null {
+    const refusal = enforceSchema(schema, this.advertisement());
+    return refusal && !refusal.compatible ? { code: refusal.code, message: refusal.message } : null;
+  }
+
   subscribe(onEvent: (event: ChangeEvent) => void, ctx: Context): Unsubscribe {
     return this.backend.changes((event) => {
       if (this.modelAllowed(event.model)) onEvent(event);

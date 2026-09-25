@@ -6,6 +6,8 @@
  */
 import { describe, it, expect } from "vitest";
 import { InMemoryBackend } from "../backends/memory/InMemoryBackend.js";
+import { PostgresBackend } from "../backends/sql/PostgresBackend.js";
+import { newDb } from "pg-mem";
 import { runMigrations, rollbackMigrations, gateOpen, MigrationLockedError } from "./run.js";
 import { BackendJournal, MIGRATION_LOG_MODEL, acquireLock, LOCK_LEASE_MS } from "./journal.js";
 import { SchemaVersionError, MigrationBlockedError } from "./errors.js";
@@ -123,6 +125,34 @@ describe("an open gate still needs an explicit release", () => {
 
     // The contract-side re-copy is what saves this write from being thrown away by the drop.
     expect((await readUsers(backend))[0]).toEqual({ uuid: "u1", fullName: "Ann-updated" });
+  });
+
+  it.each([
+    ["in memory", async () => seeded()],
+    [
+      "Postgres (lowered)",
+      async () => {
+        const { Pool } = newDb().adapters.createPg();
+        const backend = new PostgresBackend(new Pool());
+        await backend.registerModel("User", [], [{ name: "name", type: "text" }, { name: "fullName", type: "text" }]);
+        const source = await seeded();
+        for (const row of await readUsers(source)) backend.save("User", row, ctx);
+        await backend.persist(ctx);
+        return backend;
+      }
+    ]
+  ] as const)("adopts an old writer clearing the field, rather than undoing it (%s)", async (_name, make) => {
+    const backend = await make();
+    const migrations = [rename()];
+    const sqlModels = { User: { fields: [{ name: "name", type: "text" as const }, { name: "fullName", type: "text" as const }], indexes: [] } };
+    await run(backend, migrations, { schemaVersion: 7, minSupportedSchemaVersion: 5, models: sqlModels });
+
+    // An old build, still running, clears the legacy field it knows about.
+    backend.save("User", { uuid: "u1", fullName: "Ann" }, ctx, ["name"]);
+    await backend.persist(ctx);
+
+    await run(backend, migrations, { schemaVersion: 7, minSupportedSchemaVersion: 7, applyContracts: true, models: sqlModels });
+    expect((await readUsers(backend))[0]).toEqual({ uuid: "u1" });
   });
 
   it("marks the migration complete afterwards", async () => {

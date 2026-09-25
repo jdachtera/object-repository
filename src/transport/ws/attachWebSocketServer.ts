@@ -54,9 +54,31 @@ export function attachWebSocketServer(
     let closed = false;
     const early: string[] = [];
     let unsubscribe: (() => void) | null = null;
-    socket.on("message", (data) => {
+    // The change feed starts once the subscriber is admitted: at once when the server needs no schema
+    // advertisement, else on a `subscribe` message carrying one it accepts.
+    const admit = (schema: WireRequest["schema"], resolved: Context): boolean => {
+      if (unsubscribe) return true;
+      const refusal = adapter.admitSubscriber?.(schema) ?? null;
+      if (refusal) return false;
+      unsubscribe = adapter.subscribe((event) => {
+        socket.send(JSON.stringify({ type: "event", event }));
+      }, resolved);
+      return true;
+    };
+    const receive = (data: string, resolved: Context): void => {
+      const subscribe = subscribeMessage(data);
+      if (subscribe) {
+        if (!admit(subscribe.schema, resolved)) {
+          const error = adapter.admitSubscriber?.(subscribe.schema);
+          socket.send(JSON.stringify({ type: "error", error }));
+        }
+        return;
+      }
       // Never let a malformed frame or a failed send become an unhandled rejection. Contain it.
-      if (ctx) void handleMessage(adapter, socket, String(data), ctx).catch(() => {});
+      void handleMessage(adapter, socket, data, resolved).catch(() => {});
+    };
+    socket.on("message", (data) => {
+      if (ctx) receive(String(data), ctx);
       else early.push(String(data));
     });
     socket.on("close", () => {
@@ -71,13 +93,21 @@ export function attachWebSocketServer(
       .then((resolved) => {
         if (closed) return; // gone during authentication: subscribing now would leak the subscription
         ctx = resolved;
-        unsubscribe = adapter.subscribe((event) => {
-          socket.send(JSON.stringify({ type: "event", event }));
-        }, resolved);
-        for (const data of early.splice(0)) void handleMessage(adapter, socket, data, resolved).catch(() => {});
+        admit(undefined, resolved);
+        for (const data of early.splice(0)) receive(data, resolved);
       })
       .catch(() => socket.close());
   });
+}
+
+/** A `{ type: "subscribe", schema }` frame, or `null` for anything else. */
+function subscribeMessage(data: string): { schema: WireRequest["schema"] } | null {
+  try {
+    const message = JSON.parse(data) as { type?: string; schema?: WireRequest["schema"] };
+    return message?.type === "subscribe" ? { schema: message.schema } : null;
+  } catch {
+    return null;
+  }
 }
 
 async function handleMessage(
