@@ -1,5 +1,6 @@
 import type {
   AggregatingBackend,
+  LeasingBackend,
   Backend,
   ChangeEvent,
   ChangeListener,
@@ -15,6 +16,7 @@ import type {
   Unsubscribe,
   UpsertingBackend
 } from "../../core/Backend.ts";
+import { isReservedModel } from "../../core/Backend.ts";
 import type { Capabilities, Context, JsonObject, JsonValue, Uuid } from "../../core/types.ts";
 import type { QueryPlan, Comparator, AggregatePlan, AggregateResultRow, AggregateStage, ExpressionNode, DatePart, ValueNode, TextMode } from "../../core/QueryPlan.ts";
 import { generateUuid } from "../../core/uuid.ts";
@@ -25,6 +27,12 @@ import type { ArithOp } from "../../core/QueryPlan.ts";
 import { parse } from "../../expressions/parse.ts";
 import { parseValue } from "../../expressions/values.ts";
 import { UniqueConstraintError, uniqueKey, uniqueKeySets, sameBatchConflict } from "../util/unique.ts";
+import { MigrationNotSupportedError } from "../../migrations/errors.ts";
+import type { MigrationOp } from "../../migrations/types.ts";
+import { all } from "../../expressions/builders.ts";
+
+/** The unfiltered predicate, for a migration operation that touches every record. */
+const ALL_RECORDS: ExpressionNode = all().serialize();
 
 /** Backend-level options for `MongoBackend`. */
 export interface MongoBackendOptions {
@@ -58,6 +66,8 @@ export interface MongoCollection {
   bulkWrite(operations: object[]): Promise<unknown>;
   updateOne(filter: MongoFilter, update: object, options?: { upsert?: boolean }): Promise<unknown>;
   updateMany(filter: MongoFilter, update: object): Promise<unknown>;
+  /** Needed only by a migration's `dropIndex`; the real driver's `Collection` has it. */
+  dropIndex?(name: string): Promise<unknown>;
 }
 export interface MongoDatabase {
   collection(name: string): MongoCollection;
@@ -170,7 +180,8 @@ export class MongoBackend
     MultiPatchingBackend,
     UpsertingBackend,
     AggregatingBackend,
-    RawQueryable<MongoRawQuery>
+    RawQueryable<MongoRawQuery>,
+    LeasingBackend
 {
   readonly capabilities = CAPABILITIES;
 
@@ -178,9 +189,19 @@ export class MongoBackend
   private readonly identity: MongoIdentity;
   private readonly uniquePreCheck: boolean;
   private readonly uniqueKeys = new Map<string, string[][]>();
+  private readonly indexSpecs = new Map<string, IndexSpec[]>();
   private saveQueue: PersistedChange[] = [];
   private removeQueue: PersistedChange[] = [];
   private readonly listeners = new Set<ChangeListener>();
+
+  /**
+   * The identity for `model`. The library's own bookkeeping (the migration journal, schema state and
+   * lease) is keyed by fixed strings like `__lock__`, which an ObjectId identity cannot encode, so those
+   * models always use plain string keys whatever identity the application's models use.
+   */
+  private identityFor(model: string): MongoIdentity {
+    return isReservedModel(model) ? UUID_IDENTITY : this.identity;
+  }
 
   constructor(database: MongoDatabase, identity: MongoIdentity = UUID_IDENTITY, options: MongoBackendOptions = {}) {
     this.db = database;
@@ -189,34 +210,55 @@ export class MongoBackend
   }
 
   private filter(model: string, where: ExpressionNode): MongoFilter {
-    return compileMongoFilter(where, this.identity, model);
+    return compileMongoFilter(where, this.identityFor(model), model);
   }
 
-  registerModel(model: string, indexes: IndexSpec[]): void {
+  registeredIndexes(model: string): IndexSpec[] | undefined {
+    return this.indexSpecs.get(model);
+  }
+
+  async registerModel(model: string, indexes: IndexSpec[]): Promise<void> {
+    this.indexSpecs.set(model, indexes);
     if (this.uniquePreCheck) this.uniqueKeys.set(model, uniqueKeySets(indexes));
+    await this.provisionIndexes(model, indexes);
+  }
+
+  /**
+   * Build the indexes for a model. Awaited rather than fire-and-forget: a `createIndex` that fails —
+   * a unique index over already-duplicate data, most often — used to surface as an unhandled rejection
+   * with nothing tying it back to the model that caused it.
+   */
+  private async provisionIndexes(model: string, indexes: IndexSpec[]): Promise<void> {
     const collection = this.db.collection(model);
-    for (const index of indexes) {
-      const keys = Object.fromEntries(
-        index.fields.map((f) => [
-          f.path === "uuid" ? this.identity.field : f.path,
-          index.text ? "text" : f.descending ? -1 : 1
-        ])
-      );
-      const options: Record<string, unknown> = { name: index.name };
-      if (index.unique) options.unique = true;
-      if (index.sparse) options.sparse = true;
-      if (index.ttlSeconds !== undefined) options.expireAfterSeconds = index.ttlSeconds;
-      if (index.where) options.partialFilterExpression = this.filter(model, index.where);
-      void collection.createIndex(keys, options); // provisioning; fire-and-forget
-    }
+    // Every request is issued before the first is awaited: they're independent, and deferring the
+    // later ones behind each other would make provisioning observably incomplete mid-flight.
+    await Promise.all(
+      indexes.map((index) => {
+        const keys = Object.fromEntries(
+          index.fields.map((f) => [
+            f.path === "uuid" ? this.identityFor(model).field : f.path,
+            index.text ? "text" : f.descending ? -1 : 1
+          ])
+        );
+        const options: Record<string, unknown> = { name: index.name };
+        if (index.unique) options.unique = true;
+        if (index.sparse) options.sparse = true;
+        if (index.ttlSeconds !== undefined) options.expireAfterSeconds = index.ttlSeconds;
+        if (index.where) options.partialFilterExpression = this.filter(model, index.where);
+        return collection.createIndex(keys, options);
+      })
+    );
   }
 
   async query(plan: QueryPlan, _ctx: Context): Promise<JsonObject[]> {
+    // An empty or inverted window has no rows. Mongo reads `limit: 0` as "no limit", so it can't be
+    // passed through — that would return the whole collection, past any page-size cap.
+    if (plan.paging.end !== undefined && plan.paging.end <= plan.paging.start) return [];
     const docs = await this.db
       .collection(plan.model)
-      .find(this.filter(plan.model, plan.where), findOptions(plan, this.identity))
+      .find(this.filter(plan.model, plan.where), findOptions(plan, this.identityFor(plan.model)))
       .toArray();
-    return docs.map((doc) => fromStored(doc, plan.model, this.identity));
+    return docs.map((doc) => fromStored(doc, plan.model, this.identityFor(plan.model)));
   }
 
   /**
@@ -261,7 +303,41 @@ export class MongoBackend
   }
 
   async patch(model: string, uuid: string, ops: Record<string, PatchOp>, _ctx: Context): Promise<void> {
-    await this.db.collection(model).updateOne(keyFilter(uuid, this.identity), compileMongoUpdate(ops));
+    await this.db.collection(model).updateOne(keyFilter(uuid, this.identityFor(model)), compileMongoUpdate(ops));
+  }
+
+  /**
+   * Realize a migration operation server-side where Mongo can do better than rewriting every record
+   * (ARCHITECTURE.md §11); resolve `null` to let the portable executor handle the rest.
+   *
+   * `dropField` is the one that matters. It is the operation that used to silently do nothing here —
+   * and as a single `updateMany` with `$unset` it costs one round-trip instead of paging the whole
+   * collection through the client.
+   */
+  async lowerMigrationOp(op: MigrationOp, ctx: Context): Promise<{ rows: number } | null> {
+    if (op.kind === "dropField") {
+      const rows = await this.patchMany(op.model, ALL_RECORDS, { [op.field]: { kind: "unset" } }, ctx);
+      return { rows };
+    }
+    if (op.kind === "addIndex") {
+      await this.provisionIndexes(op.model, [op.index]);
+      return { rows: 0 };
+    }
+    if (op.kind === "dropIndex") {
+      // Registration only ever creates indexes, so the reference executor can't drop one here: without
+      // the driver's `dropIndex` this refuses rather than journal a drop that left the index in place.
+      const collection = this.db.collection(op.model);
+      if (typeof collection.dropIndex !== "function") throw new MigrationNotSupportedError(op, "MongoBackend (the injected collection has no dropIndex)");
+      try {
+        await collection.dropIndex(op.index);
+      } catch (error) {
+        if ((error as { codeName?: unknown } | null)?.codeName !== "IndexNotFound") throw error; // already gone
+      }
+      return { rows: 0 };
+    }
+    // Everything else — including `dropModel`, which would need `drop` on the injected driver
+    // interface that callers are not required to provide — falls to the reference.
+    return null;
   }
 
   async patchMany(model: string, where: ExpressionNode, ops: Record<string, PatchOp>, _ctx: Context): Promise<number> {
@@ -271,8 +347,8 @@ export class MongoBackend
 
   async upsert(model: string, where: ExpressionNode, set: JsonObject, setOnInsert: JsonObject, _ctx: Context): Promise<void> {
     const update: Record<string, object> = {};
-    const mappedSet = toStoredFields(set, model, this.identity);
-    const mappedInsert = toStoredFields(setOnInsert, model, this.identity);
+    const mappedSet = toStoredFields(set, model, this.identityFor(model));
+    const mappedInsert = toStoredFields(setOnInsert, model, this.identityFor(model));
     if (Object.keys(mappedSet).length) update.$set = mappedSet;
     if (Object.keys(mappedInsert).length) update.$setOnInsert = mappedInsert;
     await this.db.collection(model).updateOne(this.filter(model, where), update, { upsert: true });
@@ -307,9 +383,10 @@ export class MongoBackend
 
       const freed = new Set(changes.map((c) => String(c.record.uuid)));
       for (const change of removed) if (change.model === model) freed.add(String(change.record.uuid));
-      const idField = this.identity.field;
+      const identity = this.identityFor(model);
+      const idField = identity.field;
       const filterField = (f: string) => (f === "uuid" ? idField : f);
-      const encodeVal = (f: string, v: unknown): unknown => (f === "uuid" ? this.identity.encode(String(v)) : v);
+      const encodeVal = (f: string, v: unknown): unknown => (f === "uuid" ? identity.encode(String(v)) : v);
 
       const collection = this.db.collection(model);
       for (const fields of keySets) {
@@ -322,11 +399,41 @@ export class MongoBackend
           fields.length === 1
             ? { [filterField(fields[0]!)]: { $in: tuples.map((t) => encodeVal(fields[0]!, t[0])) } }
             : { $or: tuples.map((t) => Object.fromEntries(fields.map((f, i) => [filterField(f), encodeVal(f, t[i])]))) };
-        const notFreed: MongoFilter = { [idField]: { $nin: [...freed].map((u) => this.identity.encode(u)) } };
+        const notFreed: MongoFilter = { [idField]: { $nin: [...freed].map((u) => identity.encode(u)) } };
         const found = await collection.find({ $and: [notFreed, keyPredicate] }, { limit: 1 }).toArray();
         if (found.length > 0) throw new UniqueConstraintError(model, fields);
       }
     }
+  }
+
+  discardPending(): void {
+    this.saveQueue = [];
+    this.removeQueue = [];
+  }
+
+  /**
+   * One upsert filtered on "free, expired, or mine". When another owner's live lease exists the filter
+   * matches nothing, so the upsert tries to insert a second document with the same key, and the
+   * unique index on the key rejects it: that rejection is the refusal.
+   */
+  async acquireLease(model: string, key: string, owner: string, now: number, ttlMs: number, _ctx: Context): Promise<boolean> {
+    const collection = this.db.collection(model);
+    if (this.identityFor(model).field !== "_id") await collection.createIndex({ [this.identityFor(model).field]: 1 }, { unique: true });
+    try {
+      await collection.updateOne(
+        { ...keyFilter(key, this.identityFor(model)), $or: [{ expiresAt: { $lte: now } }, { expiresAt: null }, { owner }] },
+        { $set: { owner, expiresAt: now + ttlMs } },
+        { upsert: true }
+      );
+      return true;
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code === 11000) return false;
+      throw error;
+    }
+  }
+
+  async releaseLease(model: string, key: string, owner: string, _ctx: Context): Promise<void> {
+    await this.db.collection(model).bulkWrite([{ deleteOne: { filter: { ...keyFilter(key, this.identityFor(model)), owner } } }]);
   }
 
   async persist(_ctx: Context): Promise<PersistResult> {
@@ -358,14 +465,21 @@ export class MongoBackend
         ? Object.fromEntries(change.dirty.filter((f) => f in change.record).map((f) => [f, change.record[f]]))
         : change.record;
       const removed = change.dirty?.filter((f) => change.record[f] === undefined) ?? [];
-      const update: Record<string, object> = { $set: toStoredFields(fields, change.model, this.identity) };
+      // Mongo rejects an empty `$set` (`FailedToParse: '$set' is empty`) and that failure takes the
+      // whole `bulkWrite` — every unrelated write batched with it — down. A dirty hint naming only
+      // deleted fields produces exactly that shape, so include each operator only when it has work,
+      // and skip the op entirely when neither does.
+      const stored = toStoredFields(fields, change.model, this.identityFor(change.model));
+      const update: Record<string, object> = {};
+      if (Object.keys(stored).length) update.$set = stored;
       if (removed.length) update.$unset = Object.fromEntries(removed.map((f) => [f, ""]));
+      if (!Object.keys(update).length) continue;
       push(change.model, {
-        updateOne: { filter: keyFilter(id, this.identity), update, upsert: true }
+        updateOne: { filter: keyFilter(id, this.identityFor(change.model)), update, upsert: true }
       });
     }
     for (const change of removed) {
-      push(change.model, { deleteOne: { filter: keyFilter(String(change.record.uuid), this.identity) } });
+      push(change.model, { deleteOne: { filter: keyFilter(String(change.record.uuid), this.identityFor(change.model)) } });
     }
     for (const [model, ops] of byModel) {
       if (ops.length) await this.db.collection(model).bulkWrite(ops);
@@ -434,6 +548,11 @@ class MongoVisitor implements ExpressionVisitor<MongoFilter> {
 
   // Map the model's `uuid` to the stored key field, and encode id-typed values (uuid + FK refs).
   private prop(property: string): string {
+    // A field name is data from a query plan — over a transport, from the client. A `$`-prefixed
+    // segment would be read as an operator (`$where` runs server-side JavaScript), so refuse it.
+    if (property.split(".").some((segment) => segment.startsWith("$")) || property.includes("\0")) {
+      throw new Error(`Invalid field name ${JSON.stringify(property)}: a field name may not start with "$".`);
+    }
     return property === "uuid" ? this.identity.field : property;
   }
   private val(property: string, value: JsonValue): unknown {
@@ -452,7 +571,9 @@ class MongoVisitor implements ExpressionVisitor<MongoFilter> {
     if (value === null && comparator === "=") return { [prop]: { $type: "null" } };
     if (value === null && comparator === "!=") return { [prop]: { $not: { $type: "null" } } };
     const v = this.val(property, value);
-    if (comparator === "=") return { [prop]: v };
+    // `$eq`, never a bare value: a bare object value like `{ $ne: null }` would be *executed* as an
+    // operator — `password: { $ne: null }` matching every row — where the reference compares it.
+    if (comparator === "=") return { [prop]: { $eq: v } };
     return { [prop]: { [MONGO_OP[comparator]]: v } };
   }
   expr(left: ValueExpr, comparator: Comparator, right: ValueExpr): MongoFilter {
@@ -477,8 +598,9 @@ class MongoVisitor implements ExpressionVisitor<MongoFilter> {
     return { [this.prop(property)]: { $nin: values.map((value) => this.val(property, value)) } };
   }
   contains(property: string, value: JsonValue): MongoFilter {
-    // Equality against an array field matches documents whose array contains the value.
-    return { [this.prop(property)]: this.val(property, value) };
+    // Equality against an array field matches documents whose array contains the value. `$eq`, for
+    // the same reason as `compare`: an object value is data, not an operator.
+    return { [this.prop(property)]: { $eq: this.val(property, value) } };
   }
   between(property: string, lowerEnd: JsonValue, upperEnd: JsonValue): MongoFilter {
     return { [this.prop(property)]: { $gte: this.val(property, lowerEnd), $lte: this.val(property, upperEnd) } };

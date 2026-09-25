@@ -8,6 +8,7 @@
  * table / index / upsert / paging DDL.
  */
 import type { FieldSpec } from "../../core/Backend.ts";
+import type { JsonValue } from "../../core/types.ts";
 
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -65,6 +66,10 @@ export interface SqlDialect {
   dropIndex(model: string, name: string): string;
   /** Query the existing column names of a table (for additive migration). Rows expose `column_name`. */
   columnsQuery(model: string): { sql: string; params: unknown[] };
+  /** Query the names of a table's existing indexes. Rows expose `name`. */
+  indexesQuery(model: string): { sql: string; params: unknown[] };
+  /** Query a table's columns with their engine types. Rows expose `column_name` and `data_type`. */
+  columnTypesQuery(model: string): { sql: string; params: unknown[] };
   /** `ALTER TABLE <table> ADD COLUMN <col> <type>` — add a newly-declared field to an existing table. */
   addColumn(model: string, name: string, type: string): string;
   /** `DROP TABLE IF EXISTS <table>`. */
@@ -177,6 +182,11 @@ export const postgresDialect: SqlDialect = {
     `CREATE ${unique ? "UNIQUE " : ""}INDEX IF NOT EXISTS "${ident(name)}" ON "${ident(m)}" (${cols.map((c) => `"${ident(c)}"`).join(", ")})`,
   dropIndex: (_m, name) => `DROP INDEX IF EXISTS "${ident(name)}"`,
   columnsQuery: (m) => ({ sql: `SELECT column_name FROM information_schema.columns WHERE table_name = $1`, params: [ident(m)] }),
+  indexesQuery: (m) => ({ sql: `SELECT indexname AS name FROM pg_indexes WHERE tablename = $1`, params: [ident(m)] }),
+  columnTypesQuery: (m) => ({
+    sql: `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1`,
+    params: [ident(m)]
+  }),
   addColumn: (m, name, type) => `ALTER TABLE "${ident(m)}" ADD COLUMN "${ident(name)}" ${type}`,
   dropTable: (m) => `DROP TABLE IF EXISTS "${ident(m)}"`,
   dropColumn: (m, name) => `ALTER TABLE "${ident(m)}" DROP COLUMN "${ident(name)}"`,
@@ -223,6 +233,14 @@ export const mysqlDialect: SqlDialect = {
     sql: `SELECT column_name AS column_name FROM information_schema.columns WHERE table_name = ? AND table_schema = DATABASE()`,
     params: [ident(m)]
   }),
+  indexesQuery: (m) => ({
+    sql: `SELECT DISTINCT index_name AS name FROM information_schema.statistics WHERE table_name = ? AND table_schema = DATABASE()`,
+    params: [ident(m)]
+  }),
+  columnTypesQuery: (m) => ({
+    sql: `SELECT column_name AS column_name, data_type AS data_type FROM information_schema.columns WHERE table_name = ? AND table_schema = DATABASE()`,
+    params: [ident(m)]
+  }),
   addColumn: (m, name, type) => `ALTER TABLE \`${ident(m)}\` ADD COLUMN \`${ident(name)}\` ${type}`,
   dropTable: (m) => `DROP TABLE IF EXISTS \`${ident(m)}\``,
   dropColumn: (m, name) => `ALTER TABLE \`${ident(m)}\` DROP COLUMN \`${ident(name)}\``,
@@ -246,3 +264,44 @@ export const mysqlDialect: SqlDialect = {
   truncate: (sql) => `truncate(${sql}, 0)`,
   nullsOrder: () => "" // MySQL already sorts nulls first-ASC / last-DESC (matches the reference) and lacks the syntax
 };
+
+/**
+ * The physical name of a model's index. Postgres index names are schema-global, so a bare declared
+ * name (`email`) on a second table would collide — and under `IF NOT EXISTS` silently skip, leaving
+ * that table unconstrained. `<model>_<name>` keeps it per-table; characters that aren't valid in an
+ * identifier (a developer-supplied `songId-userId`) fold to `_`. Provisioning and migration lowering
+ * both use this, so a migration's `dropIndex` finds what `define()` built.
+ */
+export function physicalIndexName(model: string, name: string): string {
+  return `${model}_${name}`.replace(/[^A-Za-z0-9_]/g, "_");
+}
+
+/** Encode a stored value for its column. Scalars go in typed columns; JSON-ish fields are text. */
+export function encodeValue(type: string, value: JsonValue | undefined, dialect: SqlDialect): unknown {
+  if (value === undefined || value === null) return null;
+  switch (type) {
+    case "boolean":
+      return dialect.name === "postgres" ? Boolean(value) : value ? 1 : 0;
+    case "json": // the json() codec already produced a JSON string — keep it opaque
+      return typeof value === "string" ? value : JSON.stringify(value);
+    case "array": // native array → JSON string
+    case "embedded": // native subdocument → JSON string (queryable via a JSON extraction)
+    case "scalar": // custom stored type → JSON-encode so any JsonValue round-trips
+      return JSON.stringify(value);
+    default: // text / integer / float / date pass straight through
+      return value;
+  }
+}
+
+/**
+ * The stored-type tag that decodes a column of this engine type most plainly. Used only to expose a
+ * physical column the model no longer declares to a migration pass, where the declared tag is gone:
+ * numbers decode as numbers, a boolean as a boolean, and every text-backed type as its raw text.
+ */
+export function fieldTypeOfColumn(dataType: string): string {
+  const type = dataType.toLowerCase();
+  if (type === "bigint" || type === "integer" || type === "int" || type === "smallint") return "integer";
+  if (type.startsWith("double") || type === "real" || type === "float" || type === "numeric" || type === "decimal") return "float";
+  if (type === "boolean" || type === "tinyint") return "boolean";
+  return "text";
+}

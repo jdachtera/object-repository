@@ -66,12 +66,23 @@ export class WebSocketTransport implements Transport {
     for (const { reject } of waiters) reject(error);
   }
 
-  subscribe(_op: WireRequest, onEvent: (event: unknown) => void, _ctx: Context): WireUnsubscribe {
+  /** The advertisement the change feed was opened with, re-sent on every new socket. */
+  private feedSchema: WireRequest["schema"];
+
+  subscribe(op: WireRequest, onEvent: (event: unknown) => void, _ctx: Context): WireUnsubscribe {
     this.listeners.add(onEvent);
-    void this.connect(); // ensure the connection is open so the server starts pushing events
+    // A versioned server pushes events only once this client's schema advertisement is accepted: send
+    // it now, and again on every new socket (see `connect`), or a reconnect would end the feed.
+    this.feedSchema = op.schema;
+    if (this.socket && this.socket.readyState === OPEN) this.sendSubscribe(this.socket);
+    else void this.connect().catch(() => {});
     return () => {
       this.listeners.delete(onEvent);
     };
+  }
+
+  private sendSubscribe(socket: WebSocketLike): void {
+    if (this.feedSchema) socket.send(JSON.stringify({ type: "subscribe", schema: this.feedSchema }));
   }
 
   close(): void {
@@ -92,6 +103,7 @@ export class WebSocketTransport implements Transport {
       const socket = new Ctor(this.url);
       socket.addEventListener("open", () => {
         this.socket = socket;
+        if (this.listeners.size > 0) this.sendSubscribe(socket);
         resolve(socket);
       });
       socket.addEventListener("error", () => {

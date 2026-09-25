@@ -1,3 +1,4 @@
+import type { SchemaAdvertisement } from "./schema.ts";
 import type { Context } from "./types.ts";
 
 /**
@@ -36,10 +37,16 @@ export type WireMethod =
   | "changes"
   | "command"
   | "pull"
-  | "push";
+  | "push"
+  | "migrationState";
 
 export interface WireRequest {
   method: WireMethod;
+  /**
+   * The client's schema advertisement, sent with every request so a versioned server can refuse a
+   * client it no longer serves on any request — not only at the handshake, which a client may skip.
+   */
+  schema?: SchemaAdvertisement;
   /**
    * Method arguments (e.g. a serialized QueryPlan). Typed `unknown` rather than `JsonValue`: the
    * payload must be JSON-serializable, but that is a runtime contract the transport enforces (the
@@ -77,4 +84,13 @@ export interface TransportAdapter {
    * undefined, and transports that need it check for its presence.
    */
   subscribe?(onEvent: (event: unknown) => void, ctx: Context): WireUnsubscribe;
+  /**
+   * Judge a change-feed subscriber's schema advertisement as a request would be judged: the refusal
+   * to send it, or `null` to admit it. A feed carries the same records a query returns, so a client
+   * refused on requests must not keep receiving them as events.
+   */
+  admitSubscriber?(schema: SchemaAdvertisement | undefined): WireError | null;
 }
+
+/** The header an HTTP change-feed request carries the client's schema advertisement in (JSON). */
+export const SCHEMA_HEADER = "x-object-repository-schema";

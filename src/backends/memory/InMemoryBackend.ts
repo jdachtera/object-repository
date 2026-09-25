@@ -3,6 +3,7 @@ import type {
   ChangeEvent,
   ChangeListener,
   IndexSpec,
+  LeasingBackend,
   PersistResult,
   PersistedChange,
   SchemaAwareBackend,
@@ -37,12 +38,13 @@ const CAPABILITIES: Capabilities = {
  * and emits change events. (Real tombstones land with the sync seam, step 8; today `remove`
  * deletes and emits a `removed` event.)
  */
-export class InMemoryBackend implements Backend, SchemaAwareBackend {
+export class InMemoryBackend implements Backend, SchemaAwareBackend, LeasingBackend {
   readonly capabilities = CAPABILITIES;
 
   private readonly store = new Map<string, Map<Uuid, JsonObject>>();
   /** Per model, the field-tuples that must be unique (single-field hints + compound `unique` indexes). */
   private readonly uniqueKeys = new Map<string, string[][]>();
+  private readonly indexSpecs = new Map<string, IndexSpec[]>();
   /** Live value→uuid index per unique key-set (`uniqueIndex[model][keySetIndex]`), maintained on
    *  persist so `checkUnique` is an O(batch) lookup instead of an O(store) rescan every flush. */
   private readonly uniqueIndex = new Map<string, Map<number, Map<string, Uuid>>>();
@@ -51,7 +53,12 @@ export class InMemoryBackend implements Backend, SchemaAwareBackend {
   private readonly listeners = new Set<ChangeListener>();
 
   /** Learn which fields carry a unique constraint so `persist` can enforce it (the reference backend). */
+  registeredIndexes(model: string): IndexSpec[] | undefined {
+    return this.indexSpecs.get(model);
+  }
+
   registerModel(model: string, indexes: IndexSpec[]): void {
+    this.indexSpecs.set(model, indexes);
     const keys = uniqueKeySets(indexes);
     this.uniqueKeys.set(model, keys);
     // (Re)build the value→uuid index from whatever is already stored (usually empty at define time).
@@ -136,6 +143,20 @@ export class InMemoryBackend implements Backend, SchemaAwareBackend {
   discardPending(): void {
     this.saveQueue = [];
     this.removeQueue = [];
+  }
+
+  /** Check-and-claim in one synchronous step, so no other caller in this process can interleave. */
+  async acquireLease(model: string, key: string, owner: string, now: number, ttlMs: number, _ctx: Context): Promise<boolean> {
+    const store = this.modelStore(model);
+    const held = store.get(key);
+    if (held && String(held.owner) !== owner && Number(held.expiresAt ?? 0) > now) return false;
+    store.set(key, { ...held, uuid: key, owner, expiresAt: now + ttlMs });
+    return true;
+  }
+
+  async releaseLease(model: string, key: string, owner: string, _ctx: Context): Promise<void> {
+    const store = this.modelStore(model);
+    if (String(store.get(key)?.owner) === owner) store.delete(key);
   }
 
   changes(listener: ChangeListener, _ctx: Context): Unsubscribe {

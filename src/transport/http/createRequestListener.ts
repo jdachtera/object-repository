@@ -2,14 +2,14 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Context } from "../../core/types.ts";
 import { SYSTEM_CONTEXT } from "../../core/types.ts";
 import type { WireRequest } from "../../core/Transport.ts";
-import type { TransportAdapter } from "../../core/Transport.ts";
+import { SCHEMA_HEADER, type TransportAdapter } from "../../core/Transport.ts";
 
 export interface HttpServerOptions {
   /**
    * Build the request context (identity) from the HTTP request — this is the authentication seam
    * (ARCHITECTURE.md §8). Defaults to the system context.
    */
-  context?: (request: IncomingMessage) => Context;
+  context?: (request: IncomingMessage) => Context | Promise<Context>;
   rpcPath?: string;
   changesPath?: string;
   /** Reject a request body larger than this many bytes with 413 (default 1 MiB). Guards against OOM. */
@@ -51,7 +51,15 @@ export function createRequestListener(
       });
       req.on("end", () => {
         if (aborted) return;
-        void handleRpc(adapter, Buffer.concat(chunks).toString("utf8"), contextFor(req), res);
+        // Authentication runs inside the promise chain: a `context()` that throws (or rejects) for an
+        // unauthenticated request answers 401 — it must not escape as an uncaught exception, which
+        // would take the whole process, and every other client, down with it.
+        void Promise.resolve()
+          .then(() => contextFor(req))
+          .then(
+            (ctx) => handleRpc(adapter, Buffer.concat(chunks).toString("utf8"), ctx, res),
+            () => unauthorized(res)
+          );
       });
       // A mid-request socket error would otherwise emit an unhandled 'error' event on the stream.
       req.on("error", () => {
@@ -67,22 +75,54 @@ export function createRequestListener(
         res.end(JSON.stringify({ ok: false, error: { code: "NO_CHANGE_FEED", message: "This endpoint has no change stream." } }));
         return;
       }
-      res.writeHead(200, {
-        "content-type": "text/event-stream",
-        "cache-control": "no-cache",
-        connection: "keep-alive"
-      });
-      res.write(":ok\n\n"); // comment frame so the client knows the stream is open
-      const unsubscribe = adapter.subscribe((event) => {
-        res.write(`data: ${JSON.stringify(event)}\n\n`);
-      }, contextFor(req));
-      req.on("close", unsubscribe);
+      const subscribe = adapter.subscribe.bind(adapter);
+      void Promise.resolve()
+        .then(() => contextFor(req))
+        .then(
+          (ctx) => {
+            if (req.destroyed) return; // the client left while being authenticated: nothing to stream
+            const refusal = adapter.admitSubscriber?.(schemaHeader(req)) ?? null;
+            if (refusal) {
+              res.writeHead(409, { "content-type": "application/json" });
+              res.end(JSON.stringify({ ok: false, error: refusal }));
+              return;
+            }
+            res.writeHead(200, {
+              "content-type": "text/event-stream",
+              "cache-control": "no-cache",
+              connection: "keep-alive"
+            });
+            res.write(":ok\n\n"); // comment frame so the client knows the stream is open
+            const unsubscribe = subscribe((event) => {
+              res.write(`data: ${JSON.stringify(event)}\n\n`);
+            }, ctx);
+            req.on("close", unsubscribe);
+          },
+          () => unauthorized(res)
+        );
       return;
     }
 
     res.writeHead(404);
     res.end();
   };
+}
+
+/** The subscriber's schema advertisement, from its header; absent or unreadable counts as none. */
+function schemaHeader(req: IncomingMessage): WireRequest["schema"] {
+  const raw = req.headers[SCHEMA_HEADER];
+  if (typeof raw !== "string") return undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed !== null && typeof parsed === "object" ? (parsed as WireRequest["schema"]) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function unauthorized(res: ServerResponse): void {
+  res.writeHead(401, { "content-type": "application/json" });
+  res.end(JSON.stringify({ ok: false, error: { code: "UNAUTHORIZED", message: "The request could not be authenticated." } }));
 }
 
 async function handleRpc(

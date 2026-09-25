@@ -14,6 +14,7 @@
  */
 import type {
   AggregatingBackend,
+  LeasingBackend,
   Backend,
   ChangeEvent,
   ChangeListener,
@@ -28,13 +29,15 @@ import type {
   Unsubscribe
 } from "../../core/Backend.ts";
 import type { Capabilities, Context, JsonObject, JsonValue, Uuid } from "../../core/types.ts";
+import type { MigrationOp } from "../../migrations/types.ts";
+import { changesColumns, lowerToSql, retypeThenRewrite, type Statement } from "./lower.ts";
 import type { AggregatePlan, AggregateResultRow, QueryPlan, WindowPlan } from "../../core/QueryPlan.ts";
 import { generateUuid } from "../../core/uuid.ts";
 import { reduceAggregatePlan } from "../../expressions/aggregateReduce.ts";
 import { scan } from "../util/scan.ts";
 import { compileAggregate, compileWhere, compileWindow } from "./compile.ts";
-import { OVERFLOW_COLUMN, type SqlDialect } from "./dialect.ts";
-import { runMigrations, rollbackMigrations } from "./migrate.ts";
+import { encodeValue, fieldTypeOfColumn, OVERFLOW_COLUMN, physicalIndexName, type SqlDialect } from "./dialect.ts";
+import { runMigrations, rollbackMigrations, MIGRATIONS_TABLE } from "./migrate.ts";
 import type { MigratableBackend, Migration, MigrationReport } from "./migrate.ts";
 import { UniqueConstraintError, uniqueKey, uniqueKeySets, sameBatchConflict } from "../util/unique.ts";
 
@@ -61,6 +64,13 @@ const TOP = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** Rows per multi-row statement — bounded so `rows × columns` params stay well under driver limits. */
 const MAX_BATCH_ROWS = 500;
+
+/** Do two declared field sets describe the same columns? */
+function sameFields(a: FieldSpec[], b: FieldSpec[]): boolean {
+  if (a.length !== b.length) return false;
+  const byName = new Map(a.map((field) => [field.name, field.type]));
+  return b.every((field) => byName.get(field.name) === field.type);
+}
 
 /** Group persisted changes by model, preserving first-seen order. */
 function groupByModel(changes: PersistedChange[]): Map<string, PersistedChange[]> {
@@ -101,15 +111,20 @@ export class SqlBackend
     AggregatingBackend,
     RawQueryable<SqlRawQuery>,
     TransactionalBackend,
-    MigratableBackend
+    MigratableBackend,
+    LeasingBackend
 {
   readonly capabilities: Capabilities;
+  /** Declared fields are real columns: a model's layout decides where its values are stored. */
+  readonly columnar = true;
 
   private readonly dialect: SqlDialect;
   private readonly exec: SqlExecutor;
   private readonly schemas = new Map<string, FieldSpec[]>();
   private readonly indexes = new Map<string, IndexSpec[]>();
   private readonly provisioned = new Map<string, Promise<unknown>>();
+  /** Models whose layout this backend changed (registration or DDL) — what a transaction scope hands back. */
+  private readonly touched = new Set<string>();
   private readonly uniquePreCheck: boolean;
   private saveQueue: PersistedChange[] = [];
   private removeQueue: PersistedChange[] = [];
@@ -125,14 +140,346 @@ export class SqlBackend
       sortPushdown: true,
       joins: false,
       transactions: typeof executor.transaction === "function",
+      transactionalDdl: dialect.name !== "mysql", // MySQL commits implicitly on DDL
       changeFeed: true
     };
   }
 
   async registerModel(model: string, indexes: IndexSpec[], fields: FieldSpec[] = []): Promise<void> {
+    this.touched.add(model);
+    // Provisioning is memoized per model, so a *re-registration* that widens the declared field set
+    // would otherwise update the field list without ever creating the columns — and every subsequent
+    // query would then name a column that isn't there. Drop the memo when the shape actually changes.
+    // A provisioning run before any registration (a write to a model not yet defined) knew no columns:
+    // it doesn't stand for this layout either.
+    // A changed index set counts too: restoring a model's unique indexes after a migration pass (or
+    // declaring one whose build failed over duplicates since removed) must build them.
+    const previous = this.schemas.get(model);
+    const previousIndexes = this.indexes.get(model);
+    if (!previous || !sameFields(previous, fields) || JSON.stringify(previousIndexes ?? []) !== JSON.stringify(indexes)) {
+      this.provisioned.delete(model);
+    }
     this.schemas.set(model, fields);
     this.indexes.set(model, indexes);
     await this.ensure(model);
+  }
+
+  /**
+   * Realize a migration operation as DDL, or decline so the portable executor rewrites rows instead
+   * (ARCHITECTURE.md §11). Declining is routine, not a failure: a field held in the `_extra` JSON
+   * overflow — a relation, or anything the model never declared as a scalar — has no column to alter,
+   * and emitting DDL against one would simply throw.
+   */
+  async lowerMigrationOp(op: MigrationOp, ctx: Context): Promise<{ rows: number } | null> {
+    return this.lowerRecorded(op, ctx, null);
+  }
+
+  async lowerMigrationOpRecorded(
+    op: MigrationOp,
+    ctx: Context,
+    record: (tx: Backend) => Promise<void>
+  ): Promise<{ rows: number } | null> {
+    return this.lowerRecorded(op, ctx, record);
+  }
+
+  /**
+   * Run an op's statements. With `record`, its data changes (not its DDL, which MySQL would commit
+   * anyway) run in one transaction with `record`: an op like a JSON-quoting retype must not run twice,
+   * and a runner that journals it as done in that same transaction guarantees it can't.
+   */
+  private async lowerRecorded(
+    op: MigrationOp,
+    ctx: Context,
+    record: ((tx: Backend) => Promise<void>) | null
+  ): Promise<{ rows: number } | null> {
+    const present = "model" in op ? await this.liveColumns(op.model) : new Set<string>();
+    let result: { rows: number } | null;
+    let data: Statement[] = [];
+    if (op.kind === "dropIndex") {
+      result = await this.dropIndexNamed(op.model, op.index);
+    } else {
+      if (op.kind === "copyField" && !(await this.copiesAsStored(op))) return null;
+      const statements = lowerToSql(op, this.dialect, present, "model" in op ? await this.indexColumnTypes(op) : undefined);
+      if (!statements) return null;
+      if (retypeThenRewrite(op)) {
+        // Convert the column natively, then decline: the reference pass rewrites each value into
+        // `coerce()`'s text form (safe to repeat, so no journalling needed here).
+        await this.runStatements(op, statements, this.exec);
+        if ("model" in op) this.refreshModel(op);
+        return null;
+      }
+      const deferred = record && this.exec.transaction ? statements.filter(isDataStatement) : [];
+      data = deferred;
+      result = { rows: await this.runStatements(op, statements.filter((statement) => !deferred.includes(statement)), this.exec) };
+    }
+    // The DDL has run (and, on MySQL, committed): follow the table's new shape now, before anything
+    // that can still fail — a stale layout would name a dropped column on every later write.
+    if ("model" in op && changesColumns(op)) this.refreshModel(op);
+    if (record) {
+      await this.transaction(async (tx) => {
+        result!.rows += await this.runStatements(op, data, (tx as SqlBackend).exec);
+        await record(tx);
+      }, ctx);
+    }
+    return result;
+  }
+
+  private async runStatements(op: MigrationOp, statements: Statement[], exec: SqlExecutor): Promise<number> {
+    let rows = 0;
+    for (const statement of statements) {
+      let result: unknown;
+      try {
+        result = await exec.run(statement.sql, statement.params);
+      } catch (error) {
+        // MySQL's index DDL has no IF [NOT] EXISTS. A retry after a crash between the DDL and the
+        // journal write must find the index already in its target state and carry on, not fail.
+        if (!alreadyInTargetState(op, error)) throw error;
+      }
+      rows += Array.isArray(result) ? result.length : 0;
+    }
+    return rows;
+  }
+
+  /**
+   * Column types an op's lowering depends on. An index added by a migration usually runs before the
+   * model is defined in this process, so the declared layout may not know the column at all: read the
+   * table's physical types too — they decide whether MySQL needs a key-length prefix. (A copy goes by
+   * the declared types alone: every text-backed type reads back from the catalog as plain text.)
+   */
+  private async indexColumnTypes(op: MigrationOp & { model: string }): Promise<Map<string, string>> {
+    const types = this.columnTypes(op.model);
+    if (op.kind !== "addIndex") return types;
+    for (const field of await this.liveFieldSpecs(op.model)) types.set(field.name, field.type);
+    return types;
+  }
+
+  /**
+   * Whether a plain `SET to = from` is `coerce()`'s result: both fields hold the copy's type. It is
+   * otherwise the engine's cast (refusing text → bigint, rounding 1.5, reading 'abc' as 0) or a raw copy
+   * between text-backed types that store values differently (`array`/`scalar` hold JSON, `text` doesn't),
+   * and the reference converts each value instead. Declared types decide; where the model isn't
+   * registered, the catalog's — which tell text-backed types apart only as far as "text".
+   */
+  private async copiesAsStored(
+    op: Extract<MigrationOp, { kind: "copyField" }>,
+    catalog?: ReadonlyMap<string, string>
+  ): Promise<boolean> {
+    const declared = this.columnTypes(op.model);
+    if (declared.has(op.from) || declared.has(op.to)) return declared.get(op.from) === op.type && declared.get(op.to) === op.type;
+    const physical = catalog ?? new Map((await this.liveFieldSpecs(op.model)).map((field) => [field.name, field.type]));
+    const kind = fieldTypeOfColumn(this.dialect.columnType(op.type));
+    return physical.get(op.from) === kind && physical.get(op.to) === kind;
+  }
+
+  /** Whether the table exists, asked of the catalog: nothing is provisioned. */
+  async hasModel(model: string): Promise<boolean> {
+    const probe = this.dialect.columnsQuery(model);
+    return (await this.exec.run(probe.sql, probe.params)).length > 0;
+  }
+
+  /**
+   * The table's physical columns as field specs — including ones the model no longer declares. A
+   * migration pass registers these alongside the declared layout, so a transform reading a column
+   * the application has since stopped declaring sees its values instead of `undefined`.
+   */
+  async liveFieldSpecs(model: string): Promise<FieldSpec[]> {
+    const probe = this.dialect.columnTypesQuery(model);
+    const rows = await this.exec.run(probe.sql, probe.params);
+    return rows
+      .map((row) => ({ name: String(row.column_name), type: fieldTypeOfColumn(String(row.data_type)) }))
+      .filter((field) => field.name !== "uuid" && field.name !== OVERFLOW_COLUMN);
+  }
+
+  /**
+   * Drop a model's index by its declared name. Provisioning names it `<model>_<name>`; an index made by
+   * the original SQL-only migration builder carries the bare name. Look up which of the two this table
+   * actually has, so neither a legacy index is missed nor another table's same-named index dropped.
+   */
+  private async dropIndexNamed(model: string, declared: string): Promise<{ rows: number }> {
+    const physical = physicalIndexName(model, declared);
+    let target: string | null = physical;
+    try {
+      const probe = this.dialect.indexesQuery(model);
+      const names = new Set((await this.exec.run(probe.sql, probe.params)).map((row) => String(row.name)));
+      target = names.has(physical) ? physical : names.has(declared) ? declared : null;
+    } catch {
+      // No index catalog to ask (an in-process stand-in): drop the provisioned name if it exists.
+    }
+    if (target !== null) {
+      try {
+        await this.exec.run(this.dialect.finalize(this.dialect.dropIndex(model, target)), []);
+      } catch (error) {
+        if (!alreadyInTargetState({ kind: "dropIndex", model, index: target }, error)) throw error;
+      }
+    }
+    const fields = this.indexes.get(model);
+    if (fields) this.indexes.set(model, fields.filter((index) => index.name !== declared));
+    return { rows: 0 };
+  }
+
+  /**
+   * Claim the lease with one conditional write. The seed insert never overwrites an existing row, and
+   * the `UPDATE … WHERE` only lands when the lease is expired or already ours. Each is atomic on its
+   * own, so two runners can never both read "free" and both claim.
+   */
+  async acquireLease(model: string, key: string, owner: string, now: number, ttlMs: number, _ctx: Context): Promise<boolean> {
+    await this.ensure(model);
+    const table = this.dialect.ref(model);
+    const [uuid, ownerCol, expires] = [this.dialect.column("uuid"), this.dialect.column("owner"), this.dialect.column("expiresAt")];
+    const seed =
+      this.dialect.name === "mysql"
+        ? `INSERT IGNORE INTO ${table} (${uuid}, ${ownerCol}, ${expires}) VALUES (?, ?, ?)`
+        : `INSERT INTO ${table} (${uuid}, ${ownerCol}, ${expires}) VALUES (?, ?, ?) ON CONFLICT (${uuid}) DO NOTHING`;
+    await this.exec.run(this.dialect.finalize(seed), [key, owner, now + ttlMs]);
+    await this.exec.run(
+      this.dialect.finalize(
+        `UPDATE ${table} SET ${ownerCol} = ?, ${expires} = ? WHERE ${uuid} = ? AND (${expires} IS NULL OR ${expires} <= ? OR ${ownerCol} = ?)`
+      ),
+      [owner, now + ttlMs, key, now, owner]
+    );
+    const rows = await this.exec.run(this.dialect.finalize(`SELECT ${ownerCol} AS owner FROM ${table} WHERE ${uuid} = ?`), [key]);
+    return rows.length === 1 && String(rows[0]!.owner) === owner;
+  }
+
+  async releaseLease(model: string, key: string, owner: string, _ctx: Context): Promise<void> {
+    await this.ensure(model);
+    const [uuid, ownerCol] = [this.dialect.column("uuid"), this.dialect.column("owner")];
+    await this.exec.run(
+      this.dialect.finalize(`DELETE FROM ${this.dialect.ref(model)} WHERE ${uuid} = ? AND ${ownerCol} = ?`),
+      [key, owner]
+    );
+  }
+
+  /**
+   * Migration names recorded in the original SQL-only tracking table.
+   *
+   * An already-deployed database has a populated `_object_repository_migrations` that the portable
+   * journal knows nothing about. Without adopting those names, the first run under the new mechanism
+   * would consider every historical migration pending and re-apply it against live data.
+   */
+  async legacyMigrationNames(): Promise<string[]> {
+    const probe = this.dialect.columnsQuery(MIGRATIONS_TABLE);
+    const columns = await this.exec.run(probe.sql, probe.params);
+    if (columns.length === 0) return [];
+    const rows = await this.exec.run(
+      // In the order they were applied: adoption keeps that order, which is what `rollback` walks.
+      `SELECT ${this.dialect.column("name")} AS name FROM ${this.dialect.ref(MIGRATIONS_TABLE)} ORDER BY ${this.dialect.column("applied_at")}, ${this.dialect.column("name")}`,
+      []
+    );
+    return rows.map((row) => String(row.name));
+  }
+
+  /**
+   * The rendered SQL for a plan preview. Never executed. The columns come from the table itself — not
+   * the run's cache, which a plan never fills and a later run must not inherit — and follow each op.
+   */
+  async previewMigrationOps(ops: MigrationOp[]): Promise<string[][]> {
+    const tables = new Map<string, Set<string>>();
+    // The catalog's types, followed through the ops like the columns: a copy into a column an earlier
+    // op adds is judged by the type that op gives it.
+    const catalogs = new Map<string, Map<string, string>>();
+    const catalogOf = async (model: string): Promise<Map<string, string>> => {
+      let catalog = catalogs.get(model);
+      if (!catalog) {
+        catalog = new Map((await this.liveFieldSpecs(model)).map((field) => [field.name, field.type]));
+        catalogs.set(model, catalog);
+      }
+      return catalog;
+    };
+    const columnsOf = async (model: string): Promise<Set<string>> => {
+      let columns = tables.get(model);
+      if (!columns) {
+        const probe = this.dialect.columnsQuery(model);
+        columns = new Set((await this.exec.run(probe.sql, probe.params)).map((row) => String(row.column_name)));
+        tables.set(model, columns);
+      }
+      return columns;
+    };
+    const previews: string[][] = [];
+    for (const op of ops) {
+      const present = "model" in op ? await columnsOf(op.model) : new Set<string>();
+      const types = "model" in op ? await this.indexColumnTypes(op) : undefined;
+      const native = op.kind !== "copyField" || (await this.copiesAsStored(op, await catalogOf(op.model)));
+      const statements = native ? (lowerToSql(op, this.dialect, present, types) ?? []) : [];
+      previews.push(statements.map((statement) => statement.sql));
+      if ("model" in op) {
+        followColumns(present, op);
+        const catalog = await catalogOf(op.model);
+        if (op.kind === "createModel" && catalog.size === 0) {
+          for (const field of op.fields) catalog.set(field.name, fieldTypeOfColumn(this.dialect.columnType(field.type)));
+        } else if (op.kind === "addField") catalog.set(op.field, fieldTypeOfColumn(this.dialect.columnType(op.type)));
+        else if (op.kind === "dropField") catalog.delete(op.field);
+        else if (op.kind === "renameField" && catalog.has(op.from)) {
+          catalog.set(op.to, catalog.get(op.from)!);
+          catalog.delete(op.from);
+        } else if (op.kind === "retypeField") catalog.set(op.field, fieldTypeOfColumn(this.dialect.columnType(op.to)));
+      }
+    }
+    return previews;
+  }
+
+  /**
+   * The columns a table actually has, read afresh for every op: a raw SQL step, a registration, or
+   * another process between two runs can change them, and a stale answer re-adds a column or misses
+   * one. One catalog query per migration op is nothing next to what the op itself does.
+   */
+  private async liveColumns(model: string): Promise<Set<string>> {
+    const probe = this.dialect.columnsQuery(model);
+    const rows = await this.exec.run(probe.sql, probe.params);
+    return new Set(rows.map((row) => String(row.column_name)));
+  }
+
+  /**
+   * Track a model's shape through the DDL just applied.
+   *
+   * Both halves matter. The cached column set and provisioning memo go stale immediately — without
+   * clearing them the next write would still name a column that has just been dropped, or miss one
+   * just added. And `schemas` drives both `encodeRow` and `decodeRow`, so after an
+   * `ALTER TABLE ... RENAME COLUMN` the physical column has moved but reads would still look for the
+   * old name and silently return nothing for it.
+   */
+  private refreshModel(op: MigrationOp & { model: string }): void {
+    this.touched.add(op.model);
+    this.provisioned.delete(op.model);
+
+    const fields = this.schemas.get(op.model);
+    switch (op.kind) {
+      case "createModel": {
+        // `CREATE TABLE IF NOT EXISTS` may have been a no-op on an existing table: keep the columns
+        // already known, or they vanish from reads and writes to them go to the overflow.
+        const known = new Set(op.fields.map((field) => field.name));
+        this.schemas.set(op.model, [...op.fields, ...(fields ?? []).filter((field) => !known.has(field.name))]);
+        break;
+      }
+      case "dropModel":
+        this.schemas.delete(op.model);
+        this.indexes.delete(op.model);
+        break;
+      case "addField":
+        if (fields && !fields.some((field) => field.name === op.field)) {
+          this.schemas.set(op.model, [...fields, { name: op.field, type: op.type }]);
+        }
+        break;
+      case "dropField":
+        if (fields) this.schemas.set(op.model, fields.filter((field) => field.name !== op.field));
+        break;
+      case "renameField":
+        if (fields) {
+          this.schemas.set(
+            op.model,
+            fields.map((field) => (field.name === op.from ? { name: op.to, type: field.type } : field))
+          );
+        }
+        break;
+      case "retypeField":
+        if (fields) {
+          this.schemas.set(
+            op.model,
+            fields.map((field) => (field.name === op.field ? { name: field.name, type: op.to } : field))
+          );
+        }
+        break;
+    }
   }
 
   async query(plan: QueryPlan, _ctx: Context): Promise<JsonObject[]> {
@@ -245,7 +592,7 @@ export class SqlBackend
   }
 
   async persist(_ctx: Context): Promise<PersistResult> {
-    const saved = this.saveQueue;
+    let saved = this.saveQueue;
     const removed = this.removeQueue;
     this.saveQueue = [];
     this.removeQueue = [];
@@ -255,6 +602,9 @@ export class SqlBackend
         change.record.uuid = generateUuid();
       }
     }
+    // A record saved twice before one persist is written once, as last saved: Postgres refuses to
+    // upsert the same row twice in one statement, and the later save carries the whole record anyway.
+    saved = collapseSaves(saved);
     // Provision tables/indexes (DDL) *before* the transaction: MySQL implicitly commits on DDL, so a
     // CREATE inside the tx would break its atomicity. The writes then run as one atomic unit.
     for (const model of new Set([...saved, ...removed].map((c) => c.model))) await this.ensure(model);
@@ -272,6 +622,10 @@ export class SqlBackend
         const columns = this.columns(model);
         for (const { updateColumns, items } of this.bucketByDirtyColumns(model, changes)) {
           for (const chunk of chunked(items, MAX_BATCH_ROWS)) {
+            if (this.dialect.name === "mysql") {
+              await this.writeMySqlChunk(exec, model, columns, updateColumns, chunk);
+              continue;
+            }
             const params = chunk.flatMap((c) => this.encodeRow(model, c.record));
             await exec.run(this.dialect.upsertMany(model, columns, chunk.length, updateColumns), params);
           }
@@ -301,6 +655,88 @@ export class SqlBackend
   }
 
   /**
+   * MySQL has no upsert keyed on one constraint: `ON DUPLICATE KEY UPDATE` fires on *any* unique key,
+   * so a new record colliding with another row on a secondary unique field silently overwrote that
+   * other row. Split the paths instead: rows whose uuid already exists are updated by uuid, the rest
+   * are plainly inserted — and a collision on another unique key is then an error, not a rewrite.
+   */
+  private async writeMySqlChunk(
+    exec: SqlExecutor,
+    model: string,
+    columns: string[],
+    updateColumns: string[] | undefined,
+    chunk: PersistedChange[]
+  ): Promise<void> {
+    // The last write to a uuid within one batch wins, as it did under the upsert.
+    const byUuid = new Map(chunk.map((change) => [String(change.record.uuid), change]));
+    const uuids = [...byUuid.keys()];
+    // A plain read, not `FOR UPDATE`: locking rows that don't exist yet takes gap locks, and two writers
+    // probing the same new uuid would deadlock. A writer that slips in between is caught at the insert.
+    const found = await exec.run(
+      `SELECT \`uuid\` AS uuid FROM ${this.dialect.ref(model)} WHERE \`uuid\` IN (${uuids.map(() => "?").join(", ")})`,
+      uuids
+    );
+    let existing = new Set(found.map((row) => String(row.uuid)));
+    if (existing.size) {
+      // Lock the rows that do exist — record locks by primary key, no gap locks — so a writer deleting
+      // one before the UPDATE can't turn it into a silent no-op. A row gone by now isn't locked, drops
+      // out of the set, and is inserted instead.
+      const ids = [...existing];
+      const locked = await exec.run(
+        `SELECT \`uuid\` AS uuid FROM ${this.dialect.ref(model)} WHERE \`uuid\` IN (${ids.map(() => "?").join(", ")}) FOR UPDATE`,
+        ids
+      );
+      existing = new Set(locked.map((row) => String(row.uuid)));
+    }
+
+    const inserts = [...byUuid.values()].filter((change) => !existing.has(String(change.record.uuid)));
+    if (inserts.length) {
+      const insert = (changes: PersistedChange[]) =>
+        exec.run(
+          `INSERT INTO ${this.dialect.ref(model)} (${columns.map((c) => this.dialect.column(c)).join(", ")}) VALUES ${changes
+            .map(() => `(${columns.map(() => "?").join(", ")})`)
+            .join(", ")}`,
+          changes.flatMap((change) => this.encodeRow(model, change.record))
+        );
+      try {
+        await insert(inserts);
+      } catch (error) {
+        if (!isPrimaryKeyDuplicate(error)) throw error; // another unique key: the collision it should be
+        // Another writer inserted one of these uuids since the read — the race the old upsert settled
+        // as last-write-wins. Settle it the same way: row by row, an existing uuid is updated instead.
+        for (const change of inserts) {
+          try {
+            await insert([change]);
+          } catch (rowError) {
+            if (!isPrimaryKeyDuplicate(rowError)) throw rowError;
+            existing.add(String(change.record.uuid));
+          }
+        }
+      }
+    }
+
+    const setColumns = updateColumns ?? columns.filter((column) => column !== "uuid");
+    const updates = [...byUuid.values()].filter((change) => existing.has(String(change.record.uuid)));
+    if (!setColumns.length || !updates.length) return;
+    // One statement for the whole chunk, keyed by uuid: `col = CASE uuid WHEN ? THEN ? … END`.
+    const rows = updates.map((change) => ({ uuid: String(change.record.uuid), values: this.encodeRow(model, change.record) }));
+    const params: unknown[] = [];
+    const sets = setColumns.map((column) => {
+      const index = columns.indexOf(column);
+      const cases = rows.map((row) => {
+        params.push(row.uuid, row.values[index]);
+        return "WHEN ? THEN ?";
+      });
+      return `${this.dialect.column(column)} = CASE \`uuid\` ${cases.join(" ")} END`;
+    });
+    params.push(...rows.map((row) => row.uuid));
+    await exec.run(
+      `UPDATE ${this.dialect.ref(model)} SET ${sets.join(", ")} WHERE \`uuid\` IN (${rows.map(() => "?").join(", ")})`,
+      params
+    );
+  }
+
+  /**
    * Run `fn` inside one real DB transaction, handing it a tx-scoped backend bound to the same
    * checked-out connection. Reads `fn` issues on that scoped backend see writes it has already
    * persisted (uncommitted) — true interactive isolation. Any writes queued on *this* (outer) backend
@@ -317,22 +753,61 @@ export class SqlBackend
       await this.persist(ctx);
       return result;
     }
+    let scoped: SqlBackend | undefined;
     try {
-      return await this.exec.transaction(async (txExec) => {
-        const scoped = this.forTransaction(txExec);
+      const result = await this.exec.transaction(async (txExec) => {
+        scoped = this.forTransaction(txExec);
+        // Writes queued here before the transaction began go first: `fn` may persist its own through the
+        // scope, and folding the older ones in only at the end would let them land after — overwriting,
+        // say, a newer migration marker with the stale one queued before it.
+        const earlierSaves = new Set(this.saveQueue);
+        const earlierRemoves = new Set(this.removeQueue);
+        scoped.saveQueue.push(...this.saveQueue);
+        scoped.removeQueue.push(...this.removeQueue);
+        this.saveQueue = [];
+        this.removeQueue = [];
         const result = await fn(scoped);
-        // Fold in writes queued on the outer backend (repos not obtained from the tx scope) so the
-        // whole unit commits together, then flush once on the tx connection.
-        scoped.saveQueue.unshift(...this.saveQueue);
-        scoped.removeQueue.unshift(...this.removeQueue);
+        // Fold in writes queued on the outer backend meanwhile (repos not obtained from the tx scope) so
+        // the whole unit commits together — after the earlier ones still queued, which they may
+        // supersede, and ahead of the scope's own — then flush once on the tx connection.
+        const after = <T,>(queue: T[], earlier: Set<T>): number => {
+          let index = 0;
+          while (index < queue.length && earlier.has(queue[index]!)) index++;
+          return index;
+        };
+        scoped.saveQueue.splice(after(scoped.saveQueue, earlierSaves), 0, ...this.saveQueue);
+        scoped.removeQueue.splice(after(scoped.removeQueue, earlierRemoves), 0, ...this.removeQueue);
         this.saveQueue = [];
         this.removeQueue = [];
         await scoped.persist(ctx);
         return result;
       });
+      // Committed. Anything the scope learned about table shapes (a migration's DDL, a re-registered
+      // model) is now true of the database, so this backend must stop encoding against the old one.
+      if (scoped) this.adoptSchema(scoped);
+      return result;
     } catch (error) {
       this.discardPending();
       throw error;
+    }
+  }
+
+  /**
+   * Take over what the scope changed — and only that. The scope started from a snapshot of this
+   * backend, so copying back everything would undo whatever was registered here while the
+   * transaction ran (a `define()` meanwhile, or a re-registration with new fields).
+   */
+  private adoptSchema(scoped: SqlBackend): void {
+    for (const model of scoped.touched) {
+      const fields = scoped.schemas.get(model);
+      if (fields) this.schemas.set(model, fields);
+      else this.schemas.delete(model);
+      const indexes = scoped.indexes.get(model);
+      if (indexes) this.indexes.set(model, indexes);
+      else this.indexes.delete(model);
+      const provisioned = scoped.provisioned.get(model);
+      if (provisioned) this.provisioned.set(model, provisioned);
+      else this.provisioned.delete(model);
     }
   }
 
@@ -432,7 +907,6 @@ export class SqlBackend
         }
       }
     }
-
     const known = new Set(fields.map((f) => f.name));
     for (const index of this.indexes.get(model) ?? []) {
       // Columnar indexes only: TTL/text are Mongo features; skip an index over a field with no column.
@@ -444,7 +918,7 @@ export class SqlBackend
       // skip, dropping that table's constraint. `<model>_<name>` keeps it unique per schema. Fold any
       // non-identifier characters (a developer-supplied name like "songId-userId") to `_` so the
       // dialect's identifier check accepts it.
-      const name = `${model}_${index.name}`.replace(/[^A-Za-z0-9_]/g, "_");
+      const name = physicalIndexName(model, index.name);
       // CREATE INDEX may already exist on a persistent DB (MySQL has no IF NOT EXISTS) — ignore that.
       // Pass column types so MySQL can prefix-length a TEXT-backed index column.
       await this.exec.run(this.dialect.createIndex(model, name, cols, !!index.unique, this.columnTypes(model)), []).catch(() => {});
@@ -541,23 +1015,6 @@ export class SqlBackend
   }
 }
 
-/** Encode a stored value for its column. Scalars go in typed columns; JSON-ish fields are text. */
-function encodeValue(type: string, value: JsonValue | undefined, dialect: SqlDialect): unknown {
-  if (value === undefined || value === null) return null;
-  switch (type) {
-    case "boolean":
-      return dialect.name === "postgres" ? Boolean(value) : value ? 1 : 0;
-    case "json": // the json() codec already produced a JSON string — keep it opaque
-      return typeof value === "string" ? value : JSON.stringify(value);
-    case "array": // native array → JSON string
-    case "embedded": // native subdocument → JSON string (queryable via a JSON extraction)
-    case "scalar": // custom stored type → JSON-encode so any JsonValue round-trips
-      return JSON.stringify(value);
-    default: // text / integer / float / date pass straight through
-      return value;
-  }
-}
-
 /** Decode a column value back to its stored form (the shape the repository's codec expects). */
 function decodeValue(type: string, value: unknown): JsonValue {
   switch (type) {
@@ -585,4 +1042,72 @@ function coerce(params: JsonValue[]): unknown[] {
     if (value !== null && typeof value === "object") return JSON.stringify(value);
     return value;
   });
+}
+
+/**
+ * One change per record: the last save of each, with the fields any of its saves changed (a save with
+ * no dirty hint makes the whole record dirty).
+ */
+function collapseSaves(changes: PersistedChange[]): PersistedChange[] {
+  const byRecord = new Map<string, PersistedChange>();
+  for (const change of changes) {
+    const key = `${change.model}\0${String(change.record.uuid)}`;
+    const previous = byRecord.get(key);
+    if (!previous) {
+      byRecord.set(key, change);
+      continue;
+    }
+    byRecord.delete(key); // keep the queue's order: this record now goes where its last save was
+    const { dirty: _dropped, ...rest } = change;
+    byRecord.set(
+      key,
+      previous.dirty && change.dirty ? { ...rest, dirty: [...new Set([...previous.dirty, ...change.dirty])] } : rest
+    );
+  }
+  return [...byRecord.values()];
+}
+
+/** A statement that changes rows rather than the schema — one a transaction can hold, even on MySQL. */
+function isDataStatement(statement: Statement): boolean {
+  return /^\s*(UPDATE|INSERT|DELETE)\b/i.test(statement.sql);
+}
+
+/** A table's columns after `op`, for a preview that runs nothing. */
+function followColumns(columns: Set<string>, op: MigrationOp): void {
+  switch (op.kind) {
+    case "createModel":
+      if (columns.size === 0) for (const name of ["uuid", ...op.fields.map((field) => field.name), OVERFLOW_COLUMN]) columns.add(name);
+      break;
+    case "dropModel":
+      columns.clear();
+      break;
+    case "addField":
+      if (columns.size > 0) columns.add(op.field);
+      break;
+    case "dropField":
+      columns.delete(op.field);
+      break;
+    case "renameField":
+      if (columns.has(op.from) && !columns.has(op.to)) {
+        columns.delete(op.from);
+        columns.add(op.to);
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+/** MySQL: `CREATE INDEX` (standalone, or a replayed `createModel`'s) on a name that exists (1061), `DROP INDEX` on one that doesn't (1091). */
+function alreadyInTargetState(op: MigrationOp, error: unknown): boolean {
+  const errno = (error as { errno?: unknown } | null)?.errno;
+  return ((op.kind === "addIndex" || op.kind === "createModel") && errno === 1061) || (op.kind === "dropIndex" && errno === 1091);
+}
+
+/** MySQL's duplicate-entry error (1062) on the primary key — a uuid another writer inserted first. */
+function isPrimaryKeyDuplicate(error: unknown): boolean {
+  const { errno, message } = (error ?? {}) as { errno?: unknown; message?: unknown };
+  // Anchored to the end: the message also quotes the duplicate *value*, which could itself contain
+  // "for key 'PRIMARY'" and pass a secondary-key clash off as a uuid race.
+  return errno === 1062 && /for key '(?:[^']*\.)?PRIMARY'$/.test(String(message));
 }

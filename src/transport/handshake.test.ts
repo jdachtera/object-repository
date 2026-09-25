@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { InMemoryBackend } from "../backends/memory/InMemoryBackend.js";
 import { BackendAdapter } from "./BackendAdapter.js";
 import { InProcessTransport } from "./InProcessTransport.js";
-import { RemoteBackend, SchemaMismatchError } from "./RemoteBackend.js";
+import { RemoteBackend, SchemaMismatchError, SchemaTooOldError, SchemaTooNewError } from "./RemoteBackend.js";
 import { RepositoryManager } from "../repository/RepositoryManager.js";
 import { text, integer } from "../properties/factories.js";
 import { schemaFingerprint } from "../properties/fingerprint.js";
@@ -58,5 +58,131 @@ describe("RemoteBackend.handshake", () => {
   it("is a no-op when the server advertises no fingerprint", async () => {
     const remote = new RemoteBackend(server(undefined), new InMemoryBackend().capabilities);
     await expect(remote.handshake("anything", ctx)).resolves.toBeUndefined();
+  });
+});
+
+describe("a rolling deploy: the two ends legitimately differ", () => {
+  /** The server after the rename, mid-window. */
+  const serverManager = () => {
+    const orm = new RepositoryManager({
+      backend: new InMemoryBackend(),
+      schema: { schemaVersion: 7, minSupportedSchemaVersion: 5 }
+    });
+    orm.define({
+      name: "User",
+      properties: { fullName: text(), name: text({ deprecatedSince: 7, mirrors: "fullName" }) }
+    });
+    return orm;
+  };
+
+  /** An older client instance, still deployed, that only knows the original field. */
+  const clientManager = (schemaVersion: number) => {
+    const orm = new RepositoryManager({ backend: new InMemoryBackend(), schema: { schemaVersion } });
+    orm.define({ name: "User", properties: { name: text() } });
+    return orm;
+  };
+
+  const connect = (server: RepositoryManager) => {
+    const adapter = new BackendAdapter(
+      new InMemoryBackend(),
+      server.fingerprint(),
+      undefined,
+      undefined,
+      undefined,
+      { schemaVersion: 7, minSupportedSchemaVersion: 5 }
+    );
+    return new RemoteBackend(new InProcessTransport(adapter), new InMemoryBackend().capabilities);
+  };
+
+  it("connects even though the fingerprints differ, because both declare a version", async () => {
+    const server = serverManager();
+    const client = clientManager(6);
+    expect(client.fingerprint()).not.toBe(server.fingerprint()); // the window, by construction
+
+    await expect(
+      connect(server).handshake(client.fingerprint(), ctx, { schemaVersion: 6 })
+    ).resolves.toBeUndefined();
+  });
+
+  it("refuses a client below the server's floor, so it fails at connect rather than mid-query", async () => {
+    const server = serverManager();
+    const stale = clientManager(4);
+    await expect(connect(server).handshake(stale.fingerprint(), ctx, { schemaVersion: 4 })).rejects.toThrow(
+      SchemaTooOldError
+    );
+  });
+
+  it("refuses a client ahead of the server", async () => {
+    const server = serverManager();
+    const ahead = clientManager(9);
+    await expect(connect(server).handshake(ahead.fingerprint(), ctx, { schemaVersion: 9 })).rejects.toThrow(
+      SchemaTooNewError
+    );
+  });
+
+  it("still refuses drift when the client declares no version at all", async () => {
+    // Nothing changes for anyone not using the gate: shapes must match exactly.
+    const server = serverManager();
+    const unversioned = new RepositoryManager({ backend: new InMemoryBackend() });
+    unversioned.define({ name: "User", properties: { name: text() } });
+
+    await expect(connect(server).handshake(unversioned.fingerprint(), ctx)).rejects.toThrow(SchemaMismatchError);
+  });
+});
+
+describe("per-request enforcement over the backend transport", () => {
+  it("refuses a query from a client below the floor even without a handshake, with a typed error", async () => {
+    const { BackendAdapter } = await import("./BackendAdapter.js");
+    const { InProcessTransport } = await import("./InProcessTransport.js");
+    const { RemoteBackend, SchemaTooOldError, SchemaMismatchError } = await import("./RemoteBackend.js");
+    const { InMemoryBackend } = await import("../backends/memory/InMemoryBackend.js");
+    const { SYSTEM_CONTEXT } = await import("../core/types.js");
+    const adapter = new BackendAdapter(new InMemoryBackend(), undefined, undefined, undefined, undefined, { schemaVersion: 7, minSupportedSchemaVersion: 7 });
+    const remote = new RemoteBackend(new InProcessTransport(adapter), new InMemoryBackend().capabilities);
+    const query = remote.query({ model: "User", where: { type: "all" }, order: [], paging: { start: 0 } }, SYSTEM_CONTEXT);
+    await expect(query).rejects.toBeInstanceOf(SchemaTooOldError);
+    await expect(query).rejects.toBeInstanceOf(SchemaMismatchError); // one instanceof catches every refusal
+  });
+});
+
+describe("commands under a versioned server", () => {
+  it("are served for an up-to-date client, and refused for a stale one", async () => {
+    const { BackendAdapter } = await import("./BackendAdapter.js");
+    const { InProcessTransport } = await import("./InProcessTransport.js");
+    const { InMemoryBackend } = await import("../backends/memory/InMemoryBackend.js");
+    const { RepositoryManager } = await import("../repository/RepositoryManager.js");
+    const { command } = await import("./command.js");
+    const commands = { ping: command({ handler: async () => "pong" }) };
+    const adapter = new BackendAdapter(new InMemoryBackend(), undefined, commands, undefined, undefined, { schemaVersion: 3 });
+    const transport = new InProcessTransport(adapter);
+
+    const current = new RepositoryManager({ schema: { schemaVersion: 3 } }).commands<typeof commands>(transport);
+    await expect(current.ping(undefined)).resolves.toBe("pong");
+
+    const stale = new RepositoryManager({ schema: { schemaVersion: 1 } }).commands<typeof commands>(transport);
+    await expect(stale.ping(undefined)).rejects.toMatchObject({ code: "SCHEMA_TOO_OLD" });
+  });
+
+  it("judge a client made before its models are defined by the models it has when it calls", async () => {
+    const { BackendAdapter } = await import("./BackendAdapter.js");
+    const { InProcessTransport } = await import("./InProcessTransport.js");
+    const { InMemoryBackend } = await import("../backends/memory/InMemoryBackend.js");
+    const { RepositoryManager } = await import("../repository/RepositoryManager.js");
+    const { text } = await import("../properties/factories.js");
+    const { command } = await import("./command.js");
+    const commands = { ping: command({ handler: async () => "pong" }) };
+    const serverOrm = new RepositoryManager({ schema: { schemaVersion: 3 } });
+    serverOrm.define({ name: "Note", properties: { body: text() } });
+    const adapter = new BackendAdapter(new InMemoryBackend(), serverOrm.fingerprint(), commands, undefined, undefined, { schemaVersion: 3 });
+    const transport = new InProcessTransport(adapter);
+
+    const orm = new RepositoryManager({ schema: { schemaVersion: 3 } });
+    const client = orm.commands<typeof commands>(transport); // before define()
+    orm.define({ name: "Note", properties: { body: text() } });
+    await expect(client.ping(undefined)).resolves.toBe("pong");
+
+    // A commands-only client has no models: no shape to compare, only its version.
+    const bare = new RepositoryManager({ schema: { schemaVersion: 3 } }).commands<typeof commands>(transport);
+    await expect(bare.ping(undefined)).resolves.toBe("pong");
   });
 });

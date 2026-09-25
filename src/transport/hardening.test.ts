@@ -10,11 +10,181 @@ import { InMemoryBackend } from "../backends/memory/InMemoryBackend.js";
 import { BackendAdapter } from "./BackendAdapter.js";
 import { createRequestListener } from "./http/createRequestListener.js";
 import { attachWebSocketServer } from "./ws/attachWebSocketServer.js";
+import { SCHEMA_HEADER } from "../core/Transport.js";
+import { RemoteBackend } from "./RemoteBackend.js";
+import { HttpTransport } from "./http/HttpTransport.js";
+import { WebSocketTransport } from "./ws/WebSocketTransport.js";
 import { HybridLogicalClock } from "../sync/hlc.js";
 import { RepositoryManager } from "../repository/RepositoryManager.js";
 import { text } from "../properties/factories.js";
 import { eq } from "../expressions/builders.js";
 import { SYSTEM_CONTEXT } from "../core/types.js";
+
+describe("the change feed judges a subscriber's schema as a request would be judged", () => {
+  const versioned = () =>
+    new BackendAdapter(new InMemoryBackend(), undefined, undefined, undefined, undefined, { schemaVersion: 7, minSupportedSchemaVersion: 7 });
+
+  it("refuses an SSE subscriber below the floor, and streams to a current one", async () => {
+    const server: Server = createServer(createRequestListener(versioned()));
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const { port } = server.address() as AddressInfo;
+    try {
+      const stale = await fetch(`http://127.0.0.1:${port}/changes`, { headers: { [SCHEMA_HEADER]: JSON.stringify({ schemaVersion: 5 }) } });
+      expect(stale.status).toBe(409);
+      expect(await stale.json()).toMatchObject({ error: { code: "SCHEMA_TOO_OLD" } });
+      const none = await fetch(`http://127.0.0.1:${port}/changes`);
+      expect(none.status).toBe(409); // no advertisement counts as the oldest
+      const controller = new AbortController();
+      const current = await fetch(`http://127.0.0.1:${port}/changes`, {
+        headers: { [SCHEMA_HEADER]: JSON.stringify({ schemaVersion: 7 }) },
+        signal: controller.signal
+      });
+      expect(current.status).toBe(200);
+      controller.abort();
+    } finally {
+      server.closeAllConnections();
+      server.close();
+    }
+  });
+
+  it("sends a WebSocket subscriber events only once it advertises an accepted schema", async () => {
+    const store = new InMemoryBackend();
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    attachWebSocketServer(
+      wss,
+      new BackendAdapter(store, undefined, undefined, undefined, undefined, { schemaVersion: 7, minSupportedSchemaVersion: 7 })
+    );
+    await new Promise<void>((r) => wss.on("listening", r));
+    const url = `ws://127.0.0.1:${(wss.address() as AddressInfo).port}`;
+    const connect = async () => {
+      const client = new WsClient(url);
+      const frames: Array<Record<string, unknown>> = [];
+      client.on("message", (d) => frames.push(JSON.parse(String(d)) as Record<string, unknown>));
+      await new Promise<void>((r) => client.on("open", () => r()));
+      return { client, frames };
+    };
+    const settle = () => new Promise((r) => setTimeout(r, 50));
+    try {
+      const stale = await connect();
+      const current = await connect();
+      stale.client.send(JSON.stringify({ type: "subscribe", schema: { schemaVersion: 5 } }));
+      current.client.send(JSON.stringify({ type: "subscribe", schema: { schemaVersion: 7 } }));
+      await settle();
+      store.save("Note", { uuid: "n1" }, SYSTEM_CONTEXT);
+      await store.persist(SYSTEM_CONTEXT);
+      await settle();
+      expect(stale.frames).toEqual([{ type: "error", error: expect.objectContaining({ code: "SCHEMA_TOO_OLD" }) }]);
+      expect(current.frames).toEqual([{ type: "event", event: expect.objectContaining({ model: "Note", uuid: "n1" }) }]);
+      stale.client.close();
+      current.client.close();
+    } finally {
+      wss.close();
+    }
+  });
+});
+
+describe("a WebSocket subscriber admitted as version 0", () => {
+  it("loses the feed when it goes on to advertise a version the server refuses", async () => {
+    const store = new InMemoryBackend();
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    attachWebSocketServer(
+      wss,
+      new BackendAdapter(store, undefined, undefined, undefined, undefined, { schemaVersion: 1, minSupportedSchemaVersion: 0 })
+    );
+    await new Promise<void>((r) => wss.on("listening", r));
+    const client = new WsClient(`ws://127.0.0.1:${(wss.address() as AddressInfo).port}`);
+    const frames: Array<Record<string, unknown>> = [];
+    client.on("message", (d) => frames.push(JSON.parse(String(d)) as Record<string, unknown>));
+    await new Promise<void>((r) => client.on("open", () => r()));
+    const settle = () => new Promise((r) => setTimeout(r, 50));
+    try {
+      await settle(); // admitted on connect: no advertisement reads as version 0, within the floor
+      client.send(JSON.stringify({ type: "subscribe", schema: { schemaVersion: 5 } })); // ahead of the server
+      await settle();
+      store.save("Note", { uuid: "n1" }, SYSTEM_CONTEXT);
+      await store.persist(SYSTEM_CONTEXT);
+      await settle();
+      expect(frames).toEqual([{ type: "error", error: expect.objectContaining({ code: "SCHEMA_TOO_NEW" }) }]);
+      client.close();
+    } finally {
+      wss.close();
+    }
+  });
+});
+
+describe("a current client's change feed, end to end", () => {
+  const schema = { schemaVersion: 7, minSupportedSchemaVersion: 7 };
+  const serve = () => new BackendAdapter(new InMemoryBackend(), undefined, undefined, undefined, undefined, schema);
+  const receive = async (remote: RemoteBackend, store: InMemoryBackend) => {
+    // The documented order: a repository subscribes when it is defined, before the handshake that needs
+    // every model defined for its fingerprint.
+    const seen: string[] = [];
+    const stop = remote.changes((event) => seen.push(event.uuid), SYSTEM_CONTEXT);
+    await new Promise((r) => setTimeout(r, 50));
+    await remote.handshake("fp", SYSTEM_CONTEXT, schema);
+    await new Promise((r) => setTimeout(r, 50));
+    store.save("Note", { uuid: "n1" }, SYSTEM_CONTEXT);
+    await store.persist(SYSTEM_CONTEXT);
+    await new Promise((r) => setTimeout(r, 50));
+    stop();
+    return seen;
+  };
+
+  it("over WebSocket", async () => {
+    const adapter = serve();
+    const store = (adapter as unknown as { backend: InMemoryBackend }).backend;
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    attachWebSocketServer(wss, adapter);
+    await new Promise<void>((r) => wss.on("listening", r));
+    const transport = new WebSocketTransport(`ws://127.0.0.1:${(wss.address() as AddressInfo).port}`, { WebSocket: WsClient as never });
+    try {
+      expect(await receive(new RemoteBackend(transport, store.capabilities), store)).toEqual(["n1"]);
+    } finally {
+      transport.close();
+      wss.close();
+    }
+  });
+
+  it("over WebSocket, after the connection drops and reconnects", async () => {
+    const adapter = serve();
+    const store = (adapter as unknown as { backend: InMemoryBackend }).backend;
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    attachWebSocketServer(wss, adapter);
+    await new Promise<void>((r) => wss.on("listening", r));
+    const transport = new WebSocketTransport(`ws://127.0.0.1:${(wss.address() as AddressInfo).port}`, { WebSocket: WsClient as never });
+    const remote = new RemoteBackend(transport, store.capabilities);
+    try {
+      const seen: string[] = [];
+      remote.changes((event) => seen.push(event.uuid), SYSTEM_CONTEXT);
+      await remote.handshake("fp", SYSTEM_CONTEXT, schema);
+      for (const socket of wss.clients) socket.terminate();
+      await new Promise((r) => setTimeout(r, 50));
+      await remote.query({ model: "Note", where: { type: "all" }, order: [], paging: { start: 0 } }, SYSTEM_CONTEXT); // reconnects
+      await new Promise((r) => setTimeout(r, 50));
+      store.save("Note", { uuid: "n2" }, SYSTEM_CONTEXT);
+      await store.persist(SYSTEM_CONTEXT);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(seen).toEqual(["n2"]);
+    } finally {
+      transport.close();
+      wss.close();
+    }
+  });
+
+  it("over HTTP", async () => {
+    const adapter = serve();
+    const store = (adapter as unknown as { backend: InMemoryBackend }).backend;
+    const server: Server = createServer(createRequestListener(adapter));
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    try {
+      const transport = new HttpTransport(`http://127.0.0.1:${(server.address() as AddressInfo).port}`);
+      expect(await receive(new RemoteBackend(transport, store.capabilities), store)).toEqual(["n1"]);
+    } finally {
+      server.closeAllConnections();
+      server.close();
+    }
+  });
+});
 
 describe("WebSocket server survives malformed frames (no process crash)", () => {
   it("ignores a garbage frame and still answers the next valid request", async () => {
@@ -175,5 +345,72 @@ describe("WebSocket auth seam receives the upgrade request", () => {
     } finally {
       await new Promise<void>((r) => wss.close(() => r()));
     }
+  });
+});
+
+describe("network-seam security", () => {
+  it("streams change events only for models the adapter exposes (never reserved ones)", async () => {
+    const store = new InMemoryBackend();
+    const adapter = new BackendAdapter(store, undefined, undefined, ["Note"]);
+    const seen: string[] = [];
+    adapter.subscribe((event) => seen.push(event.model), SYSTEM_CONTEXT);
+    store.save("Note", { uuid: "n1" }, SYSTEM_CONTEXT);
+    store.save("Secret", { uuid: "s1" }, SYSTEM_CONTEXT);
+    store.save("_object_repository_migration_log", { uuid: "j1" }, SYSTEM_CONTEXT);
+    await store.persist(SYSTEM_CONTEXT);
+    expect(seen).toEqual(["Note"]);
+  });
+
+  it("answers 401 when authentication throws, instead of crashing the process", async () => {
+    const server: Server = createServer(
+      createRequestListener(new BackendAdapter(new InMemoryBackend()), {
+        context: () => {
+          throw new Error("bad token");
+        }
+      })
+    );
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    let uncaught: unknown;
+    const onUncaught = (e: unknown) => (uncaught = e);
+    process.on("uncaughtException", onUncaught);
+    try {
+      const { port } = server.address() as AddressInfo;
+      const response = await fetch(`http://127.0.0.1:${port}/rpc`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ method: "query", params: { plan: { model: "X", where: { type: "all" }, order: [], paging: { start: 0 } } } })
+      });
+      expect(response.status).toBe(401);
+      expect(uncaught).toBeUndefined();
+    } finally {
+      process.off("uncaughtException", onUncaught);
+      server.close();
+    }
+  });
+
+  it("survives a socket error, and answers a frame sent while authentication was still running", async () => {
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    let sockets = 0;
+    wss.on("connection", () => sockets++);
+    attachWebSocketServer(wss, new BackendAdapter(new InMemoryBackend()), {
+      context: () => new Promise((resolve) => setTimeout(() => resolve(SYSTEM_CONTEXT), 30))
+    });
+    await new Promise<void>((r) => wss.on("listening", r));
+    const url = `ws://127.0.0.1:${(wss.address() as AddressInfo).port}`;
+    try {
+      const client = new WsClient(url);
+      const reply = new Promise<Record<string, unknown>>((r) => client.on("message", (d) => r(JSON.parse(String(d)))));
+      await new Promise<void>((r) => client.on("open", () => r()));
+      // Sent immediately — before the 30 ms authentication has resolved.
+      client.send(JSON.stringify({ type: "request", id: 1, op: { method: "query", params: { plan: { model: "X", where: { type: "all" }, order: [], paging: { start: 0 } } } } }));
+      expect(await reply).toMatchObject({ type: "response", id: 1 });
+
+      // An `error` on a server-side socket must not throw out of the event emitter.
+      for (const socket of wss.clients) expect(() => socket.emit("error", new Error("bad frame"))).not.toThrow();
+      client.close();
+    } finally {
+      wss.close();
+    }
+    expect(sockets).toBe(1);
   });
 });

@@ -270,3 +270,18 @@ describe("Repository over SQLiteBackend", () => {
     expect(loadedEvent!.users.map((u) => u.name)).toEqual(["Peter"]);
   });
 });
+
+describe("SQLite paging windows", () => {
+  it("returns no rows for an empty or inverted window, never every row", async () => {
+    const { SQLiteBackend } = await import("./sqlite/SQLiteBackend.js");
+    const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    const backend = new SQLiteBackend(new DatabaseSync(":memory:"));
+    for (const uuid of ["a", "b", "c"]) backend.save("T", { uuid }, { identity: null } as never);
+    await backend.persist({} as never);
+    const window = (start: number, end: number) =>
+      backend.query({ model: "T", where: { type: "all" }, order: [], paging: { start, end } }, {} as never);
+    expect(await window(2, 2)).toEqual([]);
+    expect(await window(1, 0)).toEqual([]); // LIMIT -1 would mean "no limit": rows b and c
+    await expect(window("0; DROP TABLE T" as never, 1)).rejects.toThrow(/non-negative integer/);
+  });
+});

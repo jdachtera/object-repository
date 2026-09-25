@@ -71,12 +71,12 @@ await orm.transaction(async (tx) => {
 const adults = await users.all().filter(gt("age", 18)).sort("age").list();
 const peters = await users.all().filter(eq("name", "Peter")).list(); // peters[0] === peter
 
-// versioned migrations for non-additive schema changes (rename/drop/retype + data backfills);
-// each runs once, tracked in _orm_migrations, and rollback() reverts via down():
+// portable migrations for non-additive schema changes (rename/drop/retype + data backfills), on every
+// backend; each runs once, journalled in the store, and rollback() reverts via down():
 await orm.migrate([
-  { name: "0001_add_status", up: (m) => m.addColumn("User", "status", "text") },
-  { name: "0002_backfill", up: (m) => m.sql(`UPDATE "User" SET "status" = 'active'`) },
-  { name: "0003_rename", up: (m) => m.renameColumn("User", "status", "state"), down: (m) => m.renameColumn("User", "state", "status") }
+  { name: "0001_add_status", up: (m) => m.addField("User", "status", "text", { fill: "active" }) },
+  { name: "0002_rename", up: (m) => m.renameField("User", "status", "state", "text"),
+    down: (m) => m.renameField("User", "state", "status", "text") }
 ]);
 ```
 
@@ -310,6 +310,26 @@ await device.reconcile(ctx);
 The query language and model code are identical across all of these — embedded, client/server,
 and offline-sync are backend swaps, not rewrites.
 
+### Version-gated schema migrations
+
+Migrations run on **every** backend — a rename is `ALTER TABLE … RENAME COLUMN` on Postgres and a
+record rewrite on Mongo, IndexedDB or in-memory, with the same result either way.
+
+```ts
+const orm = new RepositoryManager({ backend, schema: { schemaVersion: 7, minSupportedSchemaVersion: 5 } });
+
+const report = await orm.migrate([
+  { name: "0012_fullname", schemaVersion: 7,
+    up: (m) => m.renameField("User", "name", "fullName", "text") }
+]);
+
+report.expanded;  // ["0012_fullname"] — the new field is added and back-filled
+report.deferred;  // the drop, withheld until you raise the floor AND pass applyContracts
+```
+
+A bare `migrate()` never runs a versioned migration's destructive half. See
+[docs/MIGRATIONS.md](docs/MIGRATIONS.md).
+
 ### Migrating between stores
 
 Because every store is the same `Backend` contract and records cross it as plain JSON, moving data
@@ -351,15 +371,10 @@ write-batching — which still fans out.
 The library targets exact parity across backends, but a few things are genuinely engine-specific and
 are pinned by live-engine tests (`src/backends/sqlIntegration.test.ts`) so any change is deliberate:
 
-- **Secondary `unique` indexes under `persist()` diverge between Postgres and MySQL.** The declared
-  index is created on both. But `persist()` upserts by `uuid`, and the two engines scope that upsert
-  differently: Postgres uses `ON CONFLICT (uuid) DO UPDATE`, so a *different* row colliding on a
-  secondary unique field is **not** caught by the conflict target and the write **rejects** (you see
-  the violation). MySQL's `INSERT … ON DUPLICATE KEY UPDATE` can't be scoped to one key — it matches
-  on *every* unique key, so the same collision is absorbed as a no-op UPDATE of the existing row: no
-  error, the new record is silently dropped, and the row count is unchanged. If you rely on secondary
-  unique constraints to surface conflicting writes, do it on Postgres, or validate uniqueness in a
-  command/middleware before `persist()`.
+- **Secondary `unique` indexes are enforced the same way on Postgres and MySQL.** A new record whose
+  unique field collides with a *different* row is rejected on both. (MySQL's `INSERT … ON DUPLICATE
+  KEY UPDATE` fires on every unique key, so `persist()` doesn't use it there: new uuids are plainly
+  inserted and existing ones updated by uuid.)
 
 ## Commands (task-based RPC)
 
@@ -435,6 +450,7 @@ code at all; each store lives behind its own subpath:
 | `object-repository/mysql`        | `MySqlBackend` (inject a `mysql2` client)             |
 | `object-repository/mongo`        | `MongoBackend`                                        |
 | `object-repository/decorators`   | `PolicyBackend`, `observe`, `multiWriteBackend`, `copyBackend`, … |
+| `object-repository/migrations`   | portable version-gated migrations, `formatPlan`, the operation IR |
 | `object-repository/sync`         | `SyncBackend`, `InMemorySyncTarget`                   |
 | `object-repository/transport`    | `RemoteBackend`, HTTP/WS/in-process transports        |
 | `object-repository/compat/mongo` | the Mongo query-language facade (`mongoCollection`)   |

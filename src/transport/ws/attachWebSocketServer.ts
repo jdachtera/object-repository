@@ -1,6 +1,6 @@
 import type { Context } from "../../core/types.ts";
 import { SYSTEM_CONTEXT } from "../../core/types.ts";
-import type { WireRequest } from "../../core/Transport.ts";
+import type { WireError, WireRequest } from "../../core/Transport.ts";
 import type { BackendAdapter } from "../BackendAdapter.ts";
 
 /** Minimal `ws`-style socket/server surfaces, so this stays free of a runtime `ws` dependency. */
@@ -9,6 +9,7 @@ interface SocketLike {
   close(): void;
   on(event: "message", listener: (data: unknown) => void): void;
   on(event: "close", listener: () => void): void;
+  on(event: "error", listener: (error: unknown) => void): void;
 }
 /** The upgrade request `ws` hands to the `connection` listener (an `http.IncomingMessage` at runtime) —
  *  structurally typed so `context()` can read a token/cookie without a hard `node:http` dependency. */
@@ -43,23 +44,73 @@ export function attachWebSocketServer(
   const contextFor = options.context ?? ((): Context => SYSTEM_CONTEXT);
 
   server.on("connection", (socket, request) => {
-    // Resolve the (possibly async) per-connection context before wiring anything up; a failure here
-    // means we couldn't authenticate the connection, so close it rather than run under a default.
-    void Promise.resolve(contextFor(request))
-      .then((ctx) => {
-        const unsubscribe = adapter.subscribe((event) => {
-          socket.send(JSON.stringify({ type: "event", event }));
-        }, ctx);
+    // A socket emits `error` for a malformed frame or a broken connection, and an `error` event with no
+    // listener is thrown — one bad client would crash the process and drop every other connection.
+    socket.on("error", () => socket.close());
 
-        socket.on("message", (data) => {
-          // Never let a malformed frame or a failed send become an unhandled rejection — that would
-          // crash the whole process (Node's default) and drop every *other* connection. Contain it.
-          void handleMessage(adapter, socket, String(data), ctx).catch(() => {});
-        });
-        socket.on("close", unsubscribe);
+    // Listen from the start: frames that arrive while an async `context()` is still resolving are
+    // held and answered once it has, rather than silently dropped (which left that client hanging).
+    let ctx: Context | null = null;
+    let closed = false;
+    const early: string[] = [];
+    let unsubscribe: (() => void) | null = null;
+    // The change feed runs while the subscriber is admitted: from the start when the server needs no
+    // schema advertisement, else from a `subscribe` message carrying one it accepts. Every such message
+    // is judged afresh, so a client that goes on to advertise a version the server refuses loses the
+    // feed, just as its requests are refused.
+    const admit = (schema: WireRequest["schema"], resolved: Context): WireError | null => {
+      const refusal = adapter.admitSubscriber?.(schema) ?? null;
+      if (refusal) {
+        unsubscribe?.();
+        unsubscribe = null;
+        return refusal;
+      }
+      unsubscribe ??= adapter.subscribe((event) => {
+        socket.send(JSON.stringify({ type: "event", event }));
+      }, resolved);
+      return null;
+    };
+    const receive = (data: string, resolved: Context): void => {
+      const subscribe = subscribeMessage(data);
+      if (subscribe) {
+        const error = admit(subscribe.schema, resolved);
+        if (error) socket.send(JSON.stringify({ type: "error", error }));
+        return;
+      }
+      // Never let a malformed frame or a failed send become an unhandled rejection. Contain it.
+      void handleMessage(adapter, socket, data, resolved).catch(() => {});
+    };
+    socket.on("message", (data) => {
+      if (ctx) receive(String(data), ctx);
+      else early.push(String(data));
+    });
+    socket.on("close", () => {
+      closed = true;
+      unsubscribe?.();
+    });
+
+    // Resolve the (possibly async) per-connection context before serving anything; a failure means
+    // the connection couldn't be authenticated, so close it rather than run under a default.
+    void Promise.resolve()
+      .then(() => contextFor(request))
+      .then((resolved) => {
+        if (closed) return; // gone during authentication: subscribing now would leak the subscription
+        ctx = resolved;
+        admit(undefined, resolved);
+        for (const data of early.splice(0)) receive(data, resolved);
       })
       .catch(() => socket.close());
   });
+}
+
+/** A `{ type: "subscribe", schema }` frame, or `null` for anything else. */
+function subscribeMessage(data: string): { schema: WireRequest["schema"] } | null {
+  try {
+    const message = JSON.parse(data) as { type?: string; schema?: WireRequest["schema"] };
+    return message?.type === "subscribe" ? { schema: message.schema } : null;
+  } catch {
+    return null;
+  }
 }
 
 async function handleMessage(

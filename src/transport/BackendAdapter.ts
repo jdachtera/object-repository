@@ -5,7 +5,10 @@ import {
   type PersistedChange,
   type Unsubscribe
 } from "../core/Backend.ts";
-import type { Context } from "../core/types.ts";
+import type { Context, SchemaVersioning } from "../core/types.ts";
+import { migrationTarget } from "../core/Backend.ts";
+import { BackendJournal, type JournalRow } from "../migrations/journal.ts";
+import { checkSchemaCompatibility, enforceSchema, type SchemaAdvertisement } from "../core/schema.ts";
 import type { AggregatePlan, QueryPlan } from "../core/QueryPlan.ts";
 import { reduceAggregatePlan } from "../expressions/aggregateReduce.ts";
 import type { TransportAdapter, WireRequest, WireResponse } from "../core/Transport.ts";
@@ -41,9 +44,23 @@ export class BackendAdapter implements TransportAdapter {
      * ask for an unbounded window (`paging.end` omitted) and dump a whole model in one request; when set
      * this clamps the returned window to `start + maxPageSize`. Unset = unbounded (backward-compatible).
      */
-    private readonly maxPageSize?: number
+    private readonly maxPageSize?: number,
+    /**
+     * The server's declared schema versions. When the client advertises them too, compatibility is
+     * judged by range instead of fingerprint equality — which is what lets a client mid-way through a
+     * rolling deploy connect at all, since during a compatibility window the two ends' model
+     * definitions legitimately differ.
+     */
+    private readonly schema?: SchemaVersioning
   ) {
     this.allowedModels = allowedModels ? new Set(allowedModels) : undefined;
+  }
+
+  private advertisement(): SchemaAdvertisement {
+    return {
+      ...(this.schemaFingerprint === undefined ? {} : { fingerprint: this.schemaFingerprint }),
+      ...(this.schema ?? {})
+    };
   }
 
   /** Clamp a returned window to `maxPageSize` so a client can't request an unbounded bulk read. */
@@ -62,16 +79,20 @@ export class BackendAdapter implements TransportAdapter {
 
   async handle(request: WireRequest, ctx: Context): Promise<WireResponse> {
     try {
+      if (request.method !== "handshake") {
+        const refusal = enforceSchema(request.schema, this.advertisement());
+        if (refusal && !refusal.compatible) return err(refusal.code, refusal.message);
+      }
       switch (request.method) {
         case "handshake": {
-          const { fingerprint } = request.params as unknown as { fingerprint: string };
-          if (this.schemaFingerprint !== undefined && fingerprint !== this.schemaFingerprint) {
-            return err(
-              "SCHEMA_MISMATCH",
-              `Client schema ${fingerprint} does not match server schema ${this.schemaFingerprint}.`
-            );
-          }
-          return ok({ fingerprint: this.schemaFingerprint ?? null });
+          const client = request.params as unknown as SchemaAdvertisement;
+          const server: SchemaAdvertisement = {
+            ...(this.schemaFingerprint === undefined ? {} : { fingerprint: this.schemaFingerprint }),
+            ...(this.schema ?? {})
+          };
+          const verdict = checkSchemaCompatibility(client, server);
+          if (!verdict.compatible) return err(verdict.code, verdict.message);
+          return ok({ fingerprint: this.schemaFingerprint ?? null, ...(this.schema ?? {}) });
         }
         case "query": {
           const { plan } = request.params as unknown as { plan: QueryPlan };
@@ -106,6 +127,8 @@ export class BackendAdapter implements TransportAdapter {
         }
         case "command":
           return this.command(request.params, ctx);
+        case "migrationState":
+          return ok(await this.migrationState(ctx));
         default:
           return err("UNSUPPORTED_METHOD", `Adapter cannot handle "${request.method}"`);
       }
@@ -136,8 +159,36 @@ export class BackendAdapter implements TransportAdapter {
   }
 
   /** Forward the backend's change feed to a transport subscriber (server→client push, §7). */
+  /**
+   * Stream change events — only for models this adapter exposes. The backend's feed carries every
+   * model, including reserved ones (the sync outbox, the migration journal and lease) and any outside
+   * the allow-list; forwarding those would publish exactly what `query` refuses to return.
+   */
+  /**
+   * The applied journal rows a client needs to follow closed compatibility windows, stripped to their
+   * structural ops. The journal itself is a reserved model no client may query: its other ops (a
+   * transform's name, a raw SQL statement) are the server's business.
+   */
+  private async migrationState(ctx: Context): Promise<JournalRow[]> {
+    const rows = await new BackendJournal(migrationTarget(this.backend), ctx).load();
+    return rows
+      .filter((row) => row.status === "applied")
+      .map((row) => ({
+        ...row,
+        cursor: null,
+        ops: row.ops.filter((op) => op.kind === "dropField" || op.kind === "renameField" || op.kind === "dropModel")
+      }));
+  }
+
+  admitSubscriber(schema: SchemaAdvertisement | undefined): { code: string; message: string } | null {
+    const refusal = enforceSchema(schema, this.advertisement());
+    return refusal && !refusal.compatible ? { code: refusal.code, message: refusal.message } : null;
+  }
+
   subscribe(onEvent: (event: ChangeEvent) => void, ctx: Context): Unsubscribe {
-    return this.backend.changes(onEvent, ctx);
+    return this.backend.changes((event) => {
+      if (this.modelAllowed(event.model)) onEvent(event);
+    }, ctx);
   }
 }
 

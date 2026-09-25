@@ -1,7 +1,9 @@
 import type {
+  MigrationTargeting,
   Backend,
   ChangeListener,
   CountingBackend,
+  FieldSpec,
   IndexSpec,
   PersistResult,
   SchemaAwareBackend,
@@ -39,7 +41,7 @@ export interface Hooks {
  * expose native patching falls back to read-modify-write through this decorator, so its hooks fire
  * too; a natively-pushed `patch` (when this wraps a patching store directly) bypasses them.
  */
-export class HooksBackend implements Backend, SchemaAwareBackend, CountingBackend {
+export class HooksBackend implements Backend, SchemaAwareBackend, CountingBackend, MigrationTargeting {
   readonly capabilities: Capabilities;
 
   constructor(
@@ -49,8 +51,13 @@ export class HooksBackend implements Backend, SchemaAwareBackend, CountingBacken
     this.capabilities = inner.capabilities;
   }
 
-  registerModel(model: string, indexes: IndexSpec[]): void {
-    if (isSchemaAware(this.inner)) this.inner.registerModel(model, indexes);
+  registerModel(model: string, indexes: IndexSpec[], fields?: FieldSpec[]): void | Promise<void> {
+    if (isSchemaAware(this.inner)) return this.inner.registerModel(model, indexes, fields);
+  }
+
+  /** Migrations run beneath the hooks: they are store maintenance, not application writes. */
+  migrationTarget(): Backend {
+    return this.inner;
   }
 
   query(plan: QueryPlan, ctx: Context): Promise<JsonObject[]> {

@@ -12,6 +12,7 @@ export default defineConfig({
       include: ["src/**/*.ts"],
       exclude: [
         "src/**/*.test.ts",
+        "src/**/*.testutil.ts",
         "src/**/index.ts",
         "src/**/types.ts",
         "src/core/QueryPlan.ts",

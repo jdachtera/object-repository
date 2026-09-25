@@ -1,10 +1,15 @@
 import type { Backend, IndexSpec, IndexField, FieldSpec } from "../core/Backend.ts";
-import { isRawQueryable, isSchemaAware, isTransactional } from "../core/Backend.ts";
-import { isMigratable, type Migration, type MigrationReport } from "../backends/sql/migrate.ts";
+import { isJournalSource, isRawQueryable, isSchemaAware, isTransactional, migrationTarget } from "../core/Backend.ts";
+import { runMigrations, rollbackMigrations, type RunnerOptions } from "../migrations/run.ts";
+import { BackendJournal, type JournalRow } from "../migrations/journal.ts";
+import { downOps } from "../migrations/ops.ts";
+import { WindowState } from "./windowState.ts";
+import { planMigrations } from "../migrations/plan.ts";
+import type { MigrateOptions, Migration, MigrationOp, MigrationPlan, MigrationReport } from "../migrations/types.ts";
 import { commandClient, isChangeDeliverable, type CommandClient, type CommandMap } from "../transport/command.ts";
 import type { Transport } from "../core/Transport.ts";
 import type { Expression } from "../expressions/Expression.ts";
-import type { Context } from "../core/types.ts";
+import type { Context, JsonObject, SchemaVersioning } from "../core/types.ts";
 import { SYSTEM_CONTEXT } from "../core/types.ts";
 import type { AnyProperty, PropertyMap } from "../properties/infer.ts";
 import type { ScalarProperty } from "../properties/ScalarProperty.ts";
@@ -37,6 +42,11 @@ export interface RepositoryManagerOptions {
    * — e.g. `() => new ObjectId().toString()` alongside a Mongo `objectIdIdentity`.
    */
   generateId?: () => string;
+  /**
+   * The schema versions this build declares (ARCHITECTURE.md §13). Omitting it means ungated — every
+   * migration operation applies immediately, the behaviour that predates the gate.
+   */
+  schema?: SchemaVersioning;
 }
 
 export interface DefineConfig<P extends PropertyMap> {
@@ -97,20 +107,60 @@ export class RepositoryManager {
   private readonly backend: Backend;
   private readonly ctx: Context;
   private readonly generateId: (() => string) | undefined;
+  private readonly schema: SchemaVersioning | undefined;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly registry = new Map<string, Repository<any>>();
   /** Enough of each model's definition to rebuild it over a tx-scoped backend (interactive transactions). */
   private readonly defs = new Map<
     string,
-    { properties: PropertyMap; timestamps: TimestampFields | null; softDelete: SoftDeleteConfig | null }
+    {
+      properties: PropertyMap;
+      timestamps: TimestampFields | null;
+      softDelete: SoftDeleteConfig | null;
+      /** Retained because a migration's generic pass needs to re-register the model's full layout. */
+      indexes: IndexDecl[] | undefined;
+    }
   >();
   /** Shared with every repository so an immediately-persisting write can refuse to escape a transaction. */
   private readonly txState: TransactionState = { mode: "none" };
+  /** Which compatibility windows the store says have closed — read once a model declares one. */
+  private readonly windows = new WindowState();
+  private windowsLoaded = false;
+  /**
+   * Baselines taken before this process's own migrate()/rollback() ran: its writes reach the baselines
+   * through the change feed as they happen, so by the time the run's ops are replayed onto the cached
+   * instances, the baselines no longer say what those instances were loaded as.
+   */
+  private runSnapshots: Map<string, Map<string, JsonObject>> | null = null;
+  /** The applied journal rows this process knows about; newer ones changed the store behind it. */
+  private seenApplied: Map<string, JournalRow> | null = null;
 
   constructor(options: RepositoryManagerOptions = {}) {
     this.backend = options.backend ?? new InMemoryBackend();
     this.ctx = options.context ?? SYSTEM_CONTEXT;
     this.generateId = options.generateId;
+    this.schema = options.schema;
+    // Behind a RemoteBackend, the journal read a window-declaring `define()` starts goes out before the
+    // handshake can (its fingerprint needs every model defined), and a versioned server refuses it: read
+    // again once the handshake has set this client's advertisement, or every window stays open.
+    let target: Backend | null = null;
+    try {
+      target = migrationTarget(this.backend);
+    } catch {
+      // a store migrations refuse to reach through (a multi-write backend): no journal to follow
+    }
+    if (target && isJournalSource(target)) {
+      target.onSchemaAdvertised?.(() => {
+        if (!this.windowsLoaded) return;
+        // Unknown again until re-read: a save made meanwhile is held, as it is at startup.
+        this.windows.known = false;
+        this.windows.ready = this.windows.ready
+          .then(() => this.refreshSchemaState().catch(() => {}))
+          .then(() => {
+            this.windows.known = true;
+          });
+      });
+    }
   }
 
   /** Define a model and get back a repository typed by its property map. */
@@ -125,6 +175,7 @@ export class RepositoryManager {
     let properties = config.timestamps ? withTimestamps(config.properties) : config.properties;
     if (softDelete) properties = withSoftDelete(properties, softDelete.field);
     const typed = properties as P;
+    assertMirrorsAreSound(config.name, typed);
     const repository = new Repository<P>(
       config.name,
       typed,
@@ -134,16 +185,35 @@ export class RepositoryManager {
       config.timestamps ? TIMESTAMP_FIELDS : null,
       softDelete,
       this.generateId,
-      { state: this.txState, scoped: false }
+      { state: this.txState, scoped: false },
+      this.windows
     );
     // Registered by name so relations resolve their target regardless of definition order.
     this.registry.set(config.name, repository);
-    this.defs.set(config.name, { properties: typed, timestamps: config.timestamps ? TIMESTAMP_FIELDS : null, softDelete });
+    this.defs.set(config.name, {
+      properties: typed,
+      timestamps: config.timestamps ? TIMESTAMP_FIELDS : null,
+      softDelete,
+      indexes: config.indexes
+    });
 
-    // Let schema-aware backends (IndexedDB, SQL) provision stores/indexes/columns from the metadata.
-    if (isSchemaAware(this.backend)) {
-      void this.backend.registerModel(config.name, indexSpecs(typed, config.indexes), fieldSpecs(typed));
+    if (declaresWindow(typed) && !this.windowsLoaded) {
+      this.windowsLoaded = true;
+      this.windows.known = false;
+      this.windows.ready = this.refreshSchemaState()
+        .catch(() => {
+          // An unreadable journal leaves every window open: right until the contract runs, and the
+          // same state this process would have without the journal at all.
+        })
+        .then(() => {
+          this.windows.known = true;
+          for (const [name, def] of this.defs) if (declaresWindow(def.properties)) this.register(name);
+        });
     }
+    // Let schema-aware backends (IndexedDB, SQL) provision stores/indexes/columns from the metadata.
+    // A model declaring a window waits for the journal (registered just above, once it is read):
+    // registered with every window open, it would re-create a legacy column a contract has dropped.
+    if (!declaresWindow(typed) || this.windows.known) this.register(config.name);
 
     return repository;
   }
@@ -172,6 +242,10 @@ export class RepositoryManager {
    * offers no uncommitted-read isolation.
    */
   async transaction<T>(fn: (tx: TransactionScope) => Promise<T>): Promise<T> {
+    // So no write inside `fn` has to wait for the journal to be read, and saves held until it was are
+    // committed with the transaction.
+    await this.windows.release();
+    await this.windows.ready;
     const prevMode = this.txState.mode;
     if (isTransactional(this.backend)) {
       return this.backend.transaction(async (txBackend) => {
@@ -214,7 +288,7 @@ export class RepositoryManager {
     for (const [name, def] of this.defs) {
       registry.set(
         name,
-        new Repository(name, def.properties, backend, this.ctx, resolve, def.timestamps, def.softDelete, this.generateId, { state: this.txState, scoped: true })
+        new Repository(name, def.properties, backend, this.ctx, resolve, def.timestamps, def.softDelete, this.generateId, { state: this.txState, scoped: true }, this.windows)
       );
     }
     const scope: TransactionScope = {
@@ -249,30 +323,185 @@ export class RepositoryManager {
   }
 
   /**
-   * Apply a versioned migration set for non-additive schema changes the auto-provisioner can't do —
-   * rename/drop columns, type changes, index DDL, and raw data backfills. Each migration runs once
-   * (tracked in `_object_repository_migrations`) inside a transaction where the engine supports transactional DDL.
-   * Run at deploy/startup, before defining models against the new shape. Throws if the backend has no
-   * migration support (in-memory / IndexedDB).
+   * Apply a versioned migration set — renames, drops, type changes, index changes and data rewrites
+   * the additive auto-provisioner can't do (ARCHITECTURE.md §13).
+   *
+   * Works on **every** backend, not just SQL: operations are portable, and a backend that can realize
+   * one natively does, while the rest fall back to a shared record-rewriting reference. Run at
+   * deploy/startup, before defining models against the new shape.
    *
    *   await orm.migrate([
-   *     { name: "0001_add_status", up: (m) => m.addColumn("User", "status", "text") },
-   *     { name: "0002_backfill",   up: (m) => m.sql(`UPDATE "User" SET "status" = 'active'`) }
+   *     { name: "0001_add_status", up: (m) => m.addField("User", "status", "text", { fill: "active" }) },
+   *     { name: "0012_fullname", schemaVersion: 7, up: (m) => m.renameField("User", "name", "fullName", "text") }
    *   ]);
+   *
+   * **This never destroys anything on its own.** A migration carrying a `schemaVersion` has its
+   * destructive half withheld until `minSupportedSchemaVersion` reaches that number *and* the caller
+   * passes `applyContracts` — until then those operations come back in the report's `deferred` and
+   * `releasable` lists rather than running.
    */
-  async migrate(migrations: Migration[]): Promise<MigrationReport> {
-    if (!isMigratable(this.backend)) {
-      throw new Error("The configured backend does not support migrations.");
+  async migrate(migrations: Migration[], options: MigrateOptions = {}): Promise<MigrationReport> {
+    await this.snapshotJournal();
+    this.runSnapshots = this.snapshotAll();
+    try {
+      return await runMigrations(this.backend, migrations, this.runnerOptions(options));
+    } finally {
+      await this.refreshSchemaState().catch(() => {});
+      this.runSnapshots = null;
     }
-    return this.backend.migrate(migrations);
   }
 
-  /** Revert the `count` most-recently-applied migrations that declare a `down` (default 1). */
-  async rollback(migrations: Migration[], count = 1): Promise<MigrationReport> {
-    if (!isMigratable(this.backend)) {
-      throw new Error("The configured backend does not support migrations.");
+  /**
+   * Re-read the migration journal: stop mirroring compatibility windows whose contract has run, and
+   * bring the repositories' write baselines in line with any field a migration has since dropped or
+   * renamed (otherwise a save of a record loaded earlier writes the dropped field back). `migrate()` and `rollback()` do this for their own process; a long-running
+   * process whose store was migrated by another (a deploy step releasing a contract) calls it to pick
+   * the change up, or is restarted without the retired property.
+   */
+  async refreshSchemaState(): Promise<void> {
+    const rows = await this.loadJournal();
+    // Journalled work this process hasn't seen yet changed the stored shape under its repositories.
+    const applied = rows.filter((row) => row.status === "applied");
+    if (this.seenApplied) {
+      // Replayed in the order they ran — the journal loads in id (hash) order, and a rename followed
+      // by a drop of the renamed field, replayed backwards, would leave the field behind to resurrect.
+      const fresh = applied.filter((row) => !this.seenApplied!.has(journalKey(row))).sort(appliedOrder);
+      await this.replayOnto(fresh.flatMap((row) => row.ops));
+      // A row that has gone was rolled back — elsewhere, since this process's own rollbacks report
+      // each reverted migration as it goes. Its `down` isn't journalled, so what it changed can't be
+      // replayed: re-read what the store now holds for the models it touched.
+      const current = new Set(applied.map(journalKey));
+      const touched = new Set<string>();
+      for (const [key, row] of this.seenApplied) {
+        if (current.has(key)) continue;
+        for (const op of row.ops) if ("model" in op) touched.add(op.model);
+      }
+      for (const model of touched) await this.registry.get(model)?.reloadBaselines();
+    } else {
+      // No earlier read to tell what ran since records were loaded (a process that never migrated or
+      // declared a window): re-read every loaded record's baseline from the store, which is exact.
+      for (const repository of this.registry.values()) await repository.reloadBaselines();
     }
-    return this.backend.rollback(migrations, count);
+    this.seenApplied = new Map(applied.map((row) => [journalKey(row), row]));
+    const changed = this.windows.update(rows);
+    for (const model of changed) {
+      this.register(model);
+      this.registry.get(model)?.windowsChanged();
+    }
+  }
+
+  /**
+   * Apply ops a migration ran to this process's repositories: their baselines follow the stored shape,
+   * and cached instances take the values the ops rewrote (compared against the baselines as they were
+   * before any op was replayed, so a field the application edited meanwhile is left alone).
+   */
+  private async replayOnto(ops: MigrationOp[]): Promise<void> {
+    const snapshots = new Map<string, Map<string, JsonObject>>();
+    for (const op of ops) {
+      if (!("model" in op) || !rewritesValues(op) || snapshots.has(op.model)) continue;
+      const repository = this.registry.get(op.model);
+      if (repository) snapshots.set(op.model, this.runSnapshots?.get(op.model) ?? repository.snapshotBaselines());
+    }
+    for (const op of ops) if ("model" in op) this.registry.get(op.model)?.storeChanged(op);
+    for (const [model, snapshot] of snapshots) {
+      const repository = this.registry.get(model)!;
+      await repository.adoptMigratedValues(snapshot);
+      this.runSnapshots?.set(model, repository.snapshotBaselines()); // what its instances now reflect
+    }
+  }
+
+  /** Every repository's baselines, as they stand before this process runs a migration. */
+  private snapshotAll(): Map<string, Map<string, JsonObject>> {
+    return new Map([...this.registry].map(([model, repository]) => [model, repository.snapshotBaselines()]));
+  }
+
+  /** The store's journal — through the server, for a client whose server won't serve the journal models. */
+  private loadJournal(): Promise<JournalRow[]> {
+    const target = migrationTarget(this.backend);
+    return isJournalSource(target) ? target.readMigrationJournal(this.ctx) : new BackendJournal(target, this.ctx).load();
+  }
+
+  /** Remember which journal rows exist before this process migrates, so it can tell what ran. */
+  private async snapshotJournal(): Promise<void> {
+    if (this.seenApplied) return;
+    try {
+      const rows = await this.loadJournal();
+      this.seenApplied = new Map(rows.filter((row) => row.status === "applied").map((row) => [journalKey(row), row]));
+    } catch {
+      // unreadable: nothing to compare against, as for a process that never read it
+    }
+  }
+
+  /** (Re-)register a model's layout under the current window state. */
+  private register(model: string): void {
+    const def = this.defs.get(model);
+    if (!def || !isSchemaAware(this.backend)) return;
+    void this.backend.registerModel(
+      model,
+      indexSpecs(def.properties, def.indexes),
+      fieldSpecs(def.properties, (legacy) => this.windows.isClosed(model, legacy))
+    );
+  }
+
+  /**
+   * Revert exactly the `count` most recently applied migrations (default 1), newest first.
+   *
+   * Refuses the whole rollback, before anything runs, if one of them can't be reverted safely: no
+   * `down`, a compatibility window still open, data destroyed that `down` cannot restore, or history
+   * adopted from the legacy table (unless `rollbackAdopted`). See docs/MIGRATIONS.md.
+   */
+  async rollback(migrations: Migration[], count = 1, options: MigrateOptions = {}): Promise<MigrationReport> {
+    await this.snapshotJournal();
+    this.runSnapshots = this.snapshotAll();
+    try {
+      return await rollbackMigrations(this.backend, migrations, count, {
+        ...this.runnerOptions(options),
+        // A `down` isn't journalled, so apply each one that ran to the baselines directly — as it
+        // runs, so a rollback that fails part-way still accounts for the migrations it reverted.
+        onRolledBack: async (migration) => {
+          await this.replayOnto(await downOps(migration));
+          for (const key of [...(this.seenApplied?.keys() ?? [])]) {
+            if (this.seenApplied!.get(key)!.name === migration.name) this.seenApplied!.delete(key);
+          }
+        }
+      });
+    } finally {
+      await this.refreshSchemaState().catch(() => {});
+      this.runSnapshots = null;
+    }
+  }
+
+  /**
+   * What `migrate` *would* do: the operations pending, what the gate is withholding, and what
+   * `applyContracts` would destroy right now. Reads the store and writes nothing, so it is safe in
+   * production and belongs in CI as the "what does this deploy touch?" check.
+   */
+  async plan(migrations: Migration[], options: MigrateOptions = {}): Promise<MigrationPlan> {
+    return planMigrations(this.backend, migrations, this.runnerOptions(options));
+  }
+
+  /**
+   * Fill in what the runner needs from this manager: the declared schema versions, and every defined
+   * model's field/index layout — without which a generic rewrite through a schema-aware backend would
+   * refuse (it can't write a columnar table whose columns it hasn't been told about).
+   */
+  private runnerOptions(options: MigrateOptions): RunnerOptions {
+    const models: Record<string, { fields: FieldSpec[]; indexes: IndexSpec[] }> = {};
+    for (const [name, def] of this.defs) {
+      models[name] = {
+        fields: fieldSpecs(def.properties, (legacy) => this.windows.isClosed(name, legacy)),
+        indexes: indexSpecs(def.properties, def.indexes)
+      };
+    }
+    return {
+      ctx: this.ctx,
+      ...(this.schema ? { schemaVersion: this.schema.schemaVersion } : {}),
+      ...(this.schema?.minSupportedSchemaVersion !== undefined
+        ? { minSupportedSchemaVersion: this.schema.minSupportedSchemaVersion }
+        : {}),
+      ...options,
+      models: { ...models, ...(options.models ?? {}) }
+    };
   }
 
   /**
@@ -285,6 +514,10 @@ export class RepositoryManager {
   commands<M extends CommandMap>(transport: Transport): CommandClient<M> {
     return commandClient<M>(transport, {
       context: this.ctx,
+      // A server that declares a schema version checks every request, commands included. Worked out per
+      // call: a client made before its models are defined must not send the empty set's fingerprint,
+      // and one with no models at all has no shape to compare — only its versions.
+      schema: () => ({ ...(this.registry.size ? { fingerprint: this.fingerprint() } : {}), ...(this.schema ?? {}) }),
       onChanges: (events) => {
         // Route into the backend's change feed when it can receive them (a RemoteBackend); for an
         // in-process backend the command already ran against it, so its own feed fired the events.
@@ -321,14 +554,85 @@ function withSoftDelete(properties: PropertyMap, field: string): PropertyMap {
   return { ...properties, [field]: softDeleteMarker() };
 }
 
-/** The scalar columns of a model (name + stored-type tag), in declaration order — for columnar backends. */
-function fieldSpecs(properties: PropertyMap): FieldSpec[] {
+/**
+ * The scalar columns a backend should provision, in declaration order.
+ *
+ * The legacy half of a compatibility window is omitted once that window is `closed` — its contract
+ * has dropped the field. Not when the floor is raised: until the release re-copies it, the legacy
+ * column is the authoritative copy, and leaving it out of the layout would send every write-through
+ * to the JSON overflow while the column itself goes stale.
+ */
+function fieldSpecs(properties: PropertyMap, closed: (legacy: string) => boolean = () => false): FieldSpec[] {
+  const heldBy = new Map<string, string>();
+  for (const name of Object.keys(properties)) {
+    const property = properties[name] as AnyProperty;
+    if (property.kind === "scalar" && property.mirrors && !closed(name)) heldBy.set(property.mirrors, name);
+  }
   const fields: FieldSpec[] = [];
   for (const name of Object.keys(properties)) {
     const property = properties[name] as AnyProperty;
-    if (property.kind === "scalar") fields.push({ name, type: property.type });
+    if (property.kind !== "scalar") continue;
+    if (property.mirrors && closed(name)) continue;
+    const legacy = heldBy.get(name);
+    fields.push(legacy ? { name, type: property.type, mirroredBy: legacy } : { name, type: property.type });
   }
   return fields;
+}
+
+/** Whether an op changes stored values a cached instance may hold stale (not only indexes). */
+function rewritesValues(op: MigrationOp): boolean {
+  return op.kind !== "addIndex" && op.kind !== "dropIndex" && op.kind !== "rawSql" && op.kind !== "createModel";
+}
+
+function declaresWindow(properties: PropertyMap): boolean {
+  return Object.values(properties).some((property) => (property as AnyProperty).kind === "scalar" && Boolean((property as ScalarProperty<unknown>).mirrors));
+}
+
+/**
+ * Reject compatibility-window declarations that can't hold.
+ *
+ * Each of these is a case where mirroring would appear to work and then quietly produce wrong data,
+ * so they're refused at definition time rather than discovered in production.
+ */
+function assertMirrorsAreSound(model: string, properties: PropertyMap): void {
+  const scalars = new Set(
+    Object.keys(properties).filter((name) => (properties[name] as AnyProperty).kind === "scalar")
+  );
+  for (const name of Object.keys(properties)) {
+    const property = properties[name] as AnyProperty;
+    if (property.kind !== "scalar" || !property.mirrors) continue;
+    const canonical = property.mirrors;
+
+    if (!scalars.has(canonical)) {
+      throw new Error(
+        `"${model}.${name}" mirrors "${canonical}", which is not a declared scalar property on this model.`
+      );
+    }
+    if (property.deprecatedSince === undefined) {
+      throw new Error(`"${model}.${name}" declares \`mirrors\` without \`deprecatedSince\`, so its window has no gate to close.`);
+    }
+    const target = properties[canonical] as AnyProperty;
+    if (target.kind === "scalar" && (target.type !== property.type || (target.type === "scalar" && target.codec !== property.codec))) {
+      // Mirroring copies stored values between the halves as they are. Different types would hand
+      // the canonical field values in the legacy field's encoding — strings from an integer field,
+      // comparisons that never match — and write them back into a field an older build reads.
+      throw new Error(
+        `"${model}.${name}" (${property.type}) mirrors "${canonical}" (${target.type}). Both halves of a window must have the same type; change a type by adding a new field and migrating values with a transform.`
+      );
+    }
+    if (target.kind === "scalar" && target.unique) {
+      // Two unique constraints over one logical value double-report in the uniqueness pre-check, and
+      // the legacy half already carries the constraint until the contract runs.
+      throw new Error(
+        `"${model}.${canonical}" cannot be \`unique\` while "${name}" mirrors it — the legacy field carries the constraint until the window closes.`
+      );
+    }
+    if (target.kind === "scalar" && target.mirrors) {
+      throw new Error(
+        `"${model}.${name}" mirrors "${canonical}", which mirrors "${target.mirrors}". Chained windows are not supported — close one before opening the next.`
+      );
+    }
+  }
 }
 
 /** Index specs from per-scalar `index`/`unique` hints plus the model-level `indexes` declarations. */
@@ -353,4 +657,20 @@ function indexSpecs(properties: PropertyMap, declared: IndexDecl[] | undefined):
     });
   }
   return specs;
+}
+
+/** A journal row's identity across reads: re-applying a phase (after a rollback) is a new event. */
+function journalKey(row: JournalRow): string {
+  return `${row.name}\0${row.phase}\0${row.appliedAt}`;
+}
+
+/**
+ * The order journal rows were applied in: by time, then — for rows stamped in the same millisecond —
+ * by name (migration names are conventionally sequence-prefixed) and phase (an expand precedes its
+ * contract).
+ */
+function appliedOrder(a: JournalRow, b: JournalRow): number {
+  if (a.appliedAt !== b.appliedAt) return a.appliedAt - b.appliedAt;
+  if (a.name !== b.name) return a.name < b.name ? -1 : 1;
+  return a.phase === b.phase ? 0 : a.phase === "expand" ? -1 : 1;
 }

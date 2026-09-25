@@ -1,5 +1,7 @@
 import type { Capabilities, Context, JsonObject, JsonValue, Uuid } from "./types.ts";
 import type { QueryPlan, AggregatePlan, AggregateResultRow, WindowPlan, ExpressionNode, ValueNode } from "./QueryPlan.ts";
+import type { MigrationOp } from "../migrations/types.ts";
+import type { JournalRow } from "../migrations/journal.ts";
 
 /**
  * The spine of the whole library (ARCHITECTURE.md §2).
@@ -106,6 +108,12 @@ export interface FieldSpec {
   name: string;
   /** The stored-type tag (`text` / `integer` / `float` / `boolean` / `date` / `json` / `array` / `scalar`). */
   type: string;
+  /**
+   * While a rename's compatibility window is open, the legacy field that actually holds this field's
+   * value. A layer below the Repository that evaluates its own expressions against stored records (row
+   * policy) substitutes it, exactly as the Repository does for queries. Absent once the window closes.
+   */
+  mirroredBy?: string;
 }
 
 /**
@@ -117,11 +125,169 @@ export interface FieldSpec {
  */
 export interface SchemaAwareBackend {
   registerModel(model: string, indexes: IndexSpec[], fields?: FieldSpec[]): void | Promise<void>;
+  /**
+   * True when `fields` decide where values are stored (a SQL table's columns). Writing a model such a
+   * store hasn't been given the layout of would put every value in the JSON overflow, so a migration
+   * pass refuses to; a store that keeps whole documents needs no layout to be written correctly.
+   */
+  readonly columnar?: boolean;
+  /**
+   * The indexes `model` is registered with, if any — so a migration adding or dropping one index on a
+   * store it has no model layout for can register the rest unchanged rather than lose them.
+   */
+  registeredIndexes?(model: string): IndexSpec[] | undefined;
 }
 
 /** Narrow a backend to the schema-aware interface. */
 export function isSchemaAware(backend: object): backend is SchemaAwareBackend {
   return typeof (backend as Partial<SchemaAwareBackend>).registerModel === "function";
+}
+
+/**
+ * Optional capability: realize a migration operation natively instead of through the portable
+ * reference executor (ARCHITECTURE.md §11).
+ *
+ * The same relationship as every other pushdown here: the shared executor in `src/migrations/execute.ts`
+ * defines what an operation *means* using nothing but `query`/`save`/`persist`, and a backend that can
+ * do better implements this. SQL turns a rename into an O(1) `ALTER TABLE ... RENAME COLUMN` rather
+ * than rewriting every row. **A backend changes a migration's cost, never its effect on the record
+ * set** — which is what lets one migration run truthfully on a columnar table, a document collection
+ * and a browser object store alike.
+ *
+ * Declining is first-class and expected: resolve `null` for any operation this backend has no better
+ * answer for (or cannot express at all) and the reference executor runs it instead.
+ */
+export interface MigrationLoweringBackend {
+  /** Realize `op` natively, or resolve `null` to decline and let the reference executor handle it. */
+  lowerMigrationOp(op: MigrationOp, ctx: Context): Promise<{ rows: number } | null>;
+  /**
+   * `lowerMigrationOp`, with `record` committed in the same transaction as the op's data changes, so
+   * a runner can journal the op as done atomically with it. For a store whose transactions can't hold
+   * DDL (MySQL): the op's DDL, written to be safe to repeat, runs first; the rest can't run twice.
+   */
+  lowerMigrationOpRecorded?(
+    op: MigrationOp,
+    ctx: Context,
+    record: (tx: Backend) => Promise<void>
+  ): Promise<{ rows: number } | null>;
+  /**
+   * Render the native form of each op, in order, for a plan preview — `[]` for one that would run
+   * generically. Reads the store's current shape and follows the ops' effect on it, so a later op sees
+   * what an earlier one did. Never changes anything.
+   */
+  previewMigrationOps?(ops: MigrationOp[]): Promise<string[][]>;
+  /**
+   * Apply structural operations inside whatever exclusive window this store requires.
+   *
+   * Deliberately a *batch* rather than a callback the runner drives: IndexedDB's structural changes
+   * are legal only inside `onupgradeneeded`, and that transaction goes inactive on the first non-IDB
+   * await, so per-op dispatch from outside is impossible. Reserved now so the client-side migration
+   * stage is additive rather than a breaking change to a published capability.
+   */
+  applySchemaOps?(ops: MigrationOp[], ctx: Context): Promise<void>;
+  /**
+   * Names recorded by a *previous* migration mechanism this backend used, so an existing deployment
+   * isn't told it has run nothing and asked to re-apply its entire history against a populated store.
+   * Returns an empty list on a greenfield database.
+   */
+  legacyMigrationNames?(): Promise<string[]>;
+}
+
+/** Narrow a backend to the migration-lowering interface. */
+export function isMigrationLowering(backend: object): backend is MigrationLoweringBackend {
+  return typeof (backend as Partial<MigrationLoweringBackend>).lowerMigrationOp === "function";
+}
+
+/**
+ * Optional capability: an expiring, single-holder lease, claimed with one atomic compare-and-set.
+ *
+ * The migration runner uses it so two replicas cannot both migrate. A read-then-write protocol cannot
+ * give that guarantee: both runners can read "free" before either writes. So each store claims with
+ * the one conditional write it has (SQL `UPDATE … WHERE`, a Mongo upsert against a unique key, a single
+ * IndexedDB transaction, a synchronous in-process check).
+ *
+ * The lease is the row `key` of `model`, holding `owner` and `expiresAt`.
+ */
+export interface LeasingBackend {
+  /**
+   * Claim `key` for `owner` until `now + ttlMs`. Succeeds when the lease is free, expired, or already
+   * `owner`'s (so this also renews). Resolves `false` when another owner holds a live lease.
+   */
+  acquireLease(model: string, key: string, owner: string, now: number, ttlMs: number, ctx: Context): Promise<boolean>;
+  /** Give the lease up, but only if `owner` still holds it: never free a successor's lease. */
+  releaseLease(model: string, key: string, owner: string, ctx: Context): Promise<void>;
+}
+
+/** The prefix of the library's own bookkeeping models: the migration journal, schema state and lease. */
+export const RESERVED_MODEL_PREFIX = "_object_repository_";
+
+/** Is `model` the library's own bookkeeping rather than application data? */
+export function isReservedModel(model: string): boolean {
+  return model.startsWith(RESERVED_MODEL_PREFIX);
+}
+
+/**
+ * Optional: a decorator names the store underneath it that schema migrations should run against.
+ *
+ * A migration is maintenance on the *store*, not an application write. Run through a decorator it
+ * would be filtered by row policy (a user context rewrites only its own rows and journals the
+ * migration as applied), fire the application's hooks for every record, and — through a sync layer —
+ * restamp every record as a fresh edit that overwrites other replicas' offline work. A decorator that
+ * cannot sensibly be migrated through (a fan-out over several stores) throws instead.
+ */
+export interface MigrationTargeting {
+  migrationTarget(): Backend;
+}
+
+/** The store a migration against `backend` should actually run on: every decorator unwrapped. */
+export function migrationTarget(backend: Backend): Backend {
+  let current = backend;
+  for (;;) {
+    const unwrap = (current as Partial<MigrationTargeting>).migrationTarget;
+    if (typeof unwrap !== "function") return current;
+    const next = unwrap.call(current);
+    if (next === current) return current;
+    current = next;
+  }
+}
+
+/**
+ * Optional capability: read the migration journal of a store this backend fronts but can't query the
+ * reserved journal models of — a `RemoteBackend`, whose server refuses every `_`-prefixed model. A
+ * client learns from it which compatibility windows have closed. Rows carry only the structural ops
+ * (`dropField`, `renameField`, `dropModel`) that windows and write baselines follow.
+ */
+export interface JournalSourceBackend {
+  readMigrationJournal(ctx: Context): Promise<JournalRow[]>;
+  /**
+   * Called whenever the client's schema advertisement changes (its handshake). A versioned server
+   * refuses a journal read made before it — and a model declaring a window reads the journal when it
+   * is defined, which is before the handshake can be — so a reader retries from here.
+   */
+  onSchemaAdvertised?(listener: () => void): () => void;
+}
+
+export function isJournalSource(backend: object): backend is JournalSourceBackend {
+  return typeof (backend as Partial<JournalSourceBackend>).readMigrationJournal === "function";
+}
+
+/**
+ * Optional capability: say whether the store already holds `model` (its table, object store,
+ * collection) without creating it. A read-only caller — a migration plan run against production with
+ * a read-only login — skips a model that isn't there instead of provisioning it by reading it.
+ */
+export interface ModelProbingBackend {
+  hasModel(model: string): Promise<boolean>;
+}
+
+export function isModelProbing(backend: object): backend is ModelProbingBackend {
+  return typeof (backend as Partial<ModelProbingBackend>).hasModel === "function";
+}
+
+/** Narrow a backend to the leasing interface. */
+export function isLeasing(backend: object): backend is LeasingBackend {
+  const candidate = backend as Partial<LeasingBackend>;
+  return typeof candidate.acquireLease === "function" && typeof candidate.releaseLease === "function";
 }
 
 /**

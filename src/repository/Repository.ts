@@ -6,6 +6,7 @@ import { neededFields, allScalarsSelection, type Selection } from "./projection.
 import { isValueExpr } from "../expressions/values.ts";
 import { eq } from "../expressions/builders.ts";
 import type { Context, JsonObject, JsonValue, SortKey, Uuid } from "../core/types.ts";
+import { RESERVED_RECORD_FIELDS } from "../core/types.ts";
 import type { QueryPlan, AggregatePlan, AggregateResultRow, WindowPlan } from "../core/QueryPlan.ts";
 import { generateUuid } from "../core/uuid.ts";
 import type { AnyProperty, InferModel, PropertyMap } from "../properties/infer.ts";
@@ -16,6 +17,12 @@ import { inList, contains, or, not, isNull } from "../expressions/builders.ts";
 import { parse } from "../expressions/parse.ts";
 import { QueryCache } from "./QueryCache.ts";
 import { QueryCollection, type Queryable, type ReadOptions } from "./QueryCollection.ts";
+import { substitutePlan, substituteAggregate, substituteWindow, substituteNode, type Mirrors } from "./mirror.ts";
+import type { WindowState } from "./windowState.ts";
+import type { MigrationOp } from "../migrations/types.ts";
+
+/** How many rows `reloadBaselines` asks the store for at once. */
+const RELOAD_CHUNK = 500;
 
 /** Resolves a model name to its repository (the RepositoryManager registry). */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -76,12 +83,21 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
    * that filter before or after the write (see `subscribeChanges` / the change-feed handler). A listener
    * with no `matcher` (an unfiltered query) fires on every change.
    */
-  private readonly liveListeners = new Set<{ notify: () => void; matcher: Expression | null }>();
+  private readonly liveListeners = new Set<{ notify: () => void; matcher: () => Expression | null }>();
   private readonly txState: TransactionState;
   private readonly scoped: boolean;
   private readonly softDelete: SoftDeleteConfig | null;
   /** Names of computed/virtual fields — never stored, so filtering/sorting by one is rejected early. */
   private readonly computedFields: ReadonlySet<string>;
+  /**
+   * Canonical field → the legacy field holding its value while a rename's compatibility window is
+   * open (see `mirror.ts`). Empty in the overwhelmingly common case, and every path that consults it
+   * opens with a size check so nothing pays for a window that isn't there.
+   */
+  private readonly declaredMirrors: Mirrors;
+  /** Which declared windows the store has closed; shared with the manager. */
+  private readonly windows: WindowState | null;
+  private activeMirrors: { version: number; mirrors: Mirrors } | null = null;
 
   constructor(
     modelName: string,
@@ -92,7 +108,8 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     timestamps: TimestampFields | null = null,
     softDelete: SoftDeleteConfig | null = null,
     generateId: () => string = generateUuid,
-    txGuard?: { state: TransactionState; scoped: boolean }
+    txGuard?: { state: TransactionState; scoped: boolean },
+    windows: WindowState | null = null
   ) {
     this.modelName = modelName;
     this.properties = properties;
@@ -107,6 +124,13 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     this.computedFields = new Set(
       Object.keys(properties).filter((name) => (properties[name] as AnyProperty).kind === "computed")
     );
+    const mirrors = new Map<string, string>();
+    for (const name of Object.keys(properties)) {
+      const property = properties[name] as AnyProperty;
+      if (property.kind === "scalar" && property.mirrors) mirrors.set(property.mirrors, name);
+    }
+    this.declaredMirrors = mirrors;
+    this.windows = windows;
 
     // Reactive cache invalidation from the change feed (§7) — also catches writes flushed by a
     // sibling repository sharing this backend (e.g. cascaded relation saves). The same event
@@ -135,7 +159,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
       // always re-runs. This is conservative-correct — a row outside a query's filter both before and
       // after a change cannot alter that query's result set (membership, order, count, or aggregate).
       for (const listener of this.liveListeners) {
-        if (this.changeAffects(listener.matcher, previous, next)) listener.notify();
+        if (this.changeAffects(listener.matcher(), previous, next)) listener.notify();
       }
     }, ctx);
   }
@@ -164,7 +188,18 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     // can't be evaluated by `match()` on the raw stored record (the relation is a bare uuid there), so
     // fall back to "always relevant" on own-model changes rather than risk wrongly skipping one.
     const precise = where && where.type !== "all" && relatedModels.size === 0;
-    const entry = { notify: listener, matcher: precise ? parse(where!) : null };
+    // Matched against stored records, so a mirrored field has to be named as the store holds it —
+    // otherwise an old build's write to the legacy field would never look relevant.
+    // Rebuilt whenever the window state moves on: a filter built while a window was open would keep
+    // naming the legacy field after it is dropped, and no later write would look relevant.
+    let built: { version: number; matcher: Expression } | null = null;
+    const matcher = (): Expression | null => {
+      if (!precise) return null;
+      const version = this.windows?.version ?? 0;
+      if (built?.version !== version) built = { version, matcher: parse(substituteNode(where!, this.mirrors)) };
+      return built.matcher;
+    };
+    const entry = { notify: listener, matcher };
     this.liveListeners.add(entry);
 
     const unsubscribes: Array<() => void> = [() => this.liveListeners.delete(entry)];
@@ -310,6 +345,9 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
   }
 
   async persist(): Promise<this> {
+    // Saves held back while the journal was being read — this repository's and any other's, since a
+    // save cascades across models — go out now that it's known which windows are open.
+    await this.windows?.release();
     await this.backend.persist(this.ctx);
     return this;
   }
@@ -351,7 +389,10 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
 
   async patch(uuid: Uuid, spec: PatchSpecFor<InferModel<P>>): Promise<InferModel<P> | null> {
     this.assertImmediateWriteAllowed("patch()");
-    const ops = normalizePatch(spec);
+    // Which windows are open decides the fields written — and a model declaring one is registered only
+    // once that's known.
+    if (this.mirrors.size > 0) await this.windows?.ready;
+    const ops = this.mirrorOps(normalizePatch(spec));
     this.stampUpdatedAt(ops);
     if (isPatching(this.backend)) {
       await this.backend.patch(this.modelName, uuid, ops, this.ctx);
@@ -376,9 +417,11 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
    */
   async patchWhere(filter: Expression, spec: PatchSpecFor<InferModel<P>>): Promise<number> {
     this.assertImmediateWriteAllowed("patchWhere()");
-    const ops = normalizePatch(spec);
+    if (this.mirrors.size > 0) await this.windows?.ready;
+    const ops = this.mirrorOps(normalizePatch(spec));
     this.stampUpdatedAt(ops);
     const pre = await this.preprocessWhere(filter.serialize());
+    pre.node = substituteNode(pre.node, this.mirrors);
     const plan: QueryPlan = { model: this.modelName, where: pre.node, order: [], paging: { start: 0 } };
 
     let uuids: Uuid[];
@@ -419,13 +462,14 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     const set = data.set ?? {};
     const setOnInsert = data.setOnInsert ?? {};
     const pre = await this.preprocessWhere(match.serialize());
+    pre.node = substituteNode(pre.node, this.mirrors);
     const plan: QueryPlan = { model: this.modelName, where: pre.node, order: [], paging: { start: 0, end: 1 } };
 
     // Native atomic upsert when the backend supports it and the data is scalar-only (relations need
     // the read-then-write path to cascade). Otherwise: read-then-write — correct, just not atomic.
     if (isUpserting(this.backend) && this.scalarOnly(set) && this.scalarOnly(setOnInsert)) {
-      const encodedSet = this.encodeFields(set);
-      const encodedInsert = this.encodeFields(setOnInsert);
+      const encodedSet = this.mirrorEncoded(this.encodeFields(set));
+      const encodedInsert = this.mirrorEncoded(this.encodeFields(setOnInsert));
       encodedInsert.uuid = this.generateId();
       if (this.timestamps) {
         const now = new Date().getTime(); // stored form of a date is epoch ms
@@ -506,14 +550,14 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     plan = { ...plan, where: this.liveWhere(plan.where, options?.includeDeleted) };
     const pre = await this.preprocessWhere(plan.where);
     if (pre.rewritten) {
-      return this.execute({ ...plan, where: pre.node }); // relational query: not result-cached
+      return this.execute(substitutePlan({ ...plan, where: pre.node }, this.mirrors)); // relational: not result-cached
     }
 
     const hash = planHash(plan);
     const cached = this.cache.getResult(hash);
     if (cached) return cached;
 
-    const typed = await this.execute(plan);
+    const typed = await this.execute(substitutePlan(plan, this.mirrors));
     this.cache.setResult(hash, typed);
     return typed;
   }
@@ -540,7 +584,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     if (!isAggregating(this.backend)) return null;
     plan = { ...plan, where: this.liveWhere(plan.where, options?.includeDeleted) };
     const pre = await this.preprocessWhere(plan.where);
-    const effective = pre.rewritten ? { ...plan, where: pre.node } : plan;
+    const effective = substituteAggregate(pre.rewritten ? { ...plan, where: pre.node } : plan, this.mirrors);
     return this.backend.aggregate(effective, this.ctx);
   }
 
@@ -554,7 +598,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     if (!isWindowing(this.backend)) return null;
     plan = { ...plan, where: this.liveWhere(plan.where, options?.includeDeleted) };
     const pre = await this.preprocessWhere(plan.where);
-    const effective = pre.rewritten ? { ...plan, where: pre.node } : plan;
+    const effective = substituteWindow(pre.rewritten ? { ...plan, where: pre.node } : plan, this.mirrors);
     const rows = await this.backend.window(effective, this.ctx);
     if (!rows) return null;
     return rows.map((row) => {
@@ -573,6 +617,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
 
   /** Run a (already-preprocessed) plan: fetch, materialize into the identity map, load relations. */
   private async execute(plan: QueryPlan): Promise<InferModel<P>[]> {
+    if (this.mirrors.size > 0) await this.windows?.ready; // registered, and decoding the right fields
     const rows = await this.backend.query(plan, this.ctx);
     // Two phases so every result is in the identity map before any relation loading begins —
     // that is what makes the eager cross-repository loading below cycle-safe.
@@ -583,7 +628,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
 
   private async effectivePlan(plan: QueryPlan): Promise<QueryPlan> {
     const pre = await this.preprocessWhere(plan.where);
-    return pre.rewritten ? { ...plan, where: pre.node } : plan;
+    return substitutePlan(pre.rewritten ? { ...plan, where: pre.node } : plan, this.mirrors);
   }
 
   // --- projection-driven loading (for select) ------------------------------------------------
@@ -595,7 +640,11 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
   async runProject(plan: QueryPlan, selection: Selection, options?: ReadOptions): Promise<unknown[]> {
     plan = { ...plan, where: this.liveWhere(plan.where, options?.includeDeleted) };
     const effective = await this.effectivePlan(plan);
-    const rows = await this.backend.query({ ...effective, project: neededFields(selection) }, this.ctx);
+    // The projection is derived from the selection here, *after* `effectivePlan` substituted, so it
+    // has to be mapped through the mirror too — otherwise a windowed field would be projected under
+    // the name the store doesn't hold it under and come back empty.
+    const project = neededFields(selection).map((field) => this.mirrors.get(field) ?? field);
+    const rows = await this.backend.query({ ...effective, project }, this.ctx);
     return this.loadProjectedBatch(rows, selection);
   }
 
@@ -649,7 +698,9 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     if (uuids.length === 0) return new Map();
     // A projected relation load excludes soft-deleted targets by default (like the eager path).
     const where = this.liveWhere(inList("uuid", uuids).serialize());
-    const plan = { model: this.modelName, where, order: [] as SortKey[], paging: { start: 0 }, project: neededFields(selection) };
+    if (this.mirrors.size > 0) await this.windows?.ready;
+    const project = neededFields(selection).map((field) => this.mirrors.get(field) ?? field);
+    const plan = { model: this.modelName, where, order: [] as SortKey[], paging: { start: 0 }, project };
     const rows = await this.backend.query(plan, this.ctx);
     const loaded = await this.loadProjectedBatch(rows, selection);
     return new Map(loaded.map((instance) => [String(instance.uuid), instance]));
@@ -667,6 +718,9 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
   private async preprocessWhere(
     node: ExpressionNode
   ): Promise<{ node: ExpressionNode; rewritten: boolean }> {
+    // Every read that substitutes window names passes through here: wait until this process knows
+    // which windows are still open.
+    if (this.mirrors.size > 0) await this.windows?.ready;
     switch (node.type) {
       case "compare":
       case "in":
@@ -760,6 +814,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     }
 
     if (missing.length > 0) {
+      if (this.mirrors.size > 0) await this.windows?.ready;
       const where = this.liveWhere(inList("uuid", missing).serialize(), options?.includeDeleted);
       const rows = await this.backend.query({ model: this.modelName, where, order: [], paging: { start: 0 } }, this.ctx);
       const created = rows.map((row) => this.materialize(row));
@@ -788,7 +843,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     for (const name of Object.keys(this.properties)) {
       const property = this.properties[name] as AnyProperty;
       if (property.kind === "scalar") {
-        const value = row[name];
+        const value = this.storedValue(row, name);
         if (value !== undefined) instance[name] = property.decode(value);
       } else if (property.kind === "computed") {
         continue; // derived below, after all scalars are decoded
@@ -818,11 +873,193 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     for (const name of Object.keys(this.properties)) {
       const property = this.properties[name] as AnyProperty;
       if (property.kind === "scalar") {
-        const value = row[name];
+        const value = this.storedValue(row, name);
         if (value !== undefined) instance[name] = property.decode(value);
       }
     }
     return instance;
+  }
+
+  /**
+   * The windows still open: every declared one, minus those whose contract the store has run. After
+   * that the legacy field is gone, so mirroring into it would resurrect it and substituting reads
+   * onto it would find nothing.
+   */
+  private get mirrors(): Mirrors {
+    const version = this.windows?.version ?? 0;
+    if (this.activeMirrors?.version === version) return this.activeMirrors.mirrors;
+    const { mirrors, complete } = this.openMirrors(new Set([this]));
+    if (complete) this.activeMirrors = { version, mirrors };
+    return mirrors;
+  }
+
+  /**
+   * This model's open windows and, beneath each embedding path, its embedded models' — skipping any
+   * model already on the path (`visiting`), so two models embedding each other don't recurse forever.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private openMirrors(visiting: Set<Repository<any>>): { mirrors: Mirrors; complete: boolean } {
+    const open = new Map<string, string>();
+    for (const [canonical, legacy] of this.declaredMirrors) {
+      if (!this.windows?.isClosed(this.modelName, legacy)) open.set(canonical, legacy);
+    }
+    // An embedded model's own windows apply beneath its path: `address.town` → `address.city`.
+    let complete = true;
+    for (const name of Object.keys(this.properties)) {
+      const property = this.properties[name] as AnyProperty;
+      if (property.kind !== "relationToOne" && property.kind !== "relationToMany") continue;
+      if (property.storage !== "embed") continue;
+      const target = this.resolve(property.targetModel);
+      if (!target) {
+        complete = false; // not defined yet: don't cache a map that is missing its windows
+        continue;
+      }
+      if (visiting.has(target)) continue;
+      const nested = target.openMirrors(new Set([...visiting, target]));
+      if (!nested.complete) complete = false;
+      for (const [canonical, legacy] of nested.mirrors) open.set(`${name}.${canonical}`, `${name}.${legacy}`);
+    }
+    return { mirrors: open, complete };
+  }
+
+  /**
+   * A migration changed the stored shape of this model behind the repository's back — a lowered DDL
+   * statement emits no change events, and another process's migration none this process can see. The
+   * write baselines still hold the old shape, and `serialize` carries their undeclared fields forward,
+   * so a dropped field would come back with the next save. Bring the baselines up to date.
+   */
+  storeChanged(op: MigrationOp): void {
+    if (!("model" in op) || op.model !== this.modelName) return;
+    if (op.kind === "dropField") this.cache.editBaselines((record) => void delete record[op.field]);
+    else if (op.kind === "renameField") {
+      this.cache.editBaselines((record) => {
+        if (!(op.from in record)) return;
+        record[op.to] = record[op.from]!;
+        delete record[op.from];
+      });
+    } else if (op.kind === "dropModel") this.cache.editBaselines((record) => {
+      for (const key of Object.keys(record)) if (key !== "uuid") delete record[key];
+    });
+    else return;
+    this.cache.invalidateResults();
+  }
+
+  /** The cached instances' baselines as they stand — taken before a migration is replayed onto them. */
+  snapshotBaselines(): Map<string, JsonObject> {
+    const snapshot = new Map<string, JsonObject>();
+    for (const [uuid] of this.cache.instanceEntries()) {
+      const baseline = this.cache.getBaseline(uuid);
+      if (baseline) snapshot.set(uuid, { ...baseline });
+    }
+    return snapshot;
+  }
+
+  /**
+   * A migration rewrote this model's stored values (a fill, a copy, a rename, a transform): re-read the
+   * baselines, and bring each cached instance's fields up to what is stored now — every field the
+   * application hasn't changed since loading it (its value still matches the old baseline). Otherwise
+   * the instance's next save writes its stale values back: a fill it never saw reads as cleared, a
+   * renamed value as removed, a transformed one as the old.
+   */
+  async adoptMigratedValues(before: Map<string, JsonObject>): Promise<void> {
+    await this.reloadBaselines();
+    for (const [uuid, instance] of this.cache.instanceEntries()) {
+      const now = this.cache.getBaseline(uuid);
+      if (!now) continue;
+      const was = before.get(uuid) ?? {};
+      const record = instance as Record_;
+      const current = this.serialize(record);
+      for (const name of Object.keys(this.properties)) {
+        const property = this.properties[name] as AnyProperty;
+        if (property.kind !== "scalar") continue;
+        if (!sameValue(current[name], was[name]) || sameValue(now[name], was[name])) continue; // edited, or unchanged
+        const stored = now[name];
+        if (stored === undefined || stored === null) delete record[name];
+        else record[name] = property.decode(stored);
+      }
+    }
+  }
+
+  /**
+   * The stored shape changed in a way this process can't replay (another process's rollback). Re-read
+   * every baselined row from the store, so a save carries forward what the store holds now — not
+   * fields it may no longer have, and still the undeclared ones it kept. A row that has gone loses its
+   * baseline. If the store can't be read, the baselines are dropped: carrying nothing is safe, carrying
+   * stale fields is not.
+   */
+  async reloadBaselines(): Promise<void> {
+    const uuids = this.cache.baselineUuids();
+    try {
+      const found = new Map<string, JsonObject>();
+      for (let i = 0; i < uuids.length; i += RELOAD_CHUNK) {
+        const where = inList("uuid", uuids.slice(i, i + RELOAD_CHUNK)).serialize();
+        const rows = await this.backend.query({ model: this.modelName, where, order: [], paging: { start: 0 } }, this.ctx);
+        for (const row of rows) found.set(String(row.uuid), row);
+      }
+      for (const uuid of uuids) {
+        const row = found.get(uuid);
+        if (row) this.cache.setBaseline(uuid, row);
+        else this.cache.deleteBaseline(uuid);
+      }
+    } catch {
+      this.cache.clearBaselines();
+    }
+    this.cache.invalidateResults();
+  }
+
+  /** The window state changed: results cached under the old one are no longer right. */
+  windowsChanged(): void {
+    this.cache.invalidateResults();
+  }
+
+  /**
+   * Keep the legacy half of every open window equal to its canonical half, on the instance itself —
+   * before validation, so a `required` legacy field is satisfied by a write through the canonical
+   * name, and so clearing the canonical field clears the legacy one rather than leaving its loaded
+   * value to be written back. The legacy value is derived from the canonical one alone.
+   */
+  private syncMirrors(instance: Record_): void {
+    for (const [canonical, legacy] of this.mirrors) {
+      if (instance[canonical] === undefined) delete instance[legacy];
+      else instance[legacy] = instance[canonical];
+    }
+  }
+
+  /** Mirror patch ops on a canonical field onto its legacy half, which is the one readers use. */
+  private mirrorOps(ops: Record<string, PatchOp>): Record<string, PatchOp> {
+    if (this.mirrors.size === 0) return ops;
+    const out = { ...ops };
+    for (const [canonical, legacy] of this.mirrors) {
+      if (canonical in ops && !(legacy in ops)) out[legacy] = ops[canonical]!;
+    }
+    return out;
+  }
+
+  /** Mirror encoded canonical fields onto their legacy halves (native upsert bypasses `serialize`). */
+  private mirrorEncoded(encoded: JsonObject): JsonObject {
+    for (const [canonical, legacy] of this.mirrors) {
+      if (canonical in encoded) encoded[legacy] = encoded[canonical] as JsonValue;
+    }
+    return encoded;
+  }
+
+  /**
+   * The stored value backing a declared field.
+   *
+   * Normally just `row[name]`. For the canonical half of an open compatibility window it is the
+   * legacy field that actually holds the value — reading the canonical key directly would return
+   * whatever this build last mirrored there, which an older build's more recent write would not have
+   * updated.
+   */
+  private storedValue(row: JsonObject, name: string): JsonValue | undefined {
+    if (this.mirrors.size > 0) {
+      // Only the legacy field, even when it is absent: an absent legacy value is one an older build
+      // cleared (a NULL column decodes as absent), and falling back to the canonical key would
+      // resurrect the stale value it cleared.
+      const legacy = this.mirrors.get(name);
+      if (legacy !== undefined) return row[legacy];
+    }
+    return row[name];
   }
 
   /**
@@ -902,13 +1139,41 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     }
   }
 
+  /**
+   * Encode an instance to its stored form.
+   *
+   * Fields this model doesn't declare are carried forward verbatim from the write baseline (§12)
+   * rather than dropped. Without that, a build with a narrower property map silently *deletes* every
+   * field it doesn't know about on each read-modify-write, because the stores replace whole records
+   * (`InMemoryBackend.persist`, `IndexedDBBackend.put`). Two builds sharing one store is not an edge
+   * case — it's the steady state during a rolling deploy, and the premise of an expand/contract
+   * migration window. Under field-level sync the drop is worse still: the vanished key diffs as
+   * dirty, its field-version bumps, and the deletion replicates to every peer as though intended.
+   *
+   * Reserved fields (`RESERVED_RECORD_FIELDS`) are deliberately not carried forward — the sync layer
+   * below rewrites them on every write, so re-emitting a stale `_version` or a cleared `_deleted`
+   * would fight their owner.
+   *
+   * The limit: preservation needs a baseline, so it covers exactly the records this repository has
+   * *seen* — loaded, persisted, or observed on the change feed. A blind `createInstance()` + `save()`
+   * against a uuid it has never seen (a fresh process writing an existing record without reading it)
+   * still replaces the stored record wholesale.
+   */
   private serialize(instance: Record_): JsonObject {
     const json: JsonObject = { uuid: instance.uuid as JsonValue };
+    const baseline = this.cache.getBaseline(instance.uuid as Uuid);
+    if (baseline) {
+      for (const key of Object.keys(baseline)) {
+        if (key === "uuid" || key in this.properties || RESERVED_RECORD_FIELDS.has(key)) continue;
+        json[key] = baseline[key] as JsonValue;
+      }
+    }
     for (const name of Object.keys(this.properties)) {
       const property = this.properties[name] as AnyProperty;
       if (property.kind === "computed") {
         continue; // virtual — never stored (the hinge that keeps it off every backend + out of _extra)
       } else if (property.kind === "scalar") {
+        if (property.mirrors && !this.mirrors.has(property.mirrors)) continue; // retired: its window closed
         const value = instance[name];
         if (value !== undefined) json[name] = property.encode(value);
       } else if (property.kind === "relationToOne") {
@@ -928,6 +1193,12 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
         }
       }
     }
+    // Write through to the legacy half of an open compatibility window. It stays authoritative for as
+    // long as an older build might still be writing it, so this keeps the two in step from our side —
+    // and because the key is genuinely in the record, `computeDirty` diffs it without special-casing.
+    for (const [canonical, legacy] of this.mirrors) {
+      if (canonical in json) json[legacy] = json[canonical] as JsonValue;
+    }
     return json;
   }
 
@@ -939,10 +1210,25 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     visited.add(instance);
 
     this.applyTimestamps(instance);
+    if (this.mirrors.size > 0) this.syncMirrors(instance);
     this.enforceScalars(instance);
     const uuid = instance.uuid as Uuid;
     this.cache.setInstance(uuid, instance as InferModel<P>);
     this.maintainInverse(instance, visited);
+    // Until the journal is read, which windows are open isn't known: hold the write for `persist`, and
+    // serialize it then — serialized now, it would still write a legacy field whose window has closed.
+    if (this.mirrors.size > 0 && this.windows && !this.windows.known) {
+      this.windows.hold(instance, () => {
+        if (this.mirrors.size > 0) this.syncMirrors(instance);
+        this.write(instance);
+      });
+      return;
+    }
+    this.write(instance);
+  }
+
+  private write(instance: Record_): void {
+    const uuid = instance.uuid as Uuid;
     const record = this.serialize(instance);
     this.backend.save(this.modelName, record, this.ctx, this.computeDirty(uuid, record));
   }
@@ -971,6 +1257,9 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     for (const name of Object.keys(this.properties)) {
       const property = this.properties[name] as AnyProperty;
       if (property.kind !== "scalar") continue;
+      // A legacy field whose window has closed is retired: nothing mirrors into it any more, so holding
+      // it to `required` would refuse every save until the property is deleted from the code.
+      if (property.mirrors && !this.mirrors.has(property.mirrors)) continue;
       if (instance[name] === undefined && property.hasDefault) instance[name] = property.makeDefault();
       if ((instance[name] === undefined || instance[name] === null) && property.required) {
         throw new ValidationError([{ message: `Field "${name}" is required on "${this.modelName}".`, path: [name] }]);

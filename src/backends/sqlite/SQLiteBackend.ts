@@ -5,6 +5,7 @@ import type {
   ChangeListener,
   CountingBackend,
   IndexSpec,
+  LeasingBackend,
   MultiPatchingBackend,
   PatchOp,
   PatchingBackend,
@@ -18,6 +19,7 @@ import type { Capabilities, Context, JsonObject, JsonValue, SortKey, Uuid } from
 import type { QueryPlan, Comparator, AggregatePlan, AggregateResultRow, AggregateStage, ExpressionNode, DatePart, TextMode, WindowPlan, WindowFnKind } from "../../core/QueryPlan.ts";
 import { generateUuid } from "../../core/uuid.ts";
 import type { Expression } from "../../expressions/Expression.ts";
+import type { MigrationOp } from "../../migrations/types.ts";
 import type { ExpressionVisitor } from "../../expressions/visitor.ts";
 import type { ValueExpr, ValueVisitor } from "../../expressions/values.ts";
 import { arithFragment, negFragment, concatFragment, coalesceFragment } from "../sql/valueSql.ts";
@@ -86,7 +88,8 @@ export class SQLiteBackend
     PatchingBackend,
     MultiPatchingBackend,
     UpsertingBackend,
-    AggregatingBackend
+    AggregatingBackend,
+    LeasingBackend
 {
   readonly capabilities = CAPABILITIES;
 
@@ -102,19 +105,36 @@ export class SQLiteBackend
 
   async registerModel(model: string, indexes: IndexSpec[]): Promise<void> {
     await this.ensureTable(model);
-    for (const index of indexes) {
-      // SQLite does compound + direction + unique; TTL/text are Mongo-only and skipped. `where`
-      // (partial) is skipped too — a full index stays correct, and SQLite's UNIQUE already treats
-      // NULLs as distinct, which covers the "unique among present values" partial-unique case.
-      if (index.text || index.ttlSeconds !== undefined) continue;
-      const cols = index.fields.map((f) => `${jsonExtract(f.path)}${f.descending ? " DESC" : ""}`).join(", ");
-      // Index names are developer-supplied and may contain characters that aren't valid in a bare SQL
-      // identifier (e.g. a compound index named "songId-userId"); fold those to `_` before quoting.
-      const name = ident(`${model}_${index.name}_idx`.replace(/[^A-Za-z0-9_]/g, "_"));
-      await this.db.exec(
-        `CREATE ${index.unique ? "UNIQUE " : ""}INDEX IF NOT EXISTS ${name} ON ${ident(model)} (${cols})`
-      );
+    for (const index of indexes) await this.createIndex(model, index);
+  }
+
+  private async createIndex(model: string, index: IndexSpec): Promise<void> {
+    // SQLite does compound + direction + unique; TTL/text are Mongo-only and skipped. `where`
+    // (partial) is skipped too — a full index stays correct, and SQLite's UNIQUE already treats
+    // NULLs as distinct, which covers the "unique among present values" partial-unique case.
+    if (index.text || index.ttlSeconds !== undefined) return;
+    const cols = index.fields.map((f) => `${jsonExtract(f.path)}${f.descending ? " DESC" : ""}`).join(", ");
+    await this.db.exec(
+      `CREATE ${index.unique ? "UNIQUE " : ""}INDEX IF NOT EXISTS ${indexName(model, index.name)} ON ${ident(model)} (${cols})`
+    );
+  }
+
+  /**
+   * Index DDL, the only migration operations SQLite realizes natively. Registration only ever adds
+   * indexes, so without this a migration's `dropIndex` would leave the index — and its constraint —
+   * in place while the journal said it had gone. Everything else declines to the reference executor.
+   */
+  async lowerMigrationOp(op: MigrationOp, _ctx: Context): Promise<{ rows: number } | null> {
+    if (op.kind === "addIndex") {
+      await this.ensureTable(op.model);
+      await this.createIndex(op.model, op.index);
+      return { rows: 0 };
     }
+    if (op.kind === "dropIndex") {
+      await this.db.exec(`DROP INDEX IF EXISTS ${indexName(op.model, op.index)}`);
+      return { rows: 0 };
+    }
+    return null;
   }
 
   async query(plan: QueryPlan, _ctx: Context): Promise<JsonObject[]> {
@@ -322,6 +342,32 @@ export class SQLiteBackend
   discardPending(): void {
     this.saveQueue = [];
     this.removeQueue = [];
+  }
+
+  /**
+   * One conditional upsert: the claim lands only if the row is absent, expired, or already ours. A
+   * single statement is atomic on its own, so this holds on a batch-only driver (D1) as well.
+   */
+  async acquireLease(model: string, key: string, owner: string, now: number, ttlMs: number, _ctx: Context): Promise<boolean> {
+    await this.ensureTable(model);
+    const table = ident(model);
+    const data = JSON.stringify({ uuid: key, owner, expiresAt: now + ttlMs });
+    await this.db
+      .prepare(
+        `INSERT INTO ${table} (uuid, data) VALUES (?, ?) ON CONFLICT(uuid) DO UPDATE SET data = excluded.data ` +
+          `WHERE COALESCE(json_extract(${table}.data, '$.expiresAt'), 0) <= ? OR json_extract(${table}.data, '$.owner') = ?`
+      )
+      .run(key, data, now, owner);
+    const rows = (await this.db.prepare(`SELECT json_extract(data, '$.owner') AS owner FROM ${table} WHERE uuid = ?`).all(key)) as {
+      owner: unknown;
+    }[];
+    return rows[0]?.owner === owner;
+  }
+
+  async releaseLease(model: string, key: string, owner: string, _ctx: Context): Promise<void> {
+    await this.ensureTable(model);
+    const table = ident(model);
+    await this.db.prepare(`DELETE FROM ${table} WHERE uuid = ? AND json_extract(data, '$.owner') = ?`).run(key, owner);
   }
 
   changes(listener: ChangeListener, _ctx: Context): Unsubscribe {
@@ -678,9 +724,20 @@ function orderClause(order: SortKey[]): string {
   return ` ORDER BY ${keys.join(", ")}`;
 }
 
+function pageBound(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new Error(`Invalid paging bound ${JSON.stringify(value)}: expected a non-negative integer.`);
+  }
+  return value;
+}
+
 function pagingClause(paging: QueryPlan["paging"]): string {
-  if (paging.end !== undefined) return ` LIMIT ${paging.end - paging.start} OFFSET ${paging.start}`;
-  if (paging.start > 0) return ` LIMIT -1 OFFSET ${paging.start}`;
+  // Bounds are interpolated, and over a transport they come from the client: whole numbers only. An
+  // empty or inverted window is `LIMIT 0` — SQLite reads a negative LIMIT as "no limit" and would
+  // hand back every row, past any page-size cap.
+  const start = pageBound(paging.start);
+  if (paging.end !== undefined) return ` LIMIT ${Math.max(0, pageBound(paging.end) - start)} OFFSET ${start}`;
+  if (start > 0) return ` LIMIT -1 OFFSET ${start}`;
   return "";
 }
 
@@ -694,6 +751,14 @@ function coerce(params: JsonValue[]): SqliteParam[] {
 }
 
 /** Identifiers (model names) are developer-controlled, but validate to keep SQL injection-free. */
+/**
+ * An index's physical name. Developer-supplied names may contain characters that aren't valid in a
+ * bare identifier (a compound index named "songId-userId"); those fold to `_` before quoting.
+ */
+function indexName(model: string, name: string): string {
+  return ident(`${model}_${name}_idx`.replace(/[^A-Za-z0-9_]/g, "_"));
+}
+
 function ident(name: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
     throw new Error(`Invalid SQL identifier: ${JSON.stringify(name)}`);
