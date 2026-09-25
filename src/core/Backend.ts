@@ -131,6 +131,11 @@ export interface SchemaAwareBackend {
    * pass refuses to; a store that keeps whole documents needs no layout to be written correctly.
    */
   readonly columnar?: boolean;
+  /**
+   * The indexes `model` is registered with, if any — so a migration adding or dropping one index on a
+   * store it has no model layout for can register the rest unchanged rather than lose them.
+   */
+  registeredIndexes?(model: string): IndexSpec[] | undefined;
 }
 
 /** Narrow a backend to the schema-aware interface. */

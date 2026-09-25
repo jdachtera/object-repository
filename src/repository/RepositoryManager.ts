@@ -371,6 +371,10 @@ export class RepositoryManager {
         for (const op of row.ops) if ("model" in op) touched.add(op.model);
       }
       for (const model of touched) await this.registry.get(model)?.reloadBaselines();
+    } else {
+      // No earlier read to tell what ran since records were loaded (a process that never migrated or
+      // declared a window): re-read every loaded record's baseline from the store, which is exact.
+      for (const repository of this.registry.values()) await repository.reloadBaselines();
     }
     this.seenApplied = new Map(applied.map((row) => [journalKey(row), row]));
     const changed = this.windows.update(rows);

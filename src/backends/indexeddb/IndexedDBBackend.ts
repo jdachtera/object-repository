@@ -110,6 +110,10 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
    * model at zero indexes and silently discard the real specs `define()` supplies moments later, so
    * later registrations merge by index name and an empty list never downgrades a populated one.
    */
+  registeredIndexes(model: string): IndexSpec[] | undefined {
+    return this.models.get(model);
+  }
+
   registerModel(model: string, indexes: IndexSpec[]): void {
     // Declaring an index again is asking for it back, after a migration dropped it.
     for (const index of indexes) this.droppedIndexes.delete(`${model}\0${index.name}`);

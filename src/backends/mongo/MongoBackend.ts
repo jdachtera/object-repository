@@ -189,6 +189,7 @@ export class MongoBackend
   private readonly identity: MongoIdentity;
   private readonly uniquePreCheck: boolean;
   private readonly uniqueKeys = new Map<string, string[][]>();
+  private readonly indexSpecs = new Map<string, IndexSpec[]>();
   private saveQueue: PersistedChange[] = [];
   private removeQueue: PersistedChange[] = [];
   private readonly listeners = new Set<ChangeListener>();
@@ -212,7 +213,12 @@ export class MongoBackend
     return compileMongoFilter(where, this.identityFor(model), model);
   }
 
+  registeredIndexes(model: string): IndexSpec[] | undefined {
+    return this.indexSpecs.get(model);
+  }
+
   async registerModel(model: string, indexes: IndexSpec[]): Promise<void> {
+    this.indexSpecs.set(model, indexes);
     if (this.uniquePreCheck) this.uniqueKeys.set(model, uniqueKeySets(indexes));
     await this.provisionIndexes(model, indexes);
   }

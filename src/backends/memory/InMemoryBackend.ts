@@ -44,6 +44,7 @@ export class InMemoryBackend implements Backend, SchemaAwareBackend, LeasingBack
   private readonly store = new Map<string, Map<Uuid, JsonObject>>();
   /** Per model, the field-tuples that must be unique (single-field hints + compound `unique` indexes). */
   private readonly uniqueKeys = new Map<string, string[][]>();
+  private readonly indexSpecs = new Map<string, IndexSpec[]>();
   /** Live value→uuid index per unique key-set (`uniqueIndex[model][keySetIndex]`), maintained on
    *  persist so `checkUnique` is an O(batch) lookup instead of an O(store) rescan every flush. */
   private readonly uniqueIndex = new Map<string, Map<number, Map<string, Uuid>>>();
@@ -52,7 +53,12 @@ export class InMemoryBackend implements Backend, SchemaAwareBackend, LeasingBack
   private readonly listeners = new Set<ChangeListener>();
 
   /** Learn which fields carry a unique constraint so `persist` can enforce it (the reference backend). */
+  registeredIndexes(model: string): IndexSpec[] | undefined {
+    return this.indexSpecs.get(model);
+  }
+
   registerModel(model: string, indexes: IndexSpec[]): void {
+    this.indexSpecs.set(model, indexes);
     const keys = uniqueKeySets(indexes);
     this.uniqueKeys.set(model, keys);
     // (Re)build the value→uuid index from whatever is already stored (usually empty at define time).

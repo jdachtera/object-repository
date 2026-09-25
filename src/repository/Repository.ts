@@ -83,7 +83,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
    * that filter before or after the write (see `subscribeChanges` / the change-feed handler). A listener
    * with no `matcher` (an unfiltered query) fires on every change.
    */
-  private readonly liveListeners = new Set<{ notify: () => void; matcher: Expression | null }>();
+  private readonly liveListeners = new Set<{ notify: () => void; matcher: () => Expression | null }>();
   private readonly txState: TransactionState;
   private readonly scoped: boolean;
   private readonly softDelete: SoftDeleteConfig | null;
@@ -159,7 +159,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
       // always re-runs. This is conservative-correct — a row outside a query's filter both before and
       // after a change cannot alter that query's result set (membership, order, count, or aggregate).
       for (const listener of this.liveListeners) {
-        if (this.changeAffects(listener.matcher, previous, next)) listener.notify();
+        if (this.changeAffects(listener.matcher(), previous, next)) listener.notify();
       }
     }, ctx);
   }
@@ -190,7 +190,16 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     const precise = where && where.type !== "all" && relatedModels.size === 0;
     // Matched against stored records, so a mirrored field has to be named as the store holds it —
     // otherwise an old build's write to the legacy field would never look relevant.
-    const entry = { notify: listener, matcher: precise ? parse(substituteNode(where!, this.mirrors)) : null };
+    // Rebuilt whenever the window state moves on: a filter built while a window was open would keep
+    // naming the legacy field after it is dropped, and no later write would look relevant.
+    let built: { version: number; matcher: Expression } | null = null;
+    const matcher = (): Expression | null => {
+      if (!precise) return null;
+      const version = this.windows?.version ?? 0;
+      if (built?.version !== version) built = { version, matcher: parse(substituteNode(where!, this.mirrors)) };
+      return built.matcher;
+    };
+    const entry = { notify: listener, matcher };
     this.liveListeners.add(entry);
 
     const unsubscribes: Array<() => void> = [() => this.liveListeners.delete(entry)];

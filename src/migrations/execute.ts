@@ -164,8 +164,16 @@ export async function applyOp(backend: Backend, op: MigrationOp, options: Execut
       // `dropIndex` natively; registration alone would leave the index — and its constraint — in place.
       if (!isSchemaAware(backend)) return { rows: 0 };
       const schema = options.models[op.model];
-      if (!schema) throw new SchemaUnknownError(op.model);
-      const kept = schema.indexes.filter((index) => index.name !== (op.kind === "addIndex" ? op.index.name : op.index));
+      const named = op.kind === "addIndex" ? op.index.name : op.index;
+      if (!schema) {
+        // A document store needs no field layout: change this one index against the ones the model is
+        // registered with. A columnar store would provision from the layout, so there it must be known.
+        if (backend.columnar) throw new SchemaUnknownError(op.model);
+        const kept = (backend.registeredIndexes?.(op.model) ?? []).filter((index) => index.name !== named);
+        await register(backend, op.model, [], op.kind === "addIndex" ? [...kept, op.index] : kept);
+        return { rows: 0 };
+      }
+      const kept = schema.indexes.filter((index) => index.name !== named);
       options.registered?.add(op.model);
       await register(backend, op.model, schema.fields, op.kind === "addIndex" ? [...kept, op.index] : kept);
       return { rows: 0 };

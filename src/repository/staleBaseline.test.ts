@@ -48,6 +48,33 @@ describe("a field dropped by another process's migration", () => {
     }
   });
 
+  it("is not written back after the first refresh of a process that never read the journal", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "stale-baseline-"));
+    try {
+      const file = join(dir, "db.sqlite");
+      const processA = new SQLiteBackend(new DatabaseSync(file));
+      const processB = new SQLiteBackend(new DatabaseSync(file));
+      processA.save("Doc", { uuid: "d1", title: "t", ssn: "123-45" }, SYSTEM_CONTEXT);
+      await processA.persist(SYSTEM_CONTEXT);
+
+      const appA = new RepositoryManager({ backend: processA });
+      const docs = appA.define({ name: "Doc", properties: { title: text() } }); // no window: no startup read
+      const doc = (await docs.get("d1"))!;
+
+      await new RepositoryManager({ backend: processB }).migrate([{ name: "0001_drop_ssn", up: (m) => m.dropField("Doc", "ssn") }], {
+        models: { Doc: { fields: [], indexes: [] } }
+      });
+
+      await appA.refreshSchemaState(); // its first read of the journal
+      doc.title = "edited";
+      await docs.save(doc).persist();
+      const [stored] = await processB.query({ model: "Doc", where: { type: "all" }, order: [], paging: { start: 0 } }, SYSTEM_CONTEXT);
+      expect(stored).toEqual({ uuid: "d1", title: "edited" });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("replays a rename and a later drop of the renamed field in the order they ran", async () => {
     const dir = mkdtempSync(join(tmpdir(), "stale-baseline-"));
     try {

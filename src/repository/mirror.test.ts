@@ -549,6 +549,48 @@ describe("a migration run before any model is defined", () => {
   });
 });
 
+describe("a live query subscribed while a window was open", () => {
+  it("still sees writes after the window closes", async () => {
+    const backend = new InMemoryBackend();
+    const orm = new RepositoryManager({ backend, schema: { schemaVersion: 7, minSupportedSchemaVersion: 7 } });
+    const users = orm.define({ name: "User", properties: { fullName: text(), name: text({ deprecatedSince: 7, mirrors: "fullName" }) } });
+    const rename = { name: "0012_fullname", schemaVersion: 7, up: (m: MigrationBuilder) => m.renameField("User", "name", "fullName", "text") };
+    await orm.migrate([rename]); // expand: the window is open
+    let fired = 0;
+    users.subscribeChanges(() => fired++, { where: eq("fullName", "Bo").serialize() });
+    await users.save(users.createInstance({ uuid: "u1", fullName: "Al" })).persist(); // judged while open
+
+    await orm.migrate([rename], { applyContracts: true }); // closes it
+    fired = 0; // the migration itself may notify
+    await users.save(users.createInstance({ uuid: "u2", fullName: "Bo" })).persist();
+    expect(fired).toBeGreaterThan(0);
+  });
+});
+
+describe("an index migration run before any model is defined", () => {
+  const unique = (name: string) => ({ name, fields: [{ path: name }], unique: true });
+  const dup = async (backend: InMemoryBackend, field: string) => {
+    backend.save("User", { uuid: `a-${field}`, [field]: "same" }, ctx);
+    backend.save("User", { uuid: `b-${field}`, [field]: "same" }, ctx);
+    return backend.persist(ctx).then(
+      () => "accepted",
+      () => "refused"
+    );
+  };
+
+  it("adds and drops one index on a document store, keeping the others", async () => {
+    const backend = new InMemoryBackend();
+    backend.registerModel("User", [unique("email")]);
+    const orm = new RepositoryManager({ backend });
+    await orm.migrate([{ name: "0001", up: (m) => m.addIndex("User", unique("handle")) }]);
+    expect(await dup(backend, "email")).toBe("refused");
+    expect(await dup(backend, "handle")).toBe("refused");
+    await orm.migrate([{ name: "0002", up: (m) => m.dropIndex("User", "handle") }]);
+    expect(await dup(backend, "handle")).toBe("accepted");
+    expect(await dup(backend, "email")).toBe("refused");
+  });
+});
+
 describe("two models that embed each other", () => {
   it("read and write without recursing forever", async () => {
     const orm = new RepositoryManager({ backend: new InMemoryBackend() });
