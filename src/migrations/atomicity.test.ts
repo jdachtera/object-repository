@@ -277,6 +277,24 @@ describe("a transform that edits a nested value in place", () => {
   });
 });
 
+describe("a rename the SQL backend runs record by record", () => {
+  it("carries an array value across unchanged", async () => {
+    const { Pool } = newDb().adapters.createPg();
+    const backend = new PostgresBackend(new Pool());
+    await backend.registerModel("Tagged", [], [{ name: "tags", type: "array" }]);
+    backend.save("Tagged", { uuid: "t1", tags: ["a", "b"] }, ctx);
+    await backend.persist(ctx);
+    const models = { Tagged: { fields: [{ name: "labels", type: "array" as const }], indexes: [] } };
+    await backend.registerModel("Tagged", [], models.Tagged.fields); // define(): the new column exists already
+    await runMigrations(backend, [{ name: "0100_labels", up: (m) => m.renameField("Tagged", "tags", "labels", "array") }], {
+      models,
+      skipLock: true
+    });
+    const [row] = await backend.query({ model: "Tagged", where: everything(), order: [], paging: { start: 0 } }, ctx);
+    expect(row!.labels).toEqual(["a", "b"]);
+  });
+});
+
 describe("a plan with raw SQL in its expand phase", () => {
   it("warns that it isn't portable", async () => {
     const plan = await planMigrations(new InMemoryBackend(), [{ name: "0001", up: (m) => m.sql("SELECT 1") }]);

@@ -937,6 +937,16 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
         record[op.to] = record[op.from]!;
         delete record[op.from];
       });
+      // An instance loaded before the rename has no value under the new name (it wasn't stored
+      // there): give it the moved one, or its next save would read the field as cleared and drop it.
+      const property = this.properties[op.to] as AnyProperty | undefined;
+      if (property?.kind === "scalar") {
+        for (const [uuid, instance] of this.cache.instanceEntries()) {
+          const stored = this.cache.getBaseline(uuid)?.[op.to];
+          const record = instance as Record_;
+          if (record[op.to] === undefined && stored !== undefined && stored !== null) record[op.to] = property.decode(stored);
+        }
+      }
     } else if (op.kind === "dropModel") this.cache.editBaselines((record) => {
       for (const key of Object.keys(record)) if (key !== "uuid") delete record[key];
     });

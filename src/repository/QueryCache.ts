@@ -19,6 +19,11 @@ export class QueryCache<T> {
   private readonly results = new Map<string, T[]>();
   private readonly baseline = new Map<Uuid, JsonObject>();
 
+  /** Every cached instance, by uuid. */
+  instanceEntries(): IterableIterator<[Uuid, T]> {
+    return this.instances.entries();
+  }
+
   getInstance(uuid: Uuid): T | undefined {
     return this.instances.get(uuid);
   }

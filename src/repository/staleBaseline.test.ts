@@ -75,6 +75,23 @@ describe("a field dropped by another process's migration", () => {
     }
   });
 
+  it("keeps a renamed value on a record loaded before the rename", async () => {
+    const { InMemoryBackend } = await import("../backends/memory/InMemoryBackend.js");
+    const { integer } = await import("../properties/factories.js");
+    const backend = new InMemoryBackend();
+    backend.save("User", { uuid: "u1", name: "Ann", age: 1 }, SYSTEM_CONTEXT);
+    await backend.persist(SYSTEM_CONTEXT);
+    const orm = new RepositoryManager({ backend });
+    const users = orm.define({ name: "User", properties: { fullName: text(), age: integer() } });
+    const user = (await users.get("u1"))!; // loaded before: no `fullName` stored yet
+
+    await orm.migrate([{ name: "0001_fullname", up: (m) => m.renameField("User", "name", "fullName", "text") }]);
+    user.age = 2;
+    await users.save(user).persist();
+    const [stored] = await backend.query({ model: "User", where: { type: "all" }, order: [], paging: { start: 0 } }, SYSTEM_CONTEXT);
+    expect(stored).toEqual({ uuid: "u1", fullName: "Ann", age: 2 });
+  });
+
   it("replays a rename and a later drop of the renamed field in the order they ran", async () => {
     const dir = mkdtempSync(join(tmpdir(), "stale-baseline-"));
     try {

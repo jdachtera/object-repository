@@ -207,7 +207,9 @@ async function rewrite(
   change: (record: Readonly<JsonObject>) => JsonObject | null,
   where = everything()
 ): Promise<OpResult> {
-  await reregister(backend, op.model, options);
+  // A rename's source holds the rename's own type: read as plain text, an array would be wrapped
+  // in another array and a scalar encoded twice on the way to the new field.
+  await reregister(backend, op.model, options, false, op.kind === "renameField" ? [{ name: op.from, type: op.type }] : []);
   const removeOnNull = op.kind === "transform";
   const declared = ["uuid", ...fields.filter((field) => field !== "uuid")];
   let rows = 0;
@@ -302,7 +304,9 @@ async function reregister(
   backend: Backend,
   model: string,
   options: ExecuteOptions,
-  withUnique = false
+  withUnique = false,
+  /** Types known for columns the model no longer declares — the catalog reads every text-backed one as text. */
+  hints: FieldSpec[] = []
 ): Promise<void> {
   if (!isSchemaAware(backend)) return;
   const schema = options.models[model];
@@ -324,7 +328,8 @@ async function reregister(
   const live = (backend as Partial<{ liveFieldSpecs(model: string): Promise<FieldSpec[]> }>).liveFieldSpecs;
   if (typeof live === "function") {
     const declared = new Set(fields.map((field) => field.name));
-    fields = [...fields, ...(await live.call(backend, model)).filter((field) => !declared.has(field.name))];
+    const undeclared = (await live.call(backend, model)).filter((field) => !declared.has(field.name));
+    fields = [...fields, ...undeclared.map((field) => hints.find((hint) => hint.name === field.name) ?? field)];
   }
   await register(backend, model, fields, indexes);
 }
