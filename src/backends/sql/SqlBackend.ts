@@ -123,8 +123,6 @@ export class SqlBackend
   private readonly schemas = new Map<string, FieldSpec[]>();
   private readonly indexes = new Map<string, IndexSpec[]>();
   private readonly provisioned = new Map<string, Promise<unknown>>();
-  /** Live column sets, read once per model per migration run and invalidated by any DDL that moves them. */
-  private readonly liveColumnCache = new Map<string, Set<string>>();
   /** Models whose layout this backend changed (registration or DDL) — what a transaction scope hands back. */
   private readonly touched = new Set<string>();
   private readonly uniquePreCheck: boolean;
@@ -420,15 +418,15 @@ export class SqlBackend
     return previews;
   }
 
-  /** Read (and cache for this run) the columns a table actually has. */
+  /**
+   * The columns a table actually has, read afresh for every op: a raw SQL step, a registration, or
+   * another process between two runs can change them, and a stale answer re-adds a column or misses
+   * one. One catalog query per migration op is nothing next to what the op itself does.
+   */
   private async liveColumns(model: string): Promise<Set<string>> {
-    const cached = this.liveColumnCache.get(model);
-    if (cached) return cached;
     const probe = this.dialect.columnsQuery(model);
     const rows = await this.exec.run(probe.sql, probe.params);
-    const columns = new Set(rows.map((row) => String(row.column_name)));
-    this.liveColumnCache.set(model, columns);
-    return columns;
+    return new Set(rows.map((row) => String(row.column_name)));
   }
 
   /**
@@ -442,7 +440,6 @@ export class SqlBackend
    */
   private refreshModel(op: MigrationOp & { model: string }): void {
     this.touched.add(op.model);
-    this.liveColumnCache.delete(op.model);
     this.provisioned.delete(op.model);
 
     const fields = this.schemas.get(op.model);
@@ -793,7 +790,6 @@ export class SqlBackend
       const provisioned = scoped.provisioned.get(model);
       if (provisioned) this.provisioned.set(model, provisioned);
       else this.provisioned.delete(model);
-      this.liveColumnCache.delete(model);
     }
   }
 
@@ -893,10 +889,6 @@ export class SqlBackend
         }
       }
     }
-    // The table's columns may have just changed: a migration lowering later in this run must re-read
-    // them, or it would add a column that registration already added.
-    this.liveColumnCache.delete(model);
-
     const known = new Set(fields.map((f) => f.name));
     for (const index of this.indexes.get(model) ?? []) {
       // Columnar indexes only: TTL/text are Mongo features; skip an index over a field with no column.

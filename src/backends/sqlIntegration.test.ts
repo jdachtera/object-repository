@@ -1086,6 +1086,27 @@ describe("MySQL (real engine)", () => {
     await expect(backend.persist(ctx)).resolves.toBeDefined(); // not "Unknown column 'legacy'"
   });
 
+  it("a field add after a raw SQL step that added the column sees it", async () => {
+    if (!pool) return;
+    await dropMigrationTables("rawcols_my");
+    await pool.query("CREATE TABLE `rawcols_my` (`uuid` varchar(36) PRIMARY KEY, `name` longtext, `_extra` longtext)");
+    const report = await runMigrations(
+      new MySqlBackend(pool),
+      [
+        {
+          name: "0001_nick",
+          up: (m) => {
+            m.addIndex("rawcols_my", { name: "name", fields: [{ path: "name" }] }); // reads the columns
+            m.sql("ALTER TABLE `rawcols_my` ADD COLUMN `nickname` longtext");
+            m.addField("rawcols_my", "nickname", "text", { fill: "-" });
+          }
+        }
+      ],
+      { models: { rawcols_my: { fields: [{ name: "name", type: "text" }, { name: "nickname", type: "text" }], indexes: [] } } }
+    );
+    expect(report.applied).toEqual(["0001_nick"]);
+  });
+
   it("a unique-key clash whose value mentions the primary key is still refused", async () => {
     if (!pool) return;
     await pool.query("DROP TABLE IF EXISTS `uniq2_my`");

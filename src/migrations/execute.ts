@@ -264,6 +264,12 @@ async function rewrite(
       await flushPage(backend, options, page.cursor);
       rows += written;
       report(options, op, rows);
+    } else {
+      // Nothing to write, but the pass is still working: move the resume point past the page and renew
+      // the lease, or a long run of pages that are already migrated lets it lapse and a second runner
+      // starts on what comes next.
+      await options.checkpoint?.(page.cursor);
+      await options.heartbeat?.();
     }
     after = page.cursor;
   }

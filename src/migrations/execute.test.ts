@@ -231,6 +231,25 @@ describe("executor invariants", () => {
   });
 });
 
+describe("a pass over records that are already migrated", () => {
+  it("still renews the lease on every page", async () => {
+    const backend = await seeded([
+      { uuid: "a", from: "x", to: "set" },
+      { uuid: "b", from: "y", to: "set" },
+      { uuid: "c", from: "z", to: "set" },
+      { uuid: "d", from: "w", to: "set" }
+    ]);
+    let beats = 0;
+    const result = await applyOp(
+      backend,
+      { kind: "copyField", model: "M", from: "from", to: "to", type: "text", overwrite: false }, // nothing to do
+      options({ heartbeat: async () => void beats++ })
+    );
+    expect(result.rows).toBe(0);
+    expect(beats).toBeGreaterThanOrEqual(2); // batch size 2, four records: two pages
+  });
+});
+
 describe("a document store without a registered layout", () => {
   it("runs a generic pass, keeping the registration it has", async () => {
     const registrations: string[] = [];
