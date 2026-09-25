@@ -632,6 +632,18 @@ describe("Postgres (real engine)", () => {
       { uuid: "u2", fullName: "Bo" } // in its column, not the overflow
     ]);
   });
+  it("a transaction keeps the order of writes queued before and during it", async () => {
+    if (!pool) return;
+    await pool.query(`DROP TABLE IF EXISTS "txorder_pg"`);
+    const backend = new PostgresBackend(pool);
+    await backend.registerModel("txorder_pg", [], [{ name: "v", type: "integer" }]);
+    backend.save("txorder_pg", { uuid: "x", v: 1 }, ctx); // queued before
+    await backend.transaction(async () => {
+      backend.save("txorder_pg", { uuid: "x", v: 2 }, ctx); // the outer backend again, meanwhile
+    }, ctx);
+    const { rows } = await pool.query(`SELECT "v" FROM "txorder_pg" WHERE "uuid" = 'x'`);
+    expect(rows.map((row: { v: string }) => Number(row.v))).toEqual([2]);
+  });
 });
 
 describe("MySQL (real engine)", () => {

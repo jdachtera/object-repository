@@ -592,7 +592,7 @@ export class SqlBackend
   }
 
   async persist(_ctx: Context): Promise<PersistResult> {
-    const saved = this.saveQueue;
+    let saved = this.saveQueue;
     const removed = this.removeQueue;
     this.saveQueue = [];
     this.removeQueue = [];
@@ -602,6 +602,9 @@ export class SqlBackend
         change.record.uuid = generateUuid();
       }
     }
+    // A record saved twice before one persist is written once, as last saved: Postgres refuses to
+    // upsert the same row twice in one statement, and the later save carries the whole record anyway.
+    saved = collapseSaves(saved);
     // Provision tables/indexes (DDL) *before* the transaction: MySQL implicitly commits on DDL, so a
     // CREATE inside the tx would break its atomicity. The writes then run as one atomic unit.
     for (const model of new Set([...saved, ...removed].map((c) => c.model))) await this.ensure(model);
@@ -757,15 +760,23 @@ export class SqlBackend
         // Writes queued here before the transaction began go first: `fn` may persist its own through the
         // scope, and folding the older ones in only at the end would let them land after — overwriting,
         // say, a newer migration marker with the stale one queued before it.
+        const earlierSaves = new Set(this.saveQueue);
+        const earlierRemoves = new Set(this.removeQueue);
         scoped.saveQueue.push(...this.saveQueue);
         scoped.removeQueue.push(...this.removeQueue);
         this.saveQueue = [];
         this.removeQueue = [];
         const result = await fn(scoped);
-        // Fold in writes queued on the outer backend (repos not obtained from the tx scope) so the
-        // whole unit commits together, then flush once on the tx connection.
-        scoped.saveQueue.unshift(...this.saveQueue);
-        scoped.removeQueue.unshift(...this.removeQueue);
+        // Fold in writes queued on the outer backend meanwhile (repos not obtained from the tx scope) so
+        // the whole unit commits together — after the earlier ones still queued, which they may
+        // supersede, and ahead of the scope's own — then flush once on the tx connection.
+        const after = <T,>(queue: T[], earlier: Set<T>): number => {
+          let index = 0;
+          while (index < queue.length && earlier.has(queue[index]!)) index++;
+          return index;
+        };
+        scoped.saveQueue.splice(after(scoped.saveQueue, earlierSaves), 0, ...this.saveQueue);
+        scoped.removeQueue.splice(after(scoped.removeQueue, earlierRemoves), 0, ...this.removeQueue);
         this.saveQueue = [];
         this.removeQueue = [];
         await scoped.persist(ctx);
@@ -1031,6 +1042,29 @@ function coerce(params: JsonValue[]): unknown[] {
     if (value !== null && typeof value === "object") return JSON.stringify(value);
     return value;
   });
+}
+
+/**
+ * One change per record: the last save of each, with the fields any of its saves changed (a save with
+ * no dirty hint makes the whole record dirty).
+ */
+function collapseSaves(changes: PersistedChange[]): PersistedChange[] {
+  const byRecord = new Map<string, PersistedChange>();
+  for (const change of changes) {
+    const key = `${change.model}\0${String(change.record.uuid)}`;
+    const previous = byRecord.get(key);
+    if (!previous) {
+      byRecord.set(key, change);
+      continue;
+    }
+    byRecord.delete(key); // keep the queue's order: this record now goes where its last save was
+    const { dirty: _dropped, ...rest } = change;
+    byRecord.set(
+      key,
+      previous.dirty && change.dirty ? { ...rest, dirty: [...new Set([...previous.dirty, ...change.dirty])] } : rest
+    );
+  }
+  return [...byRecord.values()];
 }
 
 /** A statement that changes rows rather than the schema — one a transaction can hold, even on MySQL. */
