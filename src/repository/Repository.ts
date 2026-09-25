@@ -937,21 +937,47 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
         record[op.to] = record[op.from]!;
         delete record[op.from];
       });
-      // An instance loaded before the rename has no value under the new name (it wasn't stored
-      // there): give it the moved one, or its next save would read the field as cleared and drop it.
-      const property = this.properties[op.to] as AnyProperty | undefined;
-      if (property?.kind === "scalar") {
-        for (const [uuid, instance] of this.cache.instanceEntries()) {
-          const stored = this.cache.getBaseline(uuid)?.[op.to];
-          const record = instance as Record_;
-          if (record[op.to] === undefined && stored !== undefined && stored !== null) record[op.to] = property.decode(stored);
-        }
-      }
     } else if (op.kind === "dropModel") this.cache.editBaselines((record) => {
       for (const key of Object.keys(record)) if (key !== "uuid") delete record[key];
     });
     else return;
     this.cache.invalidateResults();
+  }
+
+  /** The cached instances' baselines as they stand — taken before a migration is replayed onto them. */
+  snapshotBaselines(): Map<string, JsonObject> {
+    const snapshot = new Map<string, JsonObject>();
+    for (const [uuid] of this.cache.instanceEntries()) {
+      const baseline = this.cache.getBaseline(uuid);
+      if (baseline) snapshot.set(uuid, { ...baseline });
+    }
+    return snapshot;
+  }
+
+  /**
+   * A migration rewrote this model's stored values (a fill, a copy, a rename, a transform): re-read the
+   * baselines, and bring each cached instance's fields up to what is stored now — every field the
+   * application hasn't changed since loading it (its value still matches the old baseline). Otherwise
+   * the instance's next save writes its stale values back: a fill it never saw reads as cleared, a
+   * renamed value as removed, a transformed one as the old.
+   */
+  async adoptMigratedValues(before: Map<string, JsonObject>): Promise<void> {
+    await this.reloadBaselines();
+    for (const [uuid, instance] of this.cache.instanceEntries()) {
+      const now = this.cache.getBaseline(uuid);
+      if (!now) continue;
+      const was = before.get(uuid) ?? {};
+      const record = instance as Record_;
+      const current = this.serialize(record);
+      for (const name of Object.keys(this.properties)) {
+        const property = this.properties[name] as AnyProperty;
+        if (property.kind !== "scalar") continue;
+        if (!sameValue(current[name], was[name]) || sameValue(now[name], was[name])) continue; // edited, or unchanged
+        const stored = now[name];
+        if (stored === undefined || stored === null) delete record[name];
+        else record[name] = property.decode(stored);
+      }
+    }
   }
 
   /**

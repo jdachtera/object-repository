@@ -5,11 +5,11 @@ import { BackendJournal, type JournalRow } from "../migrations/journal.ts";
 import { downOps } from "../migrations/ops.ts";
 import { WindowState } from "./windowState.ts";
 import { planMigrations } from "../migrations/plan.ts";
-import type { MigrateOptions, Migration, MigrationPlan, MigrationReport } from "../migrations/types.ts";
+import type { MigrateOptions, Migration, MigrationOp, MigrationPlan, MigrationReport } from "../migrations/types.ts";
 import { commandClient, isChangeDeliverable, type CommandClient, type CommandMap } from "../transport/command.ts";
 import type { Transport } from "../core/Transport.ts";
 import type { Expression } from "../expressions/Expression.ts";
-import type { Context, SchemaVersioning } from "../core/types.ts";
+import type { Context, JsonObject, SchemaVersioning } from "../core/types.ts";
 import { SYSTEM_CONTEXT } from "../core/types.ts";
 import type { AnyProperty, PropertyMap } from "../properties/infer.ts";
 import type { ScalarProperty } from "../properties/ScalarProperty.ts";
@@ -126,6 +126,12 @@ export class RepositoryManager {
   /** Which compatibility windows the store says have closed — read once a model declares one. */
   private readonly windows = new WindowState();
   private windowsLoaded = false;
+  /**
+   * Baselines taken before this process's own migrate()/rollback() ran: its writes reach the baselines
+   * through the change feed as they happen, so by the time the run's ops are replayed onto the cached
+   * instances, the baselines no longer say what those instances were loaded as.
+   */
+  private runSnapshots: Map<string, Map<string, JsonObject>> | null = null;
   /** The applied journal rows this process knows about; newer ones changed the store behind it. */
   private seenApplied: Map<string, JournalRow> | null = null;
 
@@ -336,10 +342,12 @@ export class RepositoryManager {
    */
   async migrate(migrations: Migration[], options: MigrateOptions = {}): Promise<MigrationReport> {
     await this.snapshotJournal();
+    this.runSnapshots = this.snapshotAll();
     try {
       return await runMigrations(this.backend, migrations, this.runnerOptions(options));
     } finally {
       await this.refreshSchemaState().catch(() => {});
+      this.runSnapshots = null;
     }
   }
 
@@ -358,9 +366,7 @@ export class RepositoryManager {
       // Replayed in the order they ran — the journal loads in id (hash) order, and a rename followed
       // by a drop of the renamed field, replayed backwards, would leave the field behind to resurrect.
       const fresh = applied.filter((row) => !this.seenApplied!.has(journalKey(row))).sort(appliedOrder);
-      for (const row of fresh) {
-        for (const op of row.ops) if ("model" in op) this.registry.get(op.model)?.storeChanged(op);
-      }
+      await this.replayOnto(fresh.flatMap((row) => row.ops));
       // A row that has gone was rolled back — elsewhere, since this process's own rollbacks report
       // each reverted migration as it goes. Its `down` isn't journalled, so what it changed can't be
       // replayed: re-read what the store now holds for the models it touched.
@@ -382,6 +388,31 @@ export class RepositoryManager {
       this.register(model);
       this.registry.get(model)?.windowsChanged();
     }
+  }
+
+  /**
+   * Apply ops a migration ran to this process's repositories: their baselines follow the stored shape,
+   * and cached instances take the values the ops rewrote (compared against the baselines as they were
+   * before any op was replayed, so a field the application edited meanwhile is left alone).
+   */
+  private async replayOnto(ops: MigrationOp[]): Promise<void> {
+    const snapshots = new Map<string, Map<string, JsonObject>>();
+    for (const op of ops) {
+      if (!("model" in op) || !rewritesValues(op) || snapshots.has(op.model)) continue;
+      const repository = this.registry.get(op.model);
+      if (repository) snapshots.set(op.model, this.runSnapshots?.get(op.model) ?? repository.snapshotBaselines());
+    }
+    for (const op of ops) if ("model" in op) this.registry.get(op.model)?.storeChanged(op);
+    for (const [model, snapshot] of snapshots) {
+      const repository = this.registry.get(model)!;
+      await repository.adoptMigratedValues(snapshot);
+      this.runSnapshots?.set(model, repository.snapshotBaselines()); // what its instances now reflect
+    }
+  }
+
+  /** Every repository's baselines, as they stand before this process runs a migration. */
+  private snapshotAll(): Map<string, Map<string, JsonObject>> {
+    return new Map([...this.registry].map(([model, repository]) => [model, repository.snapshotBaselines()]));
   }
 
   /** The store's journal — through the server, for a client whose server won't serve the journal models. */
@@ -421,13 +452,14 @@ export class RepositoryManager {
    */
   async rollback(migrations: Migration[], count = 1, options: MigrateOptions = {}): Promise<MigrationReport> {
     await this.snapshotJournal();
+    this.runSnapshots = this.snapshotAll();
     try {
       return await rollbackMigrations(this.backend, migrations, count, {
         ...this.runnerOptions(options),
         // A `down` isn't journalled, so apply each one that ran to the baselines directly — as it
         // runs, so a rollback that fails part-way still accounts for the migrations it reverted.
         onRolledBack: async (migration) => {
-          for (const op of await downOps(migration)) if ("model" in op) this.registry.get(op.model)?.storeChanged(op);
+          await this.replayOnto(await downOps(migration));
           for (const key of [...(this.seenApplied?.keys() ?? [])]) {
             if (this.seenApplied!.get(key)!.name === migration.name) this.seenApplied!.delete(key);
           }
@@ -435,6 +467,7 @@ export class RepositoryManager {
       });
     } finally {
       await this.refreshSchemaState().catch(() => {});
+      this.runSnapshots = null;
     }
   }
 
@@ -544,6 +577,11 @@ function fieldSpecs(properties: PropertyMap, closed: (legacy: string) => boolean
     fields.push(legacy ? { name, type: property.type, mirroredBy: legacy } : { name, type: property.type });
   }
   return fields;
+}
+
+/** Whether an op changes stored values a cached instance may hold stale (not only indexes). */
+function rewritesValues(op: MigrationOp): boolean {
+  return op.kind !== "addIndex" && op.kind !== "dropIndex" && op.kind !== "rawSql" && op.kind !== "createModel";
 }
 
 function declaresWindow(properties: PropertyMap): boolean {

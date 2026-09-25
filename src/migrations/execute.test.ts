@@ -251,6 +251,25 @@ describe("a pass over records that are already migrated", () => {
   });
 });
 
+describe("a rename of a field the layout doesn't hold", () => {
+  it("doesn't add it to the layout the model is registered with", async () => {
+    const { runMigrations } = await import("./run.js");
+    const registered: FieldSpec[][] = [];
+    const store = Object.assign(new InMemoryBackend(), {
+      registerModel: (model: string, _indexes: IndexSpec[], fields?: FieldSpec[]) => {
+        if (model === "Post") registered.push(fields ?? []);
+      }
+    }) as unknown as Backend;
+    store.save("Post", { uuid: "p1", title: "t", author: "u1" }, ctx); // `author` lives in the overflow
+    await store.persist(ctx);
+    await runMigrations(store, [{ name: "0001", up: (m) => m.renameField("Post", "author", "writer", "scalar") }], {
+      models: { Post: { fields: [{ name: "title", type: "text" }], indexes: [] } },
+      skipLock: true
+    });
+    expect(registered.at(-1)!.map((field) => field.name)).toEqual(["title"]);
+  });
+});
+
 describe("a document store without a registered layout", () => {
   it("runs a generic pass, keeping the registration it has", async () => {
     const registrations: string[] = [];

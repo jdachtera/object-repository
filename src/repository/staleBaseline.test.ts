@@ -92,6 +92,32 @@ describe("a field dropped by another process's migration", () => {
     expect(stored).toEqual({ uuid: "u1", fullName: "Ann", age: 2 });
   });
 
+  it("keeps a filled or transformed value on a record loaded before the migration", async () => {
+    const { InMemoryBackend } = await import("../backends/memory/InMemoryBackend.js");
+    const { integer } = await import("../properties/factories.js");
+    const backend = new InMemoryBackend();
+    backend.save("Doc", { uuid: "d1", title: "t", price: 3 }, SYSTEM_CONTEXT);
+    await backend.persist(SYSTEM_CONTEXT);
+    const orm = new RepositoryManager({ backend });
+    const docs = orm.define({ name: "Doc", properties: { title: text(), status: text(), price: integer() } });
+    const doc = (await docs.get("d1"))!;
+
+    await orm.migrate([
+      {
+        name: "0001",
+        transforms: { cents: (row) => ({ ...row, price: Number(row.price) * 100 }) },
+        up: (m) => {
+          m.addField("Doc", "status", "text", { fill: "active" });
+          m.transform("Doc", "cents", ["price"], undefined, { phase: "expand" });
+        }
+      }
+    ]);
+    doc.title = "edited"; // the application's own change
+    await docs.save(doc).persist();
+    const [stored] = await backend.query({ model: "Doc", where: { type: "all" }, order: [], paging: { start: 0 } }, SYSTEM_CONTEXT);
+    expect(stored).toEqual({ uuid: "d1", title: "edited", status: "active", price: 300 });
+  });
+
   it("replays a rename and a later drop of the renamed field in the order they ran", async () => {
     const dir = mkdtempSync(join(tmpdir(), "stale-baseline-"));
     try {

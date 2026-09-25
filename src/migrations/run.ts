@@ -622,11 +622,15 @@ function followLayout(options: Running, op: MigrationOp): void {
   } else if (op.kind === "renameField") {
     // The field ends up as `to`, of the rename's type. The application usually declares `to` already
     // (it defines the model as it is after the migration): keep that entry rather than drop it.
-    const renamed = { name: op.to, type: op.type };
-    const fields = layout.fields.filter((field) => field.name !== op.from && field.name !== op.to);
+    // Neither name in the layout: the field lives in the JSON overflow (a relation, or never declared),
+    // and a column for it would stand empty beside the values the overflow still holds.
     const at = layout.fields.findIndex((field) => field.name === op.to || field.name === op.from);
-    fields.splice(at < 0 ? fields.length : Math.min(at, fields.length), 0, renamed);
-    options.models[op.model] = { ...layout, fields };
+    if (at >= 0) {
+      const renamed = { name: op.to, type: op.type };
+      const fields = layout.fields.filter((field) => field.name !== op.from && field.name !== op.to);
+      fields.splice(Math.min(at, fields.length), 0, renamed);
+      options.models[op.model] = { ...layout, fields };
+    }
   }
 }
 
