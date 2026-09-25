@@ -28,7 +28,7 @@ export async function planMigrations(
   assertUniqueNames(migrations);
   backend = migrationTarget(backend);
   const ctx = options.ctx ?? SYSTEM_CONTEXT;
-  const journal = options.journal ?? new BackendJournal(backend, ctx);
+  const journal = options.journal ?? new BackendJournal(backend, ctx, { readOnly: true });
   const stored = await journal.readSchemaState();
   const versions = checkVersions(stored, options);
   const minSupported = versions.minSupportedSchemaVersion;

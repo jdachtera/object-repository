@@ -239,6 +239,19 @@ export function migrationTarget(backend: Backend): Backend {
   }
 }
 
+/**
+ * Optional capability: say whether the store already holds `model` (its table, object store,
+ * collection) without creating it. A read-only caller — a migration plan run against production with
+ * a read-only login — skips a model that isn't there instead of provisioning it by reading it.
+ */
+export interface ModelProbingBackend {
+  hasModel(model: string): Promise<boolean>;
+}
+
+export function isModelProbing(backend: object): backend is ModelProbingBackend {
+  return typeof (backend as Partial<ModelProbingBackend>).hasModel === "function";
+}
+
 /** Narrow a backend to the leasing interface. */
 export function isLeasing(backend: object): backend is LeasingBackend {
   const candidate = backend as Partial<LeasingBackend>;

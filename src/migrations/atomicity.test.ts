@@ -23,6 +23,7 @@ import { MongoClient, type Db } from "mongodb";
 import { isLeasing, type Backend, type LeasingBackend } from "../core/Backend.js";
 import { SYSTEM_CONTEXT, type JsonObject } from "../core/types.js";
 import { runMigrations, rollbackMigrations } from "./run.js";
+import { planMigrations } from "./plan.js";
 import { MigrationInterruptedError } from "./errors.js";
 import { acquireLock, BackendJournal, LOCK_LEASE_MS, LOCK_RENEW_MS, MigrationLockedError, SCHEMA_STATE_MODEL } from "./journal.js";
 import { everything } from "./paging.js";
@@ -225,6 +226,88 @@ async function nonAtomic(prices: number[]): Promise<NonAtomicStore> {
   await backend.persist(ctx);
   return backend;
 }
+
+describe("a model created by the migration itself", () => {
+  it.each([
+    ["Postgres (pg-mem)", async () => new PostgresBackend(new (newDb().adapters.createPg().Pool)())],
+    ["IndexedDB", async () => new IndexedDBBackend({ name: `created-${Math.random()}` })]
+  ] as const)("can be written by a later op in the same run (%s)", async (_name, make) => {
+    const backend: Backend = await make();
+    const migration: Migration = {
+      name: "0050_widgets",
+      transforms: { seed: (row: JsonObject) => ({ ...row, n: Number(row.n) + 1 }) },
+      up: (m) => {
+        m.createModel("Widget", [{ name: "n", type: "integer" }]);
+        m.addField("Widget", "label", "text", { fill: "new" });
+        m.transform("Widget", "seed", ["n"]);
+      }
+    };
+    // No model definitions passed: the layout comes from the createModel.
+    const report = await runMigrations(backend, [migration], { skipLock: true });
+    expect(report.applied).toEqual(["0050_widgets"]);
+  });
+});
+
+describe("a plan against a store that has never been migrated", () => {
+  it("creates nothing on SQL, so a read-only login can run it", async () => {
+    const statements: string[] = [];
+    const { Pool } = newDb().adapters.createPg();
+    const pool = new Pool();
+    const spy = {
+      query: (sql: string, params?: unknown[]) => {
+        statements.push(sql);
+        return pool.query(sql, params);
+      }
+    };
+    const plan = await planMigrations(new PostgresBackend(spy as never), [
+      { name: "0001", up: (m) => m.createModel("Thing", [{ name: "n", type: "integer" }]) }
+    ]);
+    expect(plan.steps.map((step) => step.status)).toEqual(["pending"]);
+    expect(statements.filter((sql) => /^\s*(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE)/i.test(sql))).toEqual([]);
+  });
+
+  it("reads the table that exists without creating the one that doesn't", async () => {
+    const { Pool } = newDb().adapters.createPg();
+    const pool = new Pool();
+    await runMigrations(new PostgresBackend(pool), [{ name: "0001", up: (m) => m.createModel("Thing", [{ name: "n", type: "integer" }]) }], {
+      skipLock: true
+    });
+    await pool.query(`DROP TABLE IF EXISTS "${SCHEMA_STATE_MODEL}"`);
+    const statements: string[] = [];
+    const spy = {
+      query: (sql: string, params?: unknown[]) => {
+        statements.push(sql);
+        return pool.query(sql, params);
+      }
+    };
+    const plan = await planMigrations(new PostgresBackend(spy as never), [
+      { name: "0001", up: (m) => m.createModel("Thing", [{ name: "n", type: "integer" }]) }
+    ]);
+    expect(plan.steps.map((step) => step.status)).toEqual(["applied"]); // the log was read
+    expect(statements.filter((sql) => /^\s*(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE)/i.test(sql))).toEqual([]);
+  });
+
+  it("doesn't upgrade an IndexedDB database", async () => {
+    const name = `plan-${Math.random()}`;
+    const seed = new IndexedDBBackend({ name });
+    seed.registerModel("Note", []);
+    await seed.query({ model: "Note", where: everything(), order: [], paging: { start: 0 } }, ctx); // opened at some version
+    seed.close();
+    const version = async () =>
+      new Promise<number>((resolve) => {
+        const request = indexedDB.open(name);
+        request.onsuccess = () => {
+          resolve(request.result.version);
+          request.result.close();
+        };
+      });
+    const before = await version();
+    const planning = new IndexedDBBackend({ name });
+    await planMigrations(planning, [{ name: "0001", up: (m) => m.addField("Note", "x", "text") }]);
+    planning.close();
+    expect(await version()).toBe(before);
+  });
+});
 
 describe("an interrupted page on a store that can't persist it with its marker", () => {
   // Per page of a transform: the in-flight marker, the page, the marker after it.

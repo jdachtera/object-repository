@@ -597,9 +597,17 @@ async function executeOps(
  * to a later registration unchanged, the additive provisioner would re-create that column, empty.
  */
 function followLayout(options: Running, op: MigrationOp): void {
+  // A model the migration itself creates has no definition to come from: its layout is the one it
+  // was created with, so later ops on it in the same run can register and write it.
+  if (op.kind === "createModel" && options.models && !options.models[op.model]) {
+    options.models[op.model] = { fields: [...op.fields], indexes: [...(op.indexes ?? [])] };
+    return;
+  }
   if (!("model" in op) || !options.models?.[op.model]) return;
   const layout = options.models[op.model]!;
-  if (op.kind === "dropModel") {
+  if (op.kind === "addField" && !layout.fields.some((field) => field.name === op.field)) {
+    options.models[op.model] = { ...layout, fields: [...layout.fields, { name: op.field, type: op.type }] };
+  } else if (op.kind === "dropModel") {
     delete options.models[op.model];
   } else if (op.kind === "dropField") {
     options.models[op.model] = { ...layout, fields: layout.fields.filter((field) => field.name !== op.field) };

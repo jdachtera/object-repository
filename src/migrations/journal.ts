@@ -16,7 +16,7 @@
  * path for an already-deployed SQL tracking table is `legacyMigrationNames` plus the runner's adoption.
  */
 import type { Backend } from "../core/Backend.ts";
-import { isLeasing, isSchemaAware } from "../core/Backend.ts";
+import { isLeasing, isModelProbing, isSchemaAware } from "../core/Backend.ts";
 import type { Context, JsonObject } from "../core/types.ts";
 import { everything, pageByUuid } from "./paging.ts";
 import type { MigrationOp, Phase } from "./types.ts";
@@ -139,8 +139,30 @@ export function validateMigrationNames(names: readonly string[]): void {
 export class BackendJournal implements MigrationJournal {
   constructor(
     private readonly backend: Backend,
-    private readonly ctx: Context
+    private readonly ctx: Context,
+    /**
+     * Only read, never create: a journal the store doesn't have yet reads as empty rather than being
+     * provisioned. What `plan()` uses, so it can run with a read-only login and without upgrading an
+     * IndexedDB database under other tabs.
+     */
+    private readonly options: { readOnly?: boolean } = {}
   ) {}
+
+  /**
+   * Make `model` readable: false when it isn't there and this journal only reads. Read-only, only
+   * `model` itself is registered, so reading one table never provisions the other.
+   */
+  private async readable(model: string): Promise<boolean> {
+    if (!this.options.readOnly) {
+      await this.ensureModels();
+      return true;
+    }
+    if (isModelProbing(this.backend) && !(await this.backend.hasModel(model))) return false;
+    if (isSchemaAware(this.backend)) {
+      await this.backend.registerModel(model, [], model === MIGRATION_LOG_MODEL ? LOG_FIELDS : STATE_FIELDS);
+    }
+    return true;
+  }
 
   private async ensureModels(): Promise<void> {
     if (!isSchemaAware(this.backend)) return;
@@ -149,7 +171,7 @@ export class BackendJournal implements MigrationJournal {
   }
 
   async load(): Promise<JournalRow[]> {
-    await this.ensureModels();
+    if (!(await this.readable(MIGRATION_LOG_MODEL))) return [];
     const rows: JournalRow[] = [];
     for await (const page of pageByUuid(this.backend, MIGRATION_LOG_MODEL, everything(), 500, this.ctx)) {
       for (const row of page.rows) rows.push(decodeRow(row));
@@ -178,7 +200,7 @@ export class BackendJournal implements MigrationJournal {
   }
 
   async readSchemaState(): Promise<SchemaState | null> {
-    await this.ensureModels();
+    if (!(await this.readable(SCHEMA_STATE_MODEL))) return null;
     const rows = await this.backend.query(
       { model: SCHEMA_STATE_MODEL, where: everything(), order: [], paging: { start: 0 } },
       this.ctx

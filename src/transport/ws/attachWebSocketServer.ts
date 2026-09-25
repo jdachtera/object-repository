@@ -1,6 +1,6 @@
 import type { Context } from "../../core/types.ts";
 import { SYSTEM_CONTEXT } from "../../core/types.ts";
-import type { WireRequest } from "../../core/Transport.ts";
+import type { WireError, WireRequest } from "../../core/Transport.ts";
 import type { BackendAdapter } from "../BackendAdapter.ts";
 
 /** Minimal `ws`-style socket/server surfaces, so this stays free of a runtime `ws` dependency. */
@@ -54,24 +54,27 @@ export function attachWebSocketServer(
     let closed = false;
     const early: string[] = [];
     let unsubscribe: (() => void) | null = null;
-    // The change feed starts once the subscriber is admitted: at once when the server needs no schema
-    // advertisement, else on a `subscribe` message carrying one it accepts.
-    const admit = (schema: WireRequest["schema"], resolved: Context): boolean => {
-      if (unsubscribe) return true;
+    // The change feed runs while the subscriber is admitted: from the start when the server needs no
+    // schema advertisement, else from a `subscribe` message carrying one it accepts. Every such message
+    // is judged afresh, so a client that goes on to advertise a version the server refuses loses the
+    // feed, just as its requests are refused.
+    const admit = (schema: WireRequest["schema"], resolved: Context): WireError | null => {
       const refusal = adapter.admitSubscriber?.(schema) ?? null;
-      if (refusal) return false;
-      unsubscribe = adapter.subscribe((event) => {
+      if (refusal) {
+        unsubscribe?.();
+        unsubscribe = null;
+        return refusal;
+      }
+      unsubscribe ??= adapter.subscribe((event) => {
         socket.send(JSON.stringify({ type: "event", event }));
       }, resolved);
-      return true;
+      return null;
     };
     const receive = (data: string, resolved: Context): void => {
       const subscribe = subscribeMessage(data);
       if (subscribe) {
-        if (!admit(subscribe.schema, resolved)) {
-          const error = adapter.admitSubscriber?.(subscribe.schema);
-          socket.send(JSON.stringify({ type: "error", error }));
-        }
+        const error = admit(subscribe.schema, resolved);
+        if (error) socket.send(JSON.stringify({ type: "error", error }));
         return;
       }
       // Never let a malformed frame or a failed send become an unhandled rejection. Contain it.

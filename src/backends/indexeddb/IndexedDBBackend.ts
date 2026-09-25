@@ -392,6 +392,21 @@ export class IndexedDBBackend implements Backend, SchemaAwareBackend, CountingBa
     return this.db;
   }
 
+  /** Whether the object store exists, asked of the database at its current version: no upgrade. */
+  async hasModel(model: string): Promise<boolean> {
+    if (this.db) return this.db.objectStoreNames.contains(model);
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = this.factory.open(this.name);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      return db.objectStoreNames.contains(model);
+    } finally {
+      db.close();
+    }
+  }
+
   /** Which of these unique indexes would cover duplicate values in the data as it stands. */
   private async duplicated<T extends { model: string; keyPath: string | string[] }>(candidates: T[]): Promise<T[]> {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {

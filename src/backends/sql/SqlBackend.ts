@@ -235,6 +235,12 @@ export class SqlBackend
     return types;
   }
 
+  /** Whether the table exists, asked of the catalog: nothing is provisioned. */
+  async hasModel(model: string): Promise<boolean> {
+    const probe = this.dialect.columnsQuery(model);
+    return (await this.exec.run(probe.sql, probe.params)).length > 0;
+  }
+
   /**
    * The table's physical columns as field specs — including ones the model no longer declares. A
    * migration pass registers these alongside the declared layout, so a transform reading a column

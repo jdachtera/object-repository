@@ -83,6 +83,35 @@ describe("the change feed judges a subscriber's schema as a request would be jud
   });
 });
 
+describe("a WebSocket subscriber admitted as version 0", () => {
+  it("loses the feed when it goes on to advertise a version the server refuses", async () => {
+    const store = new InMemoryBackend();
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    attachWebSocketServer(
+      wss,
+      new BackendAdapter(store, undefined, undefined, undefined, undefined, { schemaVersion: 1, minSupportedSchemaVersion: 0 })
+    );
+    await new Promise<void>((r) => wss.on("listening", r));
+    const client = new WsClient(`ws://127.0.0.1:${(wss.address() as AddressInfo).port}`);
+    const frames: Array<Record<string, unknown>> = [];
+    client.on("message", (d) => frames.push(JSON.parse(String(d)) as Record<string, unknown>));
+    await new Promise<void>((r) => client.on("open", () => r()));
+    const settle = () => new Promise((r) => setTimeout(r, 50));
+    try {
+      await settle(); // admitted on connect: no advertisement reads as version 0, within the floor
+      client.send(JSON.stringify({ type: "subscribe", schema: { schemaVersion: 5 } })); // ahead of the server
+      await settle();
+      store.save("Note", { uuid: "n1" }, SYSTEM_CONTEXT);
+      await store.persist(SYSTEM_CONTEXT);
+      await settle();
+      expect(frames).toEqual([{ type: "error", error: expect.objectContaining({ code: "SCHEMA_TOO_NEW" }) }]);
+      client.close();
+    } finally {
+      wss.close();
+    }
+  });
+});
+
 describe("a current client's change feed, end to end", () => {
   const schema = { schemaVersion: 7, minSupportedSchemaVersion: 7 };
   const serve = () => new BackendAdapter(new InMemoryBackend(), undefined, undefined, undefined, undefined, schema);
