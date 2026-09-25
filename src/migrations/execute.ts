@@ -283,7 +283,12 @@ async function reregister(
 ): Promise<void> {
   if (!isSchemaAware(backend)) return;
   const schema = options.models[model];
-  if (!schema) throw new SchemaUnknownError(model);
+  if (!schema) {
+    // A document store writes whole records whatever it was told: without a layout it keeps the
+    // registration it has. Only a columnar store would misplace every value.
+    if (!backend.columnar) return;
+    throw new SchemaUnknownError(model);
+  }
   // A record pass registers the model so a columnar store knows its columns, but leaves its unique
   // indexes out. A unique index is a contract, created by an explicit `addIndex` behind the gate;
   // building it here, over data the migration may be about to de-duplicate, would block the very

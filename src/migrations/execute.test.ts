@@ -209,12 +209,13 @@ describe("executor invariants", () => {
     expect(saves[0]!.dirty).toEqual(["uuid", "n"]);
   });
 
-  it("refuses a generic pass against a schema-aware backend with no registered layout", async () => {
+  it("refuses a generic pass against a columnar backend with no registered layout", async () => {
     const fields: FieldSpec[] = [{ name: "name", type: "text" }];
     const indexes: IndexSpec[] = [];
     const registrations: string[] = [];
     const inner = new InMemoryBackend();
     const schemaAware = Object.assign(inner, {
+      columnar: true,
       registerModel: (model: string) => {
         registrations.push(model);
       }
@@ -227,6 +228,19 @@ describe("executor invariants", () => {
     // ...and succeeds once the layout is supplied.
     await applyOp(schemaAware, { kind: "dropField", model: "M", field: "x" }, options({ models: { M: { fields, indexes } } }));
     expect(registrations).toContain("M");
+  });
+});
+
+describe("a document store without a registered layout", () => {
+  it("runs a generic pass, keeping the registration it has", async () => {
+    const registrations: string[] = [];
+    const store = Object.assign(new InMemoryBackend(), {
+      registerModel: (model: string) => {
+        registrations.push(model);
+      }
+    }) as unknown as Backend;
+    await expect(applyOp(store, { kind: "dropField", model: "M", field: "x" }, options({ models: {} }))).resolves.toBeDefined();
+    expect(registrations).toEqual([]);
   });
 });
 

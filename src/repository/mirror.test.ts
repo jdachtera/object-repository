@@ -518,14 +518,34 @@ describe("after a window closes", () => {
     define(server);
     await server.migrate([rename], { applyContracts: true });
 
-    const remote = new RemoteBackend(new InProcessTransport(new BackendAdapter(store, undefined, undefined, undefined, undefined, schema)), store.capabilities);
+    const inner = new InProcessTransport(new BackendAdapter(store, undefined, undefined, undefined, undefined, schema));
+    // A real network: the journal read takes a while, so a save right after the handshake races it.
+    const slow = {
+      request: async (op: Parameters<typeof inner.request>[0], c: Parameters<typeof inner.request>[1]) => {
+        if (op.method === "migrationState") await new Promise((r) => setTimeout(r, 30));
+        return inner.request(op, c);
+      }
+    };
+    const remote = new RemoteBackend(slow, store.capabilities);
     const client = new RepositoryManager({ backend: remote, schema });
     const users = define(client);
-    await remote.handshake(client.fingerprint(), ctx, schema);
-    await client.refreshSchemaState();
+    await new Promise((r) => setTimeout(r, 60)); // the refused startup read has come back
+    await remote.handshake(client.fingerprint(), ctx, schema); // no manual refreshSchemaState()
     await users.save(users.createInstance({ uuid: "u9", fullName: "Bo" })).persist();
     const rows = await store.query({ model: "User", where: { type: "all" }, order: [], paging: { start: 0 } }, ctx);
     expect(rows.find((row) => row.uuid === "u9")).toEqual({ uuid: "u9", fullName: "Bo" }); // no `name` written back
+  });
+});
+
+describe("a migration run before any model is defined", () => {
+  it("rewrites records on a store that needs no layout", async () => {
+    const backend = new InMemoryBackend();
+    backend.save("User", { uuid: "u1", name: "Ann" }, ctx);
+    await backend.persist(ctx);
+    const orm = new RepositoryManager({ backend });
+    await orm.migrate([{ name: "0001", up: (m) => m.renameField("User", "name", "fullName", "text") }]);
+    const rows = await backend.query({ model: "User", where: { type: "all" }, order: [], paging: { start: 0 } }, ctx);
+    expect(rows).toEqual([{ uuid: "u1", fullName: "Ann" }]);
   });
 });
 

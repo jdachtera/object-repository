@@ -115,6 +115,8 @@ export class SqlBackend
     LeasingBackend
 {
   readonly capabilities: Capabilities;
+  /** Declared fields are real columns: a model's layout decides where its values are stored. */
+  readonly columnar = true;
 
   private readonly dialect: SqlDialect;
   private readonly exec: SqlExecutor;

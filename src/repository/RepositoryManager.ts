@@ -134,6 +134,27 @@ export class RepositoryManager {
     this.ctx = options.context ?? SYSTEM_CONTEXT;
     this.generateId = options.generateId;
     this.schema = options.schema;
+    // Behind a RemoteBackend, the journal read a window-declaring `define()` starts goes out before the
+    // handshake can (its fingerprint needs every model defined), and a versioned server refuses it: read
+    // again once the handshake has set this client's advertisement, or every window stays open.
+    let target: Backend | null = null;
+    try {
+      target = migrationTarget(this.backend);
+    } catch {
+      // a store migrations refuse to reach through (a multi-write backend): no journal to follow
+    }
+    if (target && isJournalSource(target)) {
+      target.onSchemaAdvertised?.(() => {
+        if (!this.windowsLoaded) return;
+        // Unknown again until re-read: a save made meanwhile is held, as it is at startup.
+        this.windows.known = false;
+        this.windows.ready = this.windows.ready
+          .then(() => this.refreshSchemaState().catch(() => {}))
+          .then(() => {
+            this.windows.known = true;
+          });
+      });
+    }
   }
 
   /** Define a model and get back a repository typed by its property map. */

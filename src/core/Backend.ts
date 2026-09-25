@@ -125,6 +125,12 @@ export interface FieldSpec {
  */
 export interface SchemaAwareBackend {
   registerModel(model: string, indexes: IndexSpec[], fields?: FieldSpec[]): void | Promise<void>;
+  /**
+   * True when `fields` decide where values are stored (a SQL table's columns). Writing a model such a
+   * store hasn't been given the layout of would put every value in the JSON overflow, so a migration
+   * pass refuses to; a store that keeps whole documents needs no layout to be written correctly.
+   */
+  readonly columnar?: boolean;
 }
 
 /** Narrow a backend to the schema-aware interface. */
@@ -248,6 +254,12 @@ export function migrationTarget(backend: Backend): Backend {
  */
 export interface JournalSourceBackend {
   readMigrationJournal(ctx: Context): Promise<JournalRow[]>;
+  /**
+   * Called whenever the client's schema advertisement changes (its handshake). A versioned server
+   * refuses a journal read made before it — and a model declaring a window reads the journal when it
+   * is defined, which is before the handshake can be — so a reader retries from here.
+   */
+  onSchemaAdvertised?(listener: () => void): () => void;
 }
 
 export function isJournalSource(backend: object): backend is JournalSourceBackend {

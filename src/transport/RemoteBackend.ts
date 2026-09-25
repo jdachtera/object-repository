@@ -58,6 +58,7 @@ export class RemoteBackend implements Backend {
     const params: SchemaAdvertisement = { fingerprint, ...(schema ?? {}) };
     this.advertisement = params;
     expect(await this.transport.request({ method: "handshake", params: { ...params } }, ctx));
+    for (const listener of [...this.advertisedListeners]) listener();
     // A change feed opened before this (a repository subscribes when it is defined, and the fingerprint
     // needs every model defined) went out without the advertisement, and a versioned server refused
     // it. Reopen it with the advertisement, so it delivers events from here on.
@@ -75,6 +76,13 @@ export class RemoteBackend implements Backend {
   async query(plan: QueryPlan, ctx: Context): Promise<JsonObject[]> {
     const response = await this.send({ method: "query", params: { plan } }, ctx);
     return expect(response) as JsonObject[];
+  }
+
+  private readonly advertisedListeners = new Set<() => void>();
+
+  onSchemaAdvertised(listener: () => void): () => void {
+    this.advertisedListeners.add(listener);
+    return () => this.advertisedListeners.delete(listener);
   }
 
   /** The server's applied migrations, as far as closing compatibility windows needs them. */
