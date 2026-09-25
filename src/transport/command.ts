@@ -97,9 +97,10 @@ export interface CommandClientOptions {
   onChanges?: (changes: ChangeEvent[]) => void;
   /**
    * This client's schema advertisement, sent with every call. A server that declares a schema version
-   * judges each request by it; a call without one is judged as version 0.
+   * judges each request by it; a call without one is judged as version 0. A function is called on
+   * every call, so the advertisement reflects models defined after the client was made.
    */
-  schema?: SchemaAdvertisement;
+  schema?: SchemaAdvertisement | (() => SchemaAdvertisement);
 }
 
 /** Send one command over a transport, apply its change events via `onChanges`, and return the handler's value. */
@@ -129,7 +130,15 @@ export function commandClient<M extends CommandMap>(transport: Transport, option
   return new Proxy({} as CommandClient<M>, {
     get(_target, name) {
       if (typeof name !== "string") return undefined;
-      return (input: unknown) => invokeCommand(transport, name, input, ctx, options.onChanges, options.schema);
+      return (input: unknown) =>
+        invokeCommand(
+          transport,
+          name,
+          input,
+          ctx,
+          options.onChanges,
+          typeof options.schema === "function" ? options.schema() : options.schema
+        );
     }
   });
 }

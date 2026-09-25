@@ -591,6 +591,19 @@ describe("an index migration run before any model is defined", () => {
   });
 });
 
+describe("a hard remove before the journal has been read", () => {
+  it("leaves the model's columns to be provisioned from its definition", async () => {
+    const { Pool } = newDb().adapters.createPg();
+    const backend = new PostgresBackend(new Pool());
+    const orm = new RepositoryManager({ backend, schema: { schemaVersion: 7, minSupportedSchemaVersion: 5 } });
+    const users = orm.define({ name: "User", properties: { fullName: text(), name: text({ deprecatedSince: 7, mirrors: "fullName" }) } });
+    users.remove({ uuid: "gone" } as never, { hard: true }); // the very first write, at startup
+    await users.persist();
+    await users.save(users.createInstance({ fullName: "Ann" })).persist();
+    expect((await users.all().list()).map((u) => u.fullName)).toEqual(["Ann"]);
+  });
+});
+
 describe("two models that embed each other", () => {
   it("read and write without recursing forever", async () => {
     const orm = new RepositoryManager({ backend: new InMemoryBackend() });
@@ -698,6 +711,36 @@ describe("the window holds beyond plain queries", () => {
 
     expect(await asUser("alice").all().count()).toBe(0);
     expect(await asUser("bob").all().count()).toBe(1);
+  });
+
+  it("judges a write against the legacy half of the row it replaces", async () => {
+    const store = new InMemoryBackend();
+    const policy = new PolicyBackend(store, {
+      write: (_model, record, context) => record.owner === (context as unknown as { user: string }).user
+    });
+    const asUser = (user: string) =>
+      new RepositoryManager({
+        backend: policy,
+        context: { ...ctx, user } as unknown as Context,
+        schema: { schemaVersion: 7, minSupportedSchemaVersion: 5 }
+      }).define({ name: "Doc", properties: { owner: text(), title: text(), ownerId: text({ deprecatedSince: 7, mirrors: "owner" }) } });
+
+    const alice = asUser("alice");
+    alice.save(alice.createInstance({ uuid: "d1", owner: "alice", title: "t" }));
+    await alice.persist();
+    // An old build, beneath the policy, hands the record to bob through the only field it knows.
+    store.save("Doc", { uuid: "d1", owner: "alice", ownerId: "bob", title: "t" }, ctx);
+    await store.persist(ctx);
+
+    const asAlice = asUser("alice");
+    const hers = (await asAlice.get("d1"))!;
+    hers.owner = "alice"; // claims it back
+    await expect(asAlice.save(hers).persist()).rejects.toThrow(/denied/);
+
+    const asBob = asUser("bob");
+    const his = (await asBob.get("d1"))!;
+    his.title = "bob's now";
+    await expect(asBob.save(his).persist()).resolves.toBeDefined();
   });
 });
 

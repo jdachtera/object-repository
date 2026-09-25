@@ -481,8 +481,10 @@ export class RepositoryManager {
   commands<M extends CommandMap>(transport: Transport): CommandClient<M> {
     return commandClient<M>(transport, {
       context: this.ctx,
-      // A server that declares a schema version checks every request, commands included.
-      schema: { fingerprint: this.fingerprint(), ...(this.schema ?? {}) },
+      // A server that declares a schema version checks every request, commands included. Worked out per
+      // call: a client made before its models are defined must not send the empty set's fingerprint,
+      // and one with no models at all has no shape to compare — only its versions.
+      schema: () => ({ ...(this.registry.size ? { fingerprint: this.fingerprint() } : {}), ...(this.schema ?? {}) }),
       onChanges: (events) => {
         // Route into the backend's change feed when it can receive them (a RemoteBackend); for an
         // in-process backend the command already ran against it, so its own feed fired the events.

@@ -38,7 +38,9 @@ export class WindowState {
 
   /** Once the journal is read, hand every held save to the backend. */
   async release(): Promise<void> {
-    if (this.held.size === 0) return;
+    if (this.held.size === 0 && this.known) return;
+    // Unknown yet: wait, even with nothing held — a hard remove isn't held, and persisting it now
+    // would reach a model that isn't registered until the journal has been read.
     await this.ready;
     const writes = [...this.held.values()];
     this.held.clear();

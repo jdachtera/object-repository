@@ -152,8 +152,10 @@ export class SqlBackend
     // Provisioning is memoized per model, so a *re-registration* that widens the declared field set
     // would otherwise update the field list without ever creating the columns — and every subsequent
     // query would then name a column that isn't there. Drop the memo when the shape actually changes.
+    // A provisioning run before any registration (a write to a model not yet defined) knew no columns:
+    // it doesn't stand for this layout either.
     const previous = this.schemas.get(model);
-    if (previous && !sameFields(previous, fields)) this.provisioned.delete(model);
+    if (!previous || !sameFields(previous, fields)) this.provisioned.delete(model);
     this.schemas.set(model, fields);
     this.indexes.set(model, indexes);
     await this.ensure(model);

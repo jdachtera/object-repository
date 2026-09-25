@@ -117,6 +117,22 @@ export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBacke
   }
 
   /**
+   * `record` as the write policy should judge it: during an open window the legacy field is the
+   * authoritative copy (an older build may have handed the record to someone else through it alone),
+   * so each canonical field takes its legacy value — absent where that is — as the read filter does.
+   */
+  private authoritative(model: string, record: JsonObject): JsonObject {
+    const mirrors = this.mirrors.get(model);
+    if (!mirrors) return record;
+    const view = { ...record };
+    for (const [canonical, legacy] of mirrors) {
+      if (record[legacy] === undefined) delete view[canonical];
+      else view[canonical] = record[legacy]!;
+    }
+    return view;
+  }
+
+  /**
    * Migrations run on the store beneath the policy. Row policy is per-request authorization; applied
    * to a migration it would rewrite only the rows the context can see and journal the migration as
    * applied — a silent partial migration — or hide the migration lease and block every run.
@@ -243,7 +259,7 @@ export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBacke
   }
 
   private authorizeWrite(model: string, record: JsonObject, ctx: Context): void {
-    if (this.policy.write && !this.policy.write(model, record, ctx)) {
+    if (this.policy.write && !this.policy.write(model, this.authoritative(model, record), ctx)) {
       throw new PolicyError(`Write to "${model}" denied for the current context.`);
     }
   }

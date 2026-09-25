@@ -162,4 +162,27 @@ describe("commands under a versioned server", () => {
     const stale = new RepositoryManager({ schema: { schemaVersion: 1 } }).commands<typeof commands>(transport);
     await expect(stale.ping(undefined)).rejects.toMatchObject({ code: "SCHEMA_TOO_OLD" });
   });
+
+  it("judge a client made before its models are defined by the models it has when it calls", async () => {
+    const { BackendAdapter } = await import("./BackendAdapter.js");
+    const { InProcessTransport } = await import("./InProcessTransport.js");
+    const { InMemoryBackend } = await import("../backends/memory/InMemoryBackend.js");
+    const { RepositoryManager } = await import("../repository/RepositoryManager.js");
+    const { text } = await import("../properties/factories.js");
+    const { command } = await import("./command.js");
+    const commands = { ping: command({ handler: async () => "pong" }) };
+    const serverOrm = new RepositoryManager({ schema: { schemaVersion: 3 } });
+    serverOrm.define({ name: "Note", properties: { body: text() } });
+    const adapter = new BackendAdapter(new InMemoryBackend(), serverOrm.fingerprint(), commands, undefined, undefined, { schemaVersion: 3 });
+    const transport = new InProcessTransport(adapter);
+
+    const orm = new RepositoryManager({ schema: { schemaVersion: 3 } });
+    const client = orm.commands<typeof commands>(transport); // before define()
+    orm.define({ name: "Note", properties: { body: text() } });
+    await expect(client.ping(undefined)).resolves.toBe("pong");
+
+    // A commands-only client has no models: no shape to compare, only its version.
+    const bare = new RepositoryManager({ schema: { schemaVersion: 3 } }).commands<typeof commands>(transport);
+    await expect(bare.ping(undefined)).resolves.toBe("pong");
+  });
 });
