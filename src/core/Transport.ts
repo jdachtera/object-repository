@@ -37,7 +37,8 @@ export type WireMethod =
   | "changes"
   | "command"
   | "pull"
-  | "push";
+  | "push"
+  | "migrationState";
 
 export interface WireRequest {
   method: WireMethod;

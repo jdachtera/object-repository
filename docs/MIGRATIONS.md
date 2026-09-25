@@ -108,7 +108,10 @@ Once the contract has run, the process that ran it stops mirroring immediately: 
 canonical field, writes stop writing the legacy one, and the legacy column is no longer provisioned. A
 process started later learns this from the journal when it first defines the model. A process that was
 already running when another one released the contract picks it up with `orm.refreshSchemaState()`,
-or on restart. Then delete the deprecated property from the model.
+or on restart. A client behind a `RemoteBackend` can't read the journal models (the server refuses
+every reserved model), so it asks the server instead: the `migrationState` request returns the applied
+rows, stripped to their renames and drops. A legacy property marked `required` stops being required
+once its window closes. Then delete the deprecated property from the model.
 
 A migration whose gate is open *and* whose contracts are being applied in the same run skips the
 split. It runs whole, in the order written, so SQL keeps its O(1) `RENAME COLUMN`. It is reported

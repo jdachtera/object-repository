@@ -879,6 +879,17 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
   private get mirrors(): Mirrors {
     const version = this.windows?.version ?? 0;
     if (this.activeMirrors?.version === version) return this.activeMirrors.mirrors;
+    const { mirrors, complete } = this.openMirrors(new Set([this]));
+    if (complete) this.activeMirrors = { version, mirrors };
+    return mirrors;
+  }
+
+  /**
+   * This model's open windows and, beneath each embedding path, its embedded models' — skipping any
+   * model already on the path (`visiting`), so two models embedding each other don't recurse forever.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private openMirrors(visiting: Set<Repository<any>>): { mirrors: Mirrors; complete: boolean } {
     const open = new Map<string, string>();
     for (const [canonical, legacy] of this.declaredMirrors) {
       if (!this.windows?.isClosed(this.modelName, legacy)) open.set(canonical, legacy);
@@ -894,11 +905,12 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
         complete = false; // not defined yet: don't cache a map that is missing its windows
         continue;
       }
-      if (target === this) continue;
-      for (const [canonical, legacy] of target.mirrors) open.set(`${name}.${canonical}`, `${name}.${legacy}`);
+      if (visiting.has(target)) continue;
+      const nested = target.openMirrors(new Set([...visiting, target]));
+      if (!nested.complete) complete = false;
+      for (const [canonical, legacy] of nested.mirrors) open.set(`${name}.${canonical}`, `${name}.${legacy}`);
     }
-    if (complete) this.activeMirrors = { version, mirrors: open };
-    return open;
+    return { mirrors: open, complete };
   }
 
   /**
@@ -1200,6 +1212,9 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
     for (const name of Object.keys(this.properties)) {
       const property = this.properties[name] as AnyProperty;
       if (property.kind !== "scalar") continue;
+      // A legacy field whose window has closed is retired: nothing mirrors into it any more, so holding
+      // it to `required` would refuse every save until the property is deleted from the code.
+      if (property.mirrors && !this.mirrors.has(property.mirrors)) continue;
       if (instance[name] === undefined && property.hasDefault) instance[name] = property.makeDefault();
       if ((instance[name] === undefined || instance[name] === null) && property.required) {
         throw new ValidationError([{ message: `Field "${name}" is required on "${this.modelName}".`, path: [name] }]);

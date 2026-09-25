@@ -6,6 +6,8 @@ import {
   type Unsubscribe
 } from "../core/Backend.ts";
 import type { Context, SchemaVersioning } from "../core/types.ts";
+import { migrationTarget } from "../core/Backend.ts";
+import { BackendJournal, type JournalRow } from "../migrations/journal.ts";
 import { checkSchemaCompatibility, enforceSchema, type SchemaAdvertisement } from "../core/schema.ts";
 import type { AggregatePlan, QueryPlan } from "../core/QueryPlan.ts";
 import { reduceAggregatePlan } from "../expressions/aggregateReduce.ts";
@@ -125,6 +127,8 @@ export class BackendAdapter implements TransportAdapter {
         }
         case "command":
           return this.command(request.params, ctx);
+        case "migrationState":
+          return ok(await this.migrationState(ctx));
         default:
           return err("UNSUPPORTED_METHOD", `Adapter cannot handle "${request.method}"`);
       }
@@ -160,6 +164,22 @@ export class BackendAdapter implements TransportAdapter {
    * model, including reserved ones (the sync outbox, the migration journal and lease) and any outside
    * the allow-list; forwarding those would publish exactly what `query` refuses to return.
    */
+  /**
+   * The applied journal rows a client needs to follow closed compatibility windows, stripped to their
+   * structural ops. The journal itself is a reserved model no client may query: its other ops (a
+   * transform's name, a raw SQL statement) are the server's business.
+   */
+  private async migrationState(ctx: Context): Promise<JournalRow[]> {
+    const rows = await new BackendJournal(migrationTarget(this.backend), ctx).load();
+    return rows
+      .filter((row) => row.status === "applied")
+      .map((row) => ({
+        ...row,
+        cursor: null,
+        ops: row.ops.filter((op) => op.kind === "dropField" || op.kind === "renameField" || op.kind === "dropModel")
+      }));
+  }
+
   admitSubscriber(schema: SchemaAdvertisement | undefined): { code: string; message: string } | null {
     const refusal = enforceSchema(schema, this.advertisement());
     return refusal && !refusal.compatible ? { code: refusal.code, message: refusal.message } : null;

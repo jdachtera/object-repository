@@ -491,6 +491,54 @@ describe("writes through either name stay in step", () => {
   });
 });
 
+describe("after a window closes", () => {
+  const rename = { name: "0012_fullname", schemaVersion: 7, up: (m: MigrationBuilder) => m.renameField("User", "name", "fullName", "text") };
+  const define = (orm: RepositoryManager) =>
+    orm.define({
+      name: "User",
+      properties: { fullName: text(), name: text({ required: true, deprecatedSince: 7, mirrors: "fullName" }) }
+    });
+
+  it("a required legacy half no longer refuses saves", async () => {
+    const backend = new InMemoryBackend();
+    const orm = new RepositoryManager({ backend, schema: { schemaVersion: 7, minSupportedSchemaVersion: 7 } });
+    const users = define(orm);
+    await orm.migrate([rename], { applyContracts: true });
+    users.save(users.createInstance({ fullName: "Ann" }));
+    await expect(users.persist()).resolves.toBeDefined();
+  });
+
+  it("a client behind a RemoteBackend learns of it from the server", async () => {
+    const { BackendAdapter } = await import("../transport/BackendAdapter.js");
+    const { InProcessTransport } = await import("../transport/InProcessTransport.js");
+    const { RemoteBackend } = await import("../transport/RemoteBackend.js");
+    const store = new InMemoryBackend();
+    const schema = { schemaVersion: 7, minSupportedSchemaVersion: 7 };
+    const server = new RepositoryManager({ backend: store, schema });
+    define(server);
+    await server.migrate([rename], { applyContracts: true });
+
+    const remote = new RemoteBackend(new InProcessTransport(new BackendAdapter(store, undefined, undefined, undefined, undefined, schema)), store.capabilities);
+    const client = new RepositoryManager({ backend: remote, schema });
+    const users = define(client);
+    await remote.handshake(client.fingerprint(), ctx, schema);
+    await client.refreshSchemaState();
+    await users.save(users.createInstance({ uuid: "u9", fullName: "Bo" })).persist();
+    const rows = await store.query({ model: "User", where: { type: "all" }, order: [], paging: { start: 0 } }, ctx);
+    expect(rows.find((row) => row.uuid === "u9")).toEqual({ uuid: "u9", fullName: "Bo" }); // no `name` written back
+  });
+});
+
+describe("two models that embed each other", () => {
+  it("read and write without recursing forever", async () => {
+    const orm = new RepositoryManager({ backend: new InMemoryBackend() });
+    const as = orm.define({ name: "A", properties: { label: text(), b: relationToOne({ model: "B", storage: "embed" }) } });
+    orm.define({ name: "B", properties: { label: text(), a: relationToOne({ model: "A", storage: "embed" }) } });
+    await as.save(as.createInstance({ label: "x" })).persist();
+    expect(await as.all().filter(eq("label", "x")).count()).toBe(1);
+  });
+});
+
 describe("substitution reaches every place a field is named", () => {
   const mirrors = new Map([["fullName", "name"]]);
 

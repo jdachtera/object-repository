@@ -1,6 +1,7 @@
 import type { Capabilities, Context, JsonObject, JsonValue, Uuid } from "./types.ts";
 import type { QueryPlan, AggregatePlan, AggregateResultRow, WindowPlan, ExpressionNode, ValueNode } from "./QueryPlan.ts";
 import type { MigrationOp } from "../migrations/types.ts";
+import type { JournalRow } from "../migrations/journal.ts";
 
 /**
  * The spine of the whole library (ARCHITECTURE.md §2).
@@ -237,6 +238,20 @@ export function migrationTarget(backend: Backend): Backend {
     if (next === current) return current;
     current = next;
   }
+}
+
+/**
+ * Optional capability: read the migration journal of a store this backend fronts but can't query the
+ * reserved journal models of — a `RemoteBackend`, whose server refuses every `_`-prefixed model. A
+ * client learns from it which compatibility windows have closed. Rows carry only the structural ops
+ * (`dropField`, `renameField`, `dropModel`) that windows and write baselines follow.
+ */
+export interface JournalSourceBackend {
+  readMigrationJournal(ctx: Context): Promise<JournalRow[]>;
+}
+
+export function isJournalSource(backend: object): backend is JournalSourceBackend {
+  return typeof (backend as Partial<JournalSourceBackend>).readMigrationJournal === "function";
 }
 
 /**

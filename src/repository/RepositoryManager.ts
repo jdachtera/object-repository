@@ -1,5 +1,5 @@
 import type { Backend, IndexSpec, IndexField, FieldSpec } from "../core/Backend.ts";
-import { isRawQueryable, isSchemaAware, isTransactional, migrationTarget } from "../core/Backend.ts";
+import { isJournalSource, isRawQueryable, isSchemaAware, isTransactional, migrationTarget } from "../core/Backend.ts";
 import { runMigrations, rollbackMigrations, type RunnerOptions } from "../migrations/run.ts";
 import { BackendJournal, type JournalRow } from "../migrations/journal.ts";
 import { downOps } from "../migrations/ops.ts";
@@ -330,7 +330,7 @@ export class RepositoryManager {
    * the change up, or is restarted without the retired property.
    */
   async refreshSchemaState(): Promise<void> {
-    const rows = await new BackendJournal(migrationTarget(this.backend), this.ctx).load();
+    const rows = await this.loadJournal();
     // Journalled work this process hasn't seen yet changed the stored shape under its repositories.
     const applied = rows.filter((row) => row.status === "applied");
     if (this.seenApplied) {
@@ -359,11 +359,17 @@ export class RepositoryManager {
     }
   }
 
+  /** The store's journal — through the server, for a client whose server won't serve the journal models. */
+  private loadJournal(): Promise<JournalRow[]> {
+    const target = migrationTarget(this.backend);
+    return isJournalSource(target) ? target.readMigrationJournal(this.ctx) : new BackendJournal(target, this.ctx).load();
+  }
+
   /** Remember which journal rows exist before this process migrates, so it can tell what ran. */
   private async snapshotJournal(): Promise<void> {
     if (this.seenApplied) return;
     try {
-      const rows = await new BackendJournal(migrationTarget(this.backend), this.ctx).load();
+      const rows = await this.loadJournal();
       this.seenApplied = new Map(rows.filter((row) => row.status === "applied").map((row) => [journalKey(row), row]));
     } catch {
       // unreadable: nothing to compare against, as for a process that never read it

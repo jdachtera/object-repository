@@ -1,4 +1,5 @@
 import type { SchemaVersioning } from "../core/types.ts";
+import type { JournalRow } from "../migrations/journal.ts";
 import { isSchemaRefusal, type SchemaAdvertisement, type SchemaRefusalCode } from "../core/schema.ts";
 import type {
   Backend,
@@ -74,6 +75,11 @@ export class RemoteBackend implements Backend {
   async query(plan: QueryPlan, ctx: Context): Promise<JsonObject[]> {
     const response = await this.send({ method: "query", params: { plan } }, ctx);
     return expect(response) as JsonObject[];
+  }
+
+  /** The server's applied migrations, as far as closing compatibility windows needs them. */
+  async readMigrationJournal(ctx: Context): Promise<JournalRow[]> {
+    return expect(await this.send({ method: "migrationState", params: {} }, ctx)) as JournalRow[];
   }
 
   async queryUuids(plan: QueryPlan, ctx: Context): Promise<Uuid[]> {
