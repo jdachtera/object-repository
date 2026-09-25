@@ -754,6 +754,13 @@ export class SqlBackend
     try {
       const result = await this.exec.transaction(async (txExec) => {
         scoped = this.forTransaction(txExec);
+        // Writes queued here before the transaction began go first: `fn` may persist its own through the
+        // scope, and folding the older ones in only at the end would let them land after — overwriting,
+        // say, a newer migration marker with the stale one queued before it.
+        scoped.saveQueue.push(...this.saveQueue);
+        scoped.removeQueue.push(...this.removeQueue);
+        this.saveQueue = [];
+        this.removeQueue = [];
         const result = await fn(scoped);
         // Fold in writes queued on the outer backend (repos not obtained from the tx scope) so the
         // whole unit commits together, then flush once on the tx connection.

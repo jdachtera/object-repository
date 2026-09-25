@@ -1107,6 +1107,39 @@ describe("MySQL (real engine)", () => {
     expect(report.applied).toEqual(["0001_nick"]);
   });
 
+  it("a marker queued by a page with nothing to write doesn't overwrite a later op's", async () => {
+    if (!pool) return;
+    await dropMigrationTables("stalemark_my");
+    const backend = new MySqlBackend(pool);
+    const before = {
+      stalemark_my: {
+        fields: [{ name: "code", type: "text" as const }, { name: "note", type: "text" as const }, { name: "name", type: "text" as const }, { name: "price", type: "integer" as const }],
+        indexes: []
+      }
+    };
+    await backend.registerModel("stalemark_my", [], before.stalemark_my.fields);
+    ["a", "b", "c", "d"].forEach((name, i) => backend.save("stalemark_my", { uuid: `i${i}`, code: "c", note: "set", name, price: i + 1 }, ctx));
+    await backend.persist(ctx);
+
+    const models = {
+      stalemark_my: { fields: before.stalemark_my.fields.map((f) => (f.name === "name" ? { name: "name", type: "json" as const } : f)), indexes: [] }
+    };
+    const migration = (failOn?: string) => ({
+      ...cents(failOn),
+      up: (m: MigrationBuilder) => {
+        // Not a plain assignment (the copy's type isn't the columns'), so a record pass: and with every
+        // target already set, one whose pages have nothing to write.
+        m.copyField("stalemark_my", "code", "note", "json");
+        m.retypeField("stalemark_my", "name", "text", "json"); // native: UPDATE … JSON_QUOTE
+        m.transform("stalemark_my", "cents", ["price"], undefined, { phase: "expand" });
+      }
+    });
+    await expect(runMigrations(backend, [migration("i0")], { models, batchSize: 2 })).rejects.toThrow("boom on i0");
+    await runMigrations(new MySqlBackend(pool), [migration()], { models, batchSize: 2 });
+    const [rows] = (await pool.query("SELECT `name` FROM `stalemark_my` ORDER BY `uuid`")) as unknown as [Array<{ name: string }>];
+    expect(rows.map((row) => row.name)).toEqual(['"a"', '"b"', '"c"', '"d"']);
+  });
+
   it("a unique-key clash whose value mentions the primary key is still refused", async () => {
     if (!pool) return;
     await pool.query("DROP TABLE IF EXISTS `uniq2_my`");
