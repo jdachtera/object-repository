@@ -80,7 +80,8 @@ export async function planMigrations(
         message: `"${name}" is mid-window: both the old and new shapes are live. Raise minSupportedSchemaVersion to ${decision.migration.schemaVersion ?? 0} once no older reader remains.`
       });
     }
-    if (decision.owed.some((op) => op.kind === "rawSql")) {
+    // The expand half too: `m.sql()` runs in the expand phase by default.
+    if ([...(decision.expand ?? []), ...decision.owed].some((op) => op.kind === "rawSql")) {
       warnings.push({
         code: "RAW_SQL_NOT_PORTABLE",
         migration: name,

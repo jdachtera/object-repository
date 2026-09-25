@@ -154,8 +154,13 @@ export class SqlBackend
     // query would then name a column that isn't there. Drop the memo when the shape actually changes.
     // A provisioning run before any registration (a write to a model not yet defined) knew no columns:
     // it doesn't stand for this layout either.
+    // A changed index set counts too: restoring a model's unique indexes after a migration pass (or
+    // declaring one whose build failed over duplicates since removed) must build them.
     const previous = this.schemas.get(model);
-    if (!previous || !sameFields(previous, fields)) this.provisioned.delete(model);
+    const previousIndexes = this.indexes.get(model);
+    if (!previous || !sameFields(previous, fields) || JSON.stringify(previousIndexes ?? []) !== JSON.stringify(indexes)) {
+      this.provisioned.delete(model);
+    }
     this.schemas.set(model, fields);
     this.indexes.set(model, indexes);
     await this.ensure(model);
@@ -195,6 +200,7 @@ export class SqlBackend
     if (op.kind === "dropIndex") {
       result = await this.dropIndexNamed(op.model, op.index);
     } else {
+      if (op.kind === "copyField" && !(await this.copiesAsStored(op))) return null;
       const statements = lowerToSql(op, this.dialect, present, "model" in op ? await this.indexColumnTypes(op) : undefined);
       if (!statements) return null;
       if (retypeThenRewrite(op)) {
@@ -239,14 +245,32 @@ export class SqlBackend
   /**
    * Column types an op's lowering depends on. An index added by a migration usually runs before the
    * model is defined in this process, so the declared layout may not know the column at all: read the
-   * table's physical types too — they decide whether MySQL needs a key-length prefix, and whether a
-   * copy between two columns is a plain assignment or needs converting value by value.
+   * table's physical types too — they decide whether MySQL needs a key-length prefix. (A copy goes by
+   * the declared types alone: every text-backed type reads back from the catalog as plain text.)
    */
   private async indexColumnTypes(op: MigrationOp & { model: string }): Promise<Map<string, string>> {
     const types = this.columnTypes(op.model);
-    if (op.kind !== "addIndex" && op.kind !== "copyField") return types;
+    if (op.kind !== "addIndex") return types;
     for (const field of await this.liveFieldSpecs(op.model)) types.set(field.name, field.type);
     return types;
+  }
+
+  /**
+   * Whether a plain `SET to = from` is `coerce()`'s result: both fields hold the copy's type. It is
+   * otherwise the engine's cast (refusing text → bigint, rounding 1.5, reading 'abc' as 0) or a raw copy
+   * between text-backed types that store values differently (`array`/`scalar` hold JSON, `text` doesn't),
+   * and the reference converts each value instead. Declared types decide; where the model isn't
+   * registered, the catalog's — which tell text-backed types apart only as far as "text".
+   */
+  private async copiesAsStored(
+    op: Extract<MigrationOp, { kind: "copyField" }>,
+    catalog?: ReadonlyMap<string, string>
+  ): Promise<boolean> {
+    const declared = this.columnTypes(op.model);
+    if (declared.has(op.from) || declared.has(op.to)) return declared.get(op.from) === op.type && declared.get(op.to) === op.type;
+    const physical = catalog ?? new Map((await this.liveFieldSpecs(op.model)).map((field) => [field.name, field.type]));
+    const kind = fieldTypeOfColumn(this.dialect.columnType(op.type));
+    return physical.get(op.from) === kind && physical.get(op.to) === kind;
   }
 
   /** Whether the table exists, asked of the catalog: nothing is provisioned. */
@@ -353,6 +377,17 @@ export class SqlBackend
    */
   async previewMigrationOps(ops: MigrationOp[]): Promise<string[][]> {
     const tables = new Map<string, Set<string>>();
+    // The catalog's types, followed through the ops like the columns: a copy into a column an earlier
+    // op adds is judged by the type that op gives it.
+    const catalogs = new Map<string, Map<string, string>>();
+    const catalogOf = async (model: string): Promise<Map<string, string>> => {
+      let catalog = catalogs.get(model);
+      if (!catalog) {
+        catalog = new Map((await this.liveFieldSpecs(model)).map((field) => [field.name, field.type]));
+        catalogs.set(model, catalog);
+      }
+      return catalog;
+    };
     const columnsOf = async (model: string): Promise<Set<string>> => {
       let columns = tables.get(model);
       if (!columns) {
@@ -366,9 +401,21 @@ export class SqlBackend
     for (const op of ops) {
       const present = "model" in op ? await columnsOf(op.model) : new Set<string>();
       const types = "model" in op ? await this.indexColumnTypes(op) : undefined;
-      const statements = lowerToSql(op, this.dialect, present, types) ?? [];
+      const native = op.kind !== "copyField" || (await this.copiesAsStored(op, await catalogOf(op.model)));
+      const statements = native ? (lowerToSql(op, this.dialect, present, types) ?? []) : [];
       previews.push(statements.map((statement) => statement.sql));
-      if ("model" in op) followColumns(present, op);
+      if ("model" in op) {
+        followColumns(present, op);
+        const catalog = await catalogOf(op.model);
+        if (op.kind === "createModel" && catalog.size === 0) {
+          for (const field of op.fields) catalog.set(field.name, fieldTypeOfColumn(this.dialect.columnType(field.type)));
+        } else if (op.kind === "addField") catalog.set(op.field, fieldTypeOfColumn(this.dialect.columnType(op.type)));
+        else if (op.kind === "dropField") catalog.delete(op.field);
+        else if (op.kind === "renameField" && catalog.has(op.from)) {
+          catalog.set(op.to, catalog.get(op.from)!);
+          catalog.delete(op.from);
+        } else if (op.kind === "retypeField") catalog.set(op.field, fieldTypeOfColumn(this.dialect.columnType(op.to)));
+      }
     }
     return previews;
   }

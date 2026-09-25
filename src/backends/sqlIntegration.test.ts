@@ -556,6 +556,32 @@ describe("Postgres (real engine)", () => {
     expect((back.d as Date).getTime()).toBe(when.getTime()); // date stored as epoch bigint, decoded to Date
     expect(back.b).toBe(true);
   });
+  it("builds the unique indexes a migration pass set aside, once the data allows it", async () => {
+    if (!pool) return;
+    await pool.query(`DROP TABLE IF EXISTS "dedupe_pg", "_object_repository_migration_log", "_object_repository_schema_state"`);
+    const backend = new PostgresBackend(pool);
+    const byEmail = { name: "email", fields: [{ path: "email" }], unique: true };
+    const models = { dedupe_pg: { fields: [{ name: "email", type: "text" as const }], indexes: [byEmail] } };
+    await backend.registerModel("dedupe_pg", [], models.dedupe_pg.fields);
+    backend.save("dedupe_pg", { uuid: "u1", email: "a@x" }, ctx);
+    backend.save("dedupe_pg", { uuid: "u2", email: "a@x" }, ctx);
+    await backend.persist(ctx);
+    await backend.registerModel("dedupe_pg", [byEmail], models.dedupe_pg.fields); // over duplicates: fails quietly
+
+    await runMigrations(
+      backend,
+      [
+        {
+          name: "0070_dedupe",
+          transforms: { dedupe: (row: Record<string, unknown>) => (row.uuid === "u2" ? null : row) } as never,
+          up: (m) => m.transform("dedupe_pg", "dedupe", ["email"], undefined, { phase: "contract" })
+        }
+      ],
+      { models, applyContracts: true, skipLock: true }
+    );
+    backend.save("dedupe_pg", { uuid: "u3", email: "a@x" }, ctx);
+    await expect(backend.persist(ctx)).rejects.toThrow();
+  });
 });
 
 describe("MySQL (real engine)", () => {

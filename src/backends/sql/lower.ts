@@ -85,10 +85,6 @@ export function lowerToSql(
 
     case "copyField": {
       if (!present.has(op.from) || !present.has(op.to)) return null;
-      // Between columns of different types a plain assignment is the engine's cast, not `coerce()`:
-      // it refuses text → bigint, rounds 1.5 into an integer, or reads 'abc' as 0. Let the reference
-      // convert each value instead.
-      if (columnTypes && columnTypes.get(op.from) !== columnTypes.get(op.to)) return null;
       const from = dialect.column(op.from);
       const to = dialect.column(op.to);
       // `from IS NOT NULL` mirrors the reference, which skips a record whose source field is absent —

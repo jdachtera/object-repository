@@ -277,6 +277,13 @@ describe("a transform that edits a nested value in place", () => {
   });
 });
 
+describe("a plan with raw SQL in its expand phase", () => {
+  it("warns that it isn't portable", async () => {
+    const plan = await planMigrations(new InMemoryBackend(), [{ name: "0001", up: (m) => m.sql("SELECT 1") }]);
+    expect(plan.warnings.map((warning) => warning.code)).toContain("RAW_SQL_NOT_PORTABLE");
+  });
+});
+
 describe("a plan against a store that has never been migrated", () => {
   it("creates nothing on SQL, so a read-only login can run it", async () => {
     const statements: string[] = [];

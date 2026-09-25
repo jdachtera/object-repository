@@ -180,6 +180,10 @@ const CASES: Case[] = [
     skip: { "Postgres (pg-mem)": "pg-mem can't plan CREATE TABLE IF NOT EXISTS over an existing table; real Postgres runs this case" }
   },
   {
+    label: "copyField from text into an array field wraps each value",
+    migration: { name: "m", up: (m) => m.copyField(MODEL, "note", "tags", "array", { overwrite: true }) }
+  },
+  {
     label: "copyField from text into an integer field converts each value",
     migration: { name: "m", up: (m) => m.copyField(MODEL, "code", "qty", "integer", { overwrite: true }) }
   },
