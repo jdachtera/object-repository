@@ -620,12 +620,13 @@ function followLayout(options: Running, op: MigrationOp): void {
   } else if (op.kind === "dropIndex") {
     options.models[op.model] = { ...layout, indexes: layout.indexes.filter((i) => i.name !== op.index) };
   } else if (op.kind === "renameField") {
-    options.models[op.model] = {
-      ...layout,
-      fields: layout.fields
-        .filter((field) => field.name !== op.to)
-        .map((field) => (field.name === op.from ? { ...field, name: op.to } : field))
-    };
+    // The field ends up as `to`, of the rename's type. The application usually declares `to` already
+    // (it defines the model as it is after the migration): keep that entry rather than drop it.
+    const renamed = { name: op.to, type: op.type };
+    const fields = layout.fields.filter((field) => field.name !== op.from && field.name !== op.to);
+    const at = layout.fields.findIndex((field) => field.name === op.to || field.name === op.from);
+    fields.splice(at < 0 ? fields.length : Math.min(at, fields.length), 0, renamed);
+    options.models[op.model] = { ...layout, fields };
   }
 }
 

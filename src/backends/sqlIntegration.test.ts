@@ -612,6 +612,26 @@ describe("Postgres (real engine)", () => {
     const [row] = await backend.query({ model: "retyped_pg", where: { type: "all" }, order: [], paging: { start: 0 } }, ctx);
     expect(row!.n).toBe("5");
   });
+  it("a rename onto a field the model already declares keeps that field registered", async () => {
+    if (!pool) return;
+    await pool.query(`DROP TABLE IF EXISTS "renamed_pg", "_object_repository_migration_log", "_object_repository_schema_state"`);
+    await pool.query(`CREATE TABLE "renamed_pg" ("uuid" text PRIMARY KEY, "name" text, "_extra" text)`);
+    await pool.query(`INSERT INTO "renamed_pg" ("uuid", "name") VALUES ('u1', 'Ann')`);
+    const backend = new PostgresBackend(pool);
+    const models = { renamed_pg: { fields: [{ name: "fullName", type: "text" as const }], indexes: [] } };
+    await backend.registerModel("renamed_pg", [], models.renamed_pg.fields); // define(): provisions `fullName`
+    await runMigrations(backend, [{ name: "0090_rename", up: (m) => m.renameField("renamed_pg", "name", "fullName", "text") }], {
+      models,
+      skipLock: true
+    });
+    backend.save("renamed_pg", { uuid: "u2", fullName: "Bo" }, ctx);
+    await backend.persist(ctx);
+    const { rows } = await pool.query(`SELECT "uuid", "fullName" FROM "renamed_pg" ORDER BY "uuid"`);
+    expect(rows).toEqual([
+      { uuid: "u1", fullName: "Ann" },
+      { uuid: "u2", fullName: "Bo" } // in its column, not the overflow
+    ]);
+  });
 });
 
 describe("MySQL (real engine)", () => {
