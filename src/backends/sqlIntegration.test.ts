@@ -582,6 +582,36 @@ describe("Postgres (real engine)", () => {
     backend.save("dedupe_pg", { uuid: "u3", email: "a@x" }, ctx);
     await expect(backend.persist(ctx)).rejects.toThrow();
   });
+  it("a record pass after a retype in the same run reads the new type", async () => {
+    if (!pool) return;
+    await pool.query(`DROP TABLE IF EXISTS "retyped_pg", "_object_repository_migration_log", "_object_repository_schema_state"`);
+    const backend = new PostgresBackend(pool);
+    const seen: string[] = [];
+    await runMigrations(
+      backend,
+      [
+        {
+          name: "0080_widgets",
+          transforms: {
+            look: ((row: Record<string, unknown>) => {
+              seen.push(typeof row.n);
+              return row;
+            }) as never
+          },
+          up: (m) => {
+            m.createModel("retyped_pg", [{ name: "n", type: "integer" }]);
+            m.sql(`INSERT INTO "retyped_pg" ("uuid", "n") VALUES ('w1', 5)`);
+            m.retypeField("retyped_pg", "n", "integer", "text");
+            m.transform("retyped_pg", "look", ["n"], undefined, { phase: "expand" });
+          }
+        }
+      ],
+      { skipLock: true }
+    );
+    expect(seen).toEqual(["string"]);
+    const [row] = await backend.query({ model: "retyped_pg", where: { type: "all" }, order: [], paging: { start: 0 } }, ctx);
+    expect(row!.n).toBe("5");
+  });
 });
 
 describe("MySQL (real engine)", () => {

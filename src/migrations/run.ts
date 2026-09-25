@@ -605,7 +605,11 @@ function followLayout(options: Running, op: MigrationOp): void {
   }
   if (!("model" in op) || !options.models?.[op.model]) return;
   const layout = options.models[op.model]!;
-  if (op.kind === "addField" && !layout.fields.some((field) => field.name === op.field)) {
+  if (op.kind === "retypeField") {
+    // The field now holds the new type: a later registration under the old one would encode and decode
+    // it wrongly against a column that has already changed.
+    options.models[op.model] = { ...layout, fields: layout.fields.map((field) => (field.name === op.field ? { ...field, type: op.to } : field)) };
+  } else if (op.kind === "addField" && !layout.fields.some((field) => field.name === op.field)) {
     options.models[op.model] = { ...layout, fields: [...layout.fields, { name: op.field, type: op.type }] };
   } else if (op.kind === "dropModel") {
     delete options.models[op.model];
