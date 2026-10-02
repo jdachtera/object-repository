@@ -900,10 +900,20 @@ export class SqlBackend
     // is a manual, destructive operation. (Introspecting first also avoids a redundant CREATE on an
     // existing table.)
     const columnsQuery = this.dialect.columnsQuery(model);
-    const present = new Set((await this.exec.run(columnsQuery.sql, columnsQuery.params)).map((r) => String(r.column_name)));
+    const readColumns = async () => new Set((await this.exec.run(columnsQuery.sql, columnsQuery.params)).map((r) => String(r.column_name)));
+    let present = await readColumns();
     if (present.size === 0) {
-      await this.exec.run(this.dialect.createTable(model, fields), []);
-    } else {
+      try {
+        await this.exec.run(this.dialect.createTable(model, fields), []);
+      } catch (error) {
+        // Two processes creating the same table at once: Postgres can fail the second
+        // `CREATE TABLE IF NOT EXISTS` on its own catalog's unique index. If the table is there now,
+        // someone else made it — carry on as for an existing one.
+        present = await readColumns();
+        if (present.size === 0) throw error;
+      }
+    }
+    if (present.size > 0) {
       for (const f of fields) {
         if (!present.has(f.name)) {
           await this.exec.run(this.dialect.addColumn(model, f.name, this.dialect.columnType(f.type)), []).catch(() => {});

@@ -27,194 +27,37 @@ import { PostgresBackend } from "../backends/sql/PostgresBackend.js";
 import { MySqlBackend } from "../backends/sql/MySqlBackend.js";
 import { MongoBackend } from "../backends/mongo/MongoBackend.js";
 import { runMigrations } from "./run.js";
-import { everything } from "./paging.js";
-import { isWidening } from "./ops.js";
-import { SYSTEM_CONTEXT, type JsonObject, type JsonValue } from "../core/types.js";
+import type { JsonObject } from "../core/types.js";
 import type { Backend, FieldSpec } from "../core/Backend.js";
-import type { MigrationBuilder, StoredType } from "./types.js";
+import type { StoredType } from "./types.js";
+import {
+  MODEL,
+  exceeds15Digits,
+  intentArb,
+  layoutArb,
+  migrationOf,
+  plan,
+  readBack,
+  recordsOf,
+  seed,
+  type Intent,
+  type Plan
+} from "../testing/migrationScenarios.testutil.js";
 
 const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
-const ctx = SYSTEM_CONTEXT;
-const MODEL = "Prop";
 const RUNS = Number(process.env.PROPERTY_RUNS ?? 25);
 const SEED = process.env.PROPERTY_SEED === undefined ? undefined : Number(process.env.PROPERTY_SEED);
 
-// --- values -------------------------------------------------------------------------------------
-
-const TYPES: StoredType[] = ["text", "integer", "float", "boolean", "array", "scalar", "json"];
-
-const awkwardText = fc.constantFrom("", "42", "-7", "1e15", "0.1", "abc", 'say "hi"', "null", "true", "[1]", "ünïcødé", " padded ");
-// Engines store doubles exactly, but -0 is not worth chasing (JSON can't carry it).
-const finiteDouble = fc.double({ noNaN: true, noDefaultInfinity: true, min: -1e18, max: 1e18 }).filter((n) => !Object.is(n, -0));
-
-function valueOf(type: StoredType): fc.Arbitrary<JsonValue> {
-  switch (type) {
-    case "text":
-      return fc.oneof(awkwardText, fc.string({ maxLength: 12 }).filter((s) => !s.includes("\u0000")));
-    case "integer":
-      return fc.integer({ min: -1_000_000, max: 1_000_000 });
-    case "float":
-      return fc.oneof(fc.constantFrom(1e15, 1e-7, 0.1, 1.5, -2.25, 3), finiteDouble);
-    case "boolean":
-      return fc.boolean();
-    case "array":
-      return fc.array(fc.oneof(awkwardText, fc.string({ maxLength: 6 }).filter((s) => !s.includes("\u0000"))), { maxLength: 3 });
-    case "scalar":
-      return fc.oneof(awkwardText, fc.integer({ min: -1000, max: 1000 }), fc.boolean());
-    case "json":
-      // The json() codec stores JSON text.
-      return fc.oneof(fc.integer(), awkwardText, fc.array(fc.integer(), { maxLength: 3 })).map((v) => JSON.stringify(v));
-    default:
-      return fc.constant(null);
-  }
-}
-
-// --- layouts, records, steps --------------------------------------------------------------------
-
-const NAMES = ["a", "b", "c", "d", "e", "f", "g", "h"];
-
-/** A starting layout: three to five fields of random types. */
-const layoutArb: fc.Arbitrary<FieldSpec[]> = fc
-  .uniqueArray(fc.constantFrom(...NAMES), { minLength: 3, maxLength: 5 })
-  .chain((names) => fc.tuple(...names.map(() => fc.constantFrom(...TYPES))).map((types) => names.map((name, i) => ({ name, type: types[i]! }))));
-
-/** A record of a layout: each field absent, null, or a value of its type. */
-function recordsOf(layout: FieldSpec[]): fc.Arbitrary<JsonObject[]> {
-  const record = fc.record(
-    Object.fromEntries(layout.map((field) => [field.name, fc.option(fc.option(valueOf(field.type as StoredType), { nil: null }), { nil: undefined })]))
-  );
-  return fc.array(record, { minLength: 1, maxLength: 6 }).map((rows) =>
-    rows.map((row, i) => {
-      const out: JsonObject = { uuid: `r${i}` };
-      for (const [key, value] of Object.entries(row)) if (value !== undefined) out[key] = value as JsonValue;
-      return out;
-    })
-  );
-}
-
-/** An intent, turned into a valid step against whatever layout the steps before it left. */
-interface Intent {
-  kind: "add" | "drop" | "rename" | "copy" | "retype";
-  pick: number;
-  pick2: number;
-  type: StoredType;
-  fill: boolean;
-  overwrite: boolean;
-  seed: number;
-}
-
-const intentArb: fc.Arbitrary<Intent> = fc.record({
-  kind: fc.constantFrom("add", "drop", "rename", "copy", "retype"),
-  pick: fc.nat(),
-  pick2: fc.nat(),
-  type: fc.constantFrom(...TYPES),
-  fill: fc.boolean(),
-  overwrite: fc.boolean(),
-  seed: fc.nat()
-});
-
-type Step = (m: MigrationBuilder) => void;
-
-/** Plan the steps, following the layout as each one changes it. Returns the steps and the final layout. */
-function plan(initial: FieldSpec[], intents: Intent[]): { steps: Step[]; describe: string[]; final: FieldSpec[] } {
-  const layout = new Map(initial.map((field) => [field.name, field.type as StoredType]));
-  const steps: Step[] = [];
-  const describe: string[] = [];
-  for (const intent of intents) {
-    const present = [...layout.keys()];
-    const absent = NAMES.filter((name) => !layout.has(name));
-    const pickPresent = (n: number) => present[n % present.length]!;
-    switch (intent.kind) {
-      case "add": {
-        if (!absent.length) continue;
-        const field = absent[intent.pick % absent.length]!;
-        const fill = intent.fill ? fc.sample(valueOf(intent.type), { seed: intent.seed, numRuns: 1 })[0] : undefined;
-        steps.push((m) => m.addField(MODEL, field, intent.type, fill === undefined ? undefined : { fill }));
-        describe.push(`addField ${field}:${intent.type}${fill === undefined ? "" : ` fill=${JSON.stringify(fill)}`}`);
-        layout.set(field, intent.type);
-        break;
-      }
-      case "drop": {
-        if (present.length <= 1) continue;
-        const field = pickPresent(intent.pick);
-        steps.push((m) => m.dropField(MODEL, field));
-        describe.push(`dropField ${field}`);
-        layout.delete(field);
-        break;
-      }
-      case "rename": {
-        if (!present.length || !absent.length) continue;
-        const from = pickPresent(intent.pick);
-        const to = absent[intent.pick2 % absent.length]!;
-        const type = layout.get(from)!;
-        steps.push((m) => m.renameField(MODEL, from, to, type));
-        describe.push(`renameField ${from}→${to}:${type}`);
-        layout.delete(from);
-        layout.set(to, type);
-        break;
-      }
-      case "copy": {
-        if (present.length < 2) continue;
-        const from = pickPresent(intent.pick);
-        const to = pickPresent(intent.pick2 === intent.pick ? intent.pick + 1 : intent.pick2);
-        if (from === to) continue;
-        const type = layout.get(to)!;
-        const fromType = layout.get(from)!;
-        steps.push((m) => m.copyField(MODEL, from, to, type, { overwrite: intent.overwrite, fromType }));
-        describe.push(`copyField ${from}→${to}:${type}${intent.overwrite ? " overwrite" : ""}`);
-        break;
-      }
-      case "retype": {
-        if (!present.length) continue;
-        const field = pickPresent(intent.pick);
-        const from = layout.get(field)!;
-        if (from === intent.type || !isWidening(from, intent.type)) continue;
-        steps.push((m) => m.retypeField(MODEL, field, from, intent.type));
-        describe.push(`retypeField ${field} ${from}→${intent.type}`);
-        layout.set(field, intent.type);
-        break;
-      }
-    }
-  }
-  return { steps, describe, final: [...layout].map(([name, type]) => ({ name, type })) };
-}
-
-// --- running one case on one backend ------------------------------------------------------------
-
 type Outcome = { refused: string } | { rows: JsonObject[] };
 
-async function outcome(backend: Backend, initial: FieldSpec[], seed: JsonObject[], steps: Step[], final: FieldSpec[]): Promise<Outcome> {
-  const aware = backend as Partial<{ registerModel(m: string, i: never[], f: FieldSpec[]): unknown }>;
-  if (aware.registerModel) await aware.registerModel(MODEL, [], initial);
-  for (const row of seed) backend.save(MODEL, structuredClone(row), ctx);
-  await backend.persist(ctx);
+async function outcome(backend: Backend, initial: FieldSpec[], rows: JsonObject[], planned: Plan): Promise<Outcome> {
+  await seed(backend, initial, rows);
   try {
-    await runMigrations(backend, [{ name: "0001_random", up: (m) => steps.forEach((step) => step(m)) }], {
-      models: { [MODEL]: { fields: final, indexes: [] } },
-      skipLock: true
-    });
+    await runMigrations(backend, [migrationOf(planned)], { models: { [MODEL]: { fields: planned.final, indexes: [] } }, skipLock: true });
   } catch (error) {
     return { refused: (error as Error).name };
   }
-  // Read back under the final layout: what the application sees after the migration.
-  if (aware.registerModel) await aware.registerModel(MODEL, [], final);
-  const rows = await backend.query({ model: MODEL, where: everything(), order: [{ property: "uuid", descending: false }], paging: { start: 0 } }, ctx);
-  const names = new Set(final.map((field) => field.name));
-  return {
-    rows: rows
-      .map((row) => {
-        // Absent and null are one state everywhere; a field the final layout doesn't declare isn't
-        // something the application reads (SQL keeps no column for it to compare).
-        const out: JsonObject = {};
-        for (const [key, value] of Object.entries(row)) {
-          if (value === null || value === undefined) continue;
-          if (key !== "uuid" && !names.has(key)) continue;
-          out[key] = value;
-        }
-        return out;
-      })
-      .sort((x, y) => String(x.uuid).localeCompare(String(y.uuid)))
-  };
+  return { rows: await readBack(backend, planned.final) };
 }
 
 // --- backends -----------------------------------------------------------------------------------
@@ -235,8 +78,6 @@ let mongoDb: Db | undefined;
  * — no migration involved. Scenarios holding one are skipped there.
  */
 let mariaDb = false;
-const exceeds15Digits = (rows: JsonObject[]): boolean =>
-  rows.some((row) => Object.values(row).some((value) => typeof value === "number" && Number(value.toPrecision(15)) !== value));
 
 beforeAll(async () => {
   releaseLiveDbs = await exclusiveLiveDbs(PG_URL, MYSQL_URL);
@@ -357,7 +198,11 @@ const REGRESSIONS: Scenario[] = [
 ];
 
 const scenarioArb = layoutArb.chain((initial) =>
-  fc.record({ initial: fc.constant(initial), rows: recordsOf(initial), intents: fc.array(intentArb, { minLength: 1, maxLength: 5 }) })
+  fc.record({
+    initial: fc.constant(initial),
+    rows: recordsOf(initial),
+    intents: fc.array(intentArb(["add", "drop", "rename", "copy", "retype", "transform"]), { minLength: 1, maxLength: 5 })
+  })
 );
 
 describe("random migrations over random records", () => {
@@ -367,12 +212,13 @@ describe("random migrations over random records", () => {
       if (!probe) return context.skip();
       await fc.assert(
         fc.asyncProperty(scenarioArb, async ({ initial, rows, intents }) => {
-          const { steps, describe: description, final } = plan(initial, intents);
-          if (!steps.length) return;
+          const planned = plan(initial, intents);
+          const description = planned.describe;
+          if (!planned.steps.length) return;
           fc.pre(!(name === "MySQL (real)" && mariaDb && exceeds15Digits(rows)));
-          const expected = await outcome(new InMemoryBackend(), initial, rows, steps, final);
+          const expected = await outcome(new InMemoryBackend(), initial, rows, planned);
           const backend = (await make())!;
-          const actual = await outcome(backend, initial, rows, steps, final);
+          const actual = await outcome(backend, initial, rows, planned);
           (backend as Partial<{ close(): void }>).close?.();
           expect({ steps: description, ...actual }).toEqual({ steps: description, ...expected });
         }),
