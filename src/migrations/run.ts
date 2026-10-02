@@ -10,7 +10,7 @@
  * `applyContracts` defaults to **false**, so a bare `migrate()` in a deploy script can only ever add.
  * Contracts whose gate has cleared are reported as `releasable` and wait for someone to say so.
  */
-import type { Backend } from "../core/Backend.ts";
+import type { Backend, FieldSpec } from "../core/Backend.ts";
 import { isMigrationLowering, isSchemaAware, isTransactional, migrationTarget } from "../core/Backend.ts";
 import type { Context } from "../core/types.ts";
 import { SYSTEM_CONTEXT } from "../core/types.ts";
@@ -119,7 +119,7 @@ async function withLease<T>(
     // On a transactional store `registered` holds only what committed phases registered: a failed
     // phase's registration was made in its rolled-back scope and never reached this backend, and
     // re-registering it here would re-provision the very columns the rollback just removed.
-    await restoreRegistrations(backend, registered, options);
+    await restoreRegistrations(backend, registered, options, failed);
     try {
       await lease?.release();
     } catch (releaseError) {
@@ -400,14 +400,26 @@ type Running = RunnerOptions & {
  * Give every model a pass registered with a reduced index set its full registration back, so the
  * store enforces its unique constraints again. A unique index that can't be built yet — its de-dupe
  * contract hasn't been released — is left as `define()` would leave it; the run's outcome stands.
+ *
+ * After a failed run the store stands part-way, short of the layout the run was heading for. Only the
+ * fields it already has a column for are registered then: provisioning the rest would create a column
+ * a step that hasn't run yet is meant to create (a rename's target), and the retry would find it there
+ * and take a different path than the uninterrupted run.
  */
-async function restoreRegistrations(backend: Backend, registered: Set<string>, options: RunnerOptions): Promise<void> {
+async function restoreRegistrations(backend: Backend, registered: Set<string>, options: RunnerOptions, failed = false): Promise<void> {
   if (!isSchemaAware(backend)) return;
+  const live = (backend as Partial<{ liveFieldSpecs(model: string): Promise<FieldSpec[]> }>).liveFieldSpecs;
   for (const model of registered) {
     const schema = options.models?.[model];
     if (!schema) continue;
     try {
-      await backend.registerModel(model, schema.indexes, schema.fields);
+      let fields = schema.fields;
+      if (failed && backend.columnar) {
+        if (typeof live !== "function") continue; // can't tell what exists: leave the registration as the run left it
+        const present = new Set((await live.call(backend, model)).map((field) => field.name));
+        fields = fields.filter((field) => present.has(field.name));
+      }
+      await backend.registerModel(model, schema.indexes, fields);
     } catch {
       // see above
     }

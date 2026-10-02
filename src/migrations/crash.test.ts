@@ -371,6 +371,13 @@ const REGRESSIONS: Scenario[] = [
     initial: [{ name: "f", type: "scalar" }, { name: "h", type: "array" }, { name: "d", type: "integer" }],
     rows: [{ uuid: "r00", f: "", h: [] }],
     intents: [I("drop", 2), I("copy", 1), I("rename", 0)]
+  },
+  // A failed run restored its registrations with the layout it was heading for, provisioning a rename's
+  // target early; the retry found the column there and copied a scalar into a still-integer column
+  {
+    initial: [{ name: "b", type: "integer" }, { name: "g", type: "scalar" }, { name: "h", type: "array" }, { name: "f", type: "text" }],
+    rows: [{ uuid: "r00", g: "" }],
+    intents: [I("transform", 0), I("rename", 0), I("rename", 0)]
   }
 ];
 
