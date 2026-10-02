@@ -104,3 +104,24 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm audit --audit-level moderate
       - run: pnpm exec vitest run src/migrations/property.test.ts src/migrations/crash.test.ts
+
+  # Mutation testing of the migration core: too slow for every push (hours), so nightly. The report
+  # (reports/mutation/index.html) lists every mutant the tests didn't notice.
+  mutation:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run test:mutation
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-report
+          path: reports/mutation/
