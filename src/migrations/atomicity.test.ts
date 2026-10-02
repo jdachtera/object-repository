@@ -57,7 +57,7 @@ beforeAll(async () => {
       mongoServer = await MongoMemoryServer.create({ binary: { version: process.env.MONGOMS_VERSION ?? "8.0.4" } });
       url = mongoServer.getUri();
     }
-    mongoClient = new MongoClient(url);
+    mongoClient = new MongoClient(url, { serverSelectionTimeoutMS: 2000 });
     await mongoClient.connect();
     mongoDb = mongoClient.db("lease_conformance");
   } catch (error) {
@@ -77,7 +77,7 @@ beforeAll(async () => {
   } catch (error) {
     requireLiveDb(error);
   }
-});
+}, 700_000); // room for a MongoMemoryServer download
 afterAll(async () => {
   await mongoClient?.close().catch(() => {});
   await mongoServer?.stop().catch(() => {});

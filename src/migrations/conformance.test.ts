@@ -353,7 +353,7 @@ beforeAll(async () => {
       mongoServer = await MongoMemoryServer.create({ binary: { version: process.env.MONGOMS_VERSION ?? "8.0.4" } });
       url = mongoServer.getUri();
     }
-    mongoClient = new MongoClient(url);
+    mongoClient = new MongoClient(url, { serverSelectionTimeoutMS: 2000 });
     await mongoClient.connect();
     mongoDb = mongoClient.db("migration_conformance");
   } catch (error) {
