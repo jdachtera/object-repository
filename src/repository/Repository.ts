@@ -38,6 +38,12 @@ export type RelationResolver = (model: string) => Repository<any> | undefined;
 export type TransactionMode = "none" | "batching" | "interactive";
 export interface TransactionState {
   mode: TransactionMode;
+  /**
+   * Set while the manager runs `migrate()` or `rollback()`. The runner writes through the same backend
+   * queue as the repositories, so a write queued meanwhile could be flushed with a migration page, or
+   * discarded with a failed one.
+   */
+  migrating?: string;
 }
 
 /** Instances are plain objects at runtime; this is their internal, untyped view. */
@@ -319,6 +325,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
    * every read hides it by default); pass `{ hard: true }` to bypass soft-delete and truly delete it.
    */
   remove(instance: InferModel<P>, options?: { hard?: boolean }): this {
+    this.assertNotMigrating("remove()");
     const record = instance as Record_;
     if (this.softDelete && !options?.hard) {
       record[this.softDelete.field] = new Date();
@@ -345,6 +352,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
   }
 
   async persist(): Promise<this> {
+    this.assertNotMigrating("persist()");
     // Saves held back while the journal was being read — this repository's and any other's, since a
     // save cascades across models — go out now that it's known which windows are open.
     await this.windows?.release();
@@ -374,7 +382,17 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
    * On a non-transactional backend it can never be atomic; on a real DB transaction only the tx-scoped
    * repository joins it. Surfacing this as an error beats the prior behavior of committing regardless.
    */
+  /** Refuse a write while this manager is migrating its store (see `TransactionState.migrating`). */
+  private assertNotMigrating(op: string): void {
+    if (this.txState.migrating) {
+      throw new Error(
+        `${op} on "${this.modelName}" while ${this.txState.migrating} is running on the same store: the runner shares this backend's write queue, so the write could be committed with a migration page or discarded with a failed one. Wait for it to finish — or better, migrate before serving writes.`
+      );
+    }
+  }
+
   private assertImmediateWriteAllowed(op: string): void {
+    this.assertNotMigrating(op);
     if (this.txState.mode === "batching") {
       throw new Error(
         `${op} cannot run inside a transaction on a non-transactional backend — its write commits immediately and won't roll back. Use save()/remove() inside the transaction, or run on a transactional backend (Postgres/MySQL/SQLite via a real tx).`
@@ -1206,6 +1224,7 @@ export class Repository<P extends PropertyMap> implements Queryable<InferModel<P
 
   /** Queue `instance`, keeping declared inverse relations in sync, guarded against cycles. */
   private enqueueSave(instance: Record_, visited: Set<object>): void {
+    this.assertNotMigrating("save()");
     if (visited.has(instance)) return;
     visited.add(instance);
 

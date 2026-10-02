@@ -510,6 +510,27 @@ describe("the runner's lease", () => {
     expect(user!.name).toBe("Ann");
   });
 
+  it("stops a runner that stalled past its lease before it writes the page it was computing", async () => {
+    const backend = await seeded([1, 2, 3, 4]);
+    let clock = 0;
+    const stalling: Migration = {
+      ...cents(),
+      transforms: {
+        cents: (row: JsonObject) => {
+          if (row.uuid === "i2") {
+            // Stalls on the second page past its lease; a successor takes over meanwhile.
+            clock += LOCK_LEASE_MS + 1;
+            void backend.acquireLease(SCHEMA_STATE_MODEL, "__lock__", "successor", clock, LOCK_LEASE_MS, ctx);
+          }
+          return { ...row, price: Number(row.price) * 100 };
+        }
+      }
+    };
+    await expect(runMigrations(backend, [stalling], { models, batchSize: 2, now: () => clock })).rejects.toThrow(MigrationLockedError);
+    // The first page is its; the second, computed while the lease lapsed, was never written.
+    expect(await prices(backend)).toEqual([100, 200, 3, 4]);
+  });
+
   it("is renewed while a long pass runs, so a live runner keeps it", async () => {
     const backend = await seeded([1, 2, 3, 4]);
     let clock = 0;

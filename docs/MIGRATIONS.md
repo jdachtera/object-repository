@@ -174,12 +174,15 @@ Withheld by the version gate (1):
    what the version gate withholds, and what a release would destroy. Run it in CI against a copy of
    production's schema, and before the deploy against production itself.
 3. **Migrate from one place** — a deploy step, not every application instance on startup. A second
-   runner is turned away by the lease, but one place is simpler to reason about and to watch.
+   runner is turned away by the lease, but one place is simpler to reason about and to watch. Persist
+   pending writes before calling `migrate()`: while it (or `rollback()`) runs, writes through the same
+   manager's repositories throw, because the runner shares the backend's write queue.
 4. **Check the report.** `expanded`, `contracted`, `deferred`, `releasable`: anything withheld is listed,
    never silently skipped.
 5. **Release contracts separately.** Raise `minSupportedSchemaVersion` once no older build remains,
    then run `migrate(migrations, { applyContracts: true })` as its own deploy, after another backup.
-6. **If a run is interrupted,** run it again: it resumes. On a store that can't commit a page together
+6. **If a run is interrupted,** run it again: it resumes — a rollback too, and until an interrupted
+   rollback is finished `migrate()` refuses with `ROLLBACK_INTERRUPTED`. On a store that can't commit a page together
    with its progress marker (Mongo), a non-idempotent step may stop with `MigrationInterruptedError`
    naming the records it can't vouch for; check them and re-run with `interruptedPage`.
 

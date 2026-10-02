@@ -242,6 +242,7 @@ export class RepositoryManager {
    * offers no uncommitted-read isolation.
    */
   async transaction<T>(fn: (tx: TransactionScope) => Promise<T>): Promise<T> {
+    if (this.txState.migrating) throw new Error(`transaction() while ${this.txState.migrating} is running on the same store. Wait for it to finish.`);
     // So no write inside `fn` has to wait for the journal to be read, and saves held until it was are
     // committed with the transaction.
     await this.windows.release();
@@ -341,13 +342,31 @@ export class RepositoryManager {
    * `releasable` lists rather than running.
    */
   async migrate(migrations: Migration[], options: MigrateOptions = {}): Promise<MigrationReport> {
-    await this.snapshotJournal();
-    this.runSnapshots = this.snapshotAll();
+    return this.migrating("migrate()", async () => {
+      await this.snapshotJournal();
+      this.runSnapshots = this.snapshotAll();
+      try {
+        return await runMigrations(this.backend, migrations, this.runnerOptions(options));
+      } finally {
+        await this.refreshSchemaState().catch(() => {});
+        this.runSnapshots = null;
+      }
+    });
+  }
+
+  /**
+   * Run `body` with this manager's repositories refusing writes. The runner queues its pages on the
+   * same backend: an application write queued meanwhile would be flushed with a page (before the
+   * page's resume marker, on some stores) or discarded with a page that failed — silently either way.
+   */
+  private async migrating<T>(what: string, body: () => Promise<T>): Promise<T> {
+    if (this.txState.migrating) throw new Error(`${what} while ${this.txState.migrating} is already running on this manager.`);
+    if (this.txState.mode !== "none") throw new Error(`${what} can't run inside a transaction.`);
+    this.txState.migrating = what;
     try {
-      return await runMigrations(this.backend, migrations, this.runnerOptions(options));
+      return await body();
     } finally {
-      await this.refreshSchemaState().catch(() => {});
-      this.runSnapshots = null;
+      delete this.txState.migrating;
     }
   }
 
@@ -451,6 +470,10 @@ export class RepositoryManager {
    * adopted from the legacy table (unless `rollbackAdopted`). See docs/MIGRATIONS.md.
    */
   async rollback(migrations: Migration[], count = 1, options: MigrateOptions = {}): Promise<MigrationReport> {
+    return this.migrating("rollback()", () => this.rollbackNow(migrations, count, options));
+  }
+
+  private async rollbackNow(migrations: Migration[], count: number, options: MigrateOptions): Promise<MigrationReport> {
     await this.snapshotJournal();
     this.runSnapshots = this.snapshotAll();
     try {

@@ -506,6 +506,7 @@ async function runPhase(
           // Queued now, persisted with the page it describes.
           checkpoint: async (cursor) => journal.stage!(at(index)(cursor)),
           heartbeat: async () => lease?.renew(),
+          holdLease: async () => lease?.renew(),
           recordLowered: recordLowered(index),
           completed: done(index)
         }
@@ -522,9 +523,10 @@ async function runPhase(
                   journal.write(progress({ op: index, after, inFlight: { through } }))
               }),
           heartbeat: async (cursor) => {
-            await journal.write(at(index)(cursor));
             await lease?.renew();
-          }
+            await journal.write(at(index)(cursor));
+          },
+          holdLease: async () => lease?.renew()
         }
   );
   await settle(journal, record);
@@ -535,7 +537,7 @@ async function settle(journal: MigrationJournal, record: PhaseRecord): Promise<v
   for (const entry of record.forget ?? []) await journal.remove(entry.name, entry.phase);
 }
 
-type PageHooks = Pick<ExecuteOptions, "checkpoint" | "beforePage"> & {
+type PageHooks = Pick<ExecuteOptions, "checkpoint" | "beforePage" | "holdLease"> & {
   heartbeat?: (cursor: string) => Promise<void>;
   /** Journal a natively lowered op as done, inside the transaction that commits its data changes. */
   recordLowered?: (tx: Backend) => Promise<void>;
@@ -558,7 +560,9 @@ async function executeOps(
   for (let index = 0; index < (resume?.op ?? 0); index++) followLayout(options, ops[index]!);
   for (let index = resume?.op ?? 0; index < ops.length; index++) {
     const op = ops[index]!;
-    const { checkpoint, heartbeat, beforePage, recordLowered, completed } = typeof hooks === "function" ? hooks(index) : hooks;
+    const { checkpoint, heartbeat, beforePage, holdLease, recordLowered, completed } = typeof hooks === "function" ? hooks(index) : hooks;
+    // A natively lowered op writes too (MySQL's DDL commits at once): prove the lease before it.
+    await holdLease?.();
     const lowered = !isMigrationLowering(backend)
       ? null
       : recordLowered && backend.lowerMigrationOpRecorded
@@ -588,6 +592,7 @@ async function executeOps(
       after,
       ...("model" in op ? { typesAfter: typesAfter(options, ops, index, op.model) } : {}),
       ...(beforePage ? { beforePage } : {}),
+      ...(holdLease ? { holdLease } : {}),
       ...(checkpoint
         ? {
             checkpoint: async (at: string) => {

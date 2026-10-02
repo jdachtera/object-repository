@@ -48,6 +48,12 @@ export interface ExecuteOptions {
   /** Called after each persisted page — the runner renews its lease here. */
   heartbeat?: () => Promise<void>;
   /**
+   * Called before anything of a page is written: the runner proves it still holds its lease. Renewing
+   * only after a write let a runner that stalled past its lease — computing a page, say — write that
+   * page over its successor's work before finding out.
+   */
+  holdLease?: () => Promise<void>;
+  /**
    * Called before a page's writes are queued, with the cursor it starts after and its last uuid. The
    * runner records the page as in flight here when the store can't persist it with its marker.
    */
@@ -264,7 +270,10 @@ async function rewrite(
         // incomplete, and a store that writes only dirty fields would drop whatever it left out.
         writes.push({ save: next, dirty: op.kind === "transform" ? changedFields(row, next) : declared });
       }
-      if (writes.length) await options.beforePage?.(after, page.cursor);
+      if (writes.length) {
+        await options.holdLease?.();
+        await options.beforePage?.(after, page.cursor);
+      }
       for (const write of writes) {
         if ("remove" in write) backend.remove(op.model, write.remove, options.ctx);
         else backend.save(op.model, write.save, options.ctx, write.dirty);
@@ -295,6 +304,7 @@ async function rewrite(
 /** Persist one page together with its resume marker, discarding both if the flush fails. */
 async function flushPage(backend: Backend, options: ExecuteOptions, cursor: string): Promise<void> {
   try {
+    await options.holdLease?.();
     await options.checkpoint?.(cursor);
     await backend.persist(options.ctx);
   } catch (error) {
