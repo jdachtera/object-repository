@@ -312,6 +312,9 @@ and offline-sync are backend swaps, not rewrites.
 
 ### Version-gated schema migrations
 
+> **Experimental.** Back up first and read the `plan()` — see
+> [Running a migration safely](docs/MIGRATIONS.md#running-a-migration-safely).
+
 Migrations run on **every** backend — a rename is `ALTER TABLE … RENAME COLUMN` on Postgres and a
 record rewrite on Mongo, IndexedDB or in-memory, with the same result either way.
 

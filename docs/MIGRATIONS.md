@@ -3,6 +3,12 @@
 Schema and data migrations that run on **every** backend, and that never destroy anything without
 being told to twice.
 
+> **Status: experimental.** The mechanism is tested hard — a cross-backend conformance suite, random
+> migrations over random records compared on every engine, crashes injected at every write — but it
+> has not yet run against production data. Until it has, follow
+> [Running a migration safely](#running-a-migration-safely): take a backup, read the `plan()`, and
+> release destructive steps as a separate, deliberate deploy.
+
 Two properties are worth stating up front, because everything else follows from them:
 
 - **A migration is a list of portable operations, not DDL.** One reference implementation defines what
@@ -158,6 +164,24 @@ Will run 2 operation(s):
 Withheld by the version gate (1):
   "0012_fullname" drops User.name at schema version 7; minSupportedSchemaVersion is 5.
 ```
+
+## Running a migration safely
+
+1. **Back up the store** (or confirm a restorable snapshot exists). A migration rewrites records; a
+   `transform` can change them in ways no `down` reverses.
+2. **Read the plan.** `formatPlan(await orm.plan(migrations))` is read-only — it creates nothing, so
+   it runs with a read-only database login — and lists every step, the SQL a native step will run,
+   what the version gate withholds, and what a release would destroy. Run it in CI against a copy of
+   production's schema, and before the deploy against production itself.
+3. **Migrate from one place** — a deploy step, not every application instance on startup. A second
+   runner is turned away by the lease, but one place is simpler to reason about and to watch.
+4. **Check the report.** `expanded`, `contracted`, `deferred`, `releasable`: anything withheld is listed,
+   never silently skipped.
+5. **Release contracts separately.** Raise `minSupportedSchemaVersion` once no older build remains,
+   then run `migrate(migrations, { applyContracts: true })` as its own deploy, after another backup.
+6. **If a run is interrupted,** run it again: it resumes. On a store that can't commit a page together
+   with its progress marker (Mongo), a non-idempotent step may stop with `MigrationInterruptedError`
+   naming the records it can't vouch for; check them and re-run with `interruptedPage`.
 
 ## The operations
 
@@ -351,6 +375,14 @@ Stated plainly, because a safety mechanism you misunderstand is worse than none.
 7. **`unique` on the canonical half of a window.** Refused at `define()`: two constraints over one
    logical value double-report, and the legacy half carries the constraint until the contract runs.
 8. **Chained windows** (`a → b` and `b → c` open at once). Refused. Close one before opening the next.
+9. **Copying, on SQL, from a field nothing declares.** A field a later step drops has no type the
+   runner can work out, and a SQL table reads every text-backed type as text. Pass
+   `copyField(…, { fromType })`, or an `array`, `json` or `scalar` value arrives as its JSON text.
+10. **A record loaded before a rename is rolled back.** After `rollback()` of a rename, an instance
+    the process loaded before it still holds the renamed field, and its next save writes it back next
+    to the restored one. Reload records after a rollback.
+11. **MariaDB.** The supported MySQL target is MySQL 8. MariaDB's text protocol renders a `DOUBLE`
+    with 15 significant digits, so a float needing more is rounded on every read — migration or not.
 
 ## Upgrading an existing database
 
