@@ -4,7 +4,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { InMemoryBackend } from "../backends/memory/InMemoryBackend.js";
-import { applyOp, type ExecuteOptions } from "./execute.js";
+import { applyOp, reappliesSafely, type ExecuteOptions } from "./execute.js";
 import { SchemaUnknownError, MigrationNotSupportedError } from "./errors.js";
 import { everything } from "./paging.js";
 import { SYSTEM_CONTEXT } from "../core/types.js";
@@ -336,5 +336,147 @@ describe("a transform keeps each record's identity", () => {
     await runMigrations(backend, [migration], { models: items });
     const rows = await backend.query({ model: "Item", where: { type: "all" }, order: [{ property: "uuid", descending: false }], paging: { start: 0 } }, SYSTEM_CONTEXT);
     expect(rows).toEqual([{ uuid: "a", n: 10 }, { uuid: "b", n: 20 }]);
+  });
+});
+
+describe("what a resume may apply again", () => {
+  it("is every op but a transform and a retype that JSON-encodes", () => {
+    const safe: MigrationOp[] = [
+      { kind: "addField", model: "M", field: "f", type: "text" },
+      { kind: "dropField", model: "M", field: "f" },
+      { kind: "renameField", model: "M", from: "a", to: "b", type: "text" },
+      { kind: "copyField", model: "M", from: "a", to: "b", type: "text", overwrite: false },
+      { kind: "retypeField", model: "M", field: "f", from: "integer", to: "float" },
+      { kind: "retypeField", model: "M", field: "f", from: "json", to: "json" },
+      { kind: "retypeField", model: "M", field: "f", to: "json" } // no `from`: values taken as JSON already
+    ];
+    const unsafe: MigrationOp[] = [
+      { kind: "transform", model: "M", transform: "t", fields: [] },
+      { kind: "retypeField", model: "M", field: "f", from: "text", to: "json" } // "abc" → "\"abc\"" → …
+    ];
+    expect(safe.map(reappliesSafely)).toEqual(safe.map(() => true));
+    expect(unsafe.map(reappliesSafely)).toEqual(unsafe.map(() => false));
+  });
+});
+
+describe("the record pass's writes", () => {
+  function counting(inner: Backend) {
+    const seen = { saves: [] as PersistedChange[], persists: 0 };
+    const backend: Backend = {
+      capabilities: inner.capabilities,
+      query: (plan, c) => inner.query(plan, c),
+      queryUuids: (plan, c) => inner.queryUuids(plan, c),
+      save: (model, rec, c: Context, dirty) => {
+        seen.saves.push({ model, record: rec, dirty });
+        inner.save(model, rec, c, dirty);
+      },
+      remove: (model, rec, c) => inner.remove(model, rec, c),
+      persist: (c) => {
+        seen.persists += 1;
+        return inner.persist(c);
+      },
+      changes: (listener, c) => inner.changes(listener, c)
+    };
+    return { backend, seen };
+  }
+
+  it("hints exactly the fields a transform changed or removed", async () => {
+    const { backend, seen } = counting(await seeded([{ uuid: "a", n: 1, keep: "x", gone: true }]));
+    const edit: RecordTransform = (row) => {
+      const next: JsonObject = { ...row, n: 2 };
+      delete next.gone;
+      return next;
+    };
+    await applyOp(backend, { kind: "transform", model: "M", transform: "edit", fields: ["n"] }, options({ transforms: { edit } }));
+    expect(seen.saves[0]!.dirty).toEqual(["uuid", "n", "gone"]);
+  });
+
+  it("sees a transform that edits its argument in place, which is handed a copy", async () => {
+    const { backend, seen } = counting(await seeded([{ uuid: "a", n: 1 }]));
+    const inPlace: RecordTransform = (row) => {
+      (row as JsonObject).n = 5;
+      return row;
+    };
+    await applyOp(backend, { kind: "transform", model: "M", transform: "inPlace", fields: [] }, options({ transforms: { inPlace } }));
+    expect(seen.saves[0]!.dirty).toEqual(["uuid", "n"]);
+    expect(await readAll(backend)).toEqual([{ uuid: "a", n: 5 }]);
+  });
+
+  it("persists nothing for pages that need no change", async () => {
+    const { backend, seen } = counting(await seeded([{ uuid: "a", n: 1 }, { uuid: "b", n: 2 }, { uuid: "c", n: 3 }]));
+    await applyOp(backend, { kind: "addField", model: "M", field: "n", type: "integer" }, options());
+    expect(seen.persists).toBe(0);
+  });
+
+  it("reports progress as pages land", async () => {
+    const backend = await seeded([{ uuid: "a", x: 1 }, { uuid: "b", x: 1 }, { uuid: "c", x: 1 }]);
+    const reports: number[] = [];
+    await applyOp(backend, { kind: "dropField", model: "M", field: "x" }, options({ onProgress: (p) => void reports.push(p.rows) }));
+    expect(reports).toEqual([2, 3]);
+  });
+
+  it("drops a null source on rename without carrying it", async () => {
+    const backend = await seeded([{ uuid: "a", old: null, other: 1 }]);
+    await applyOp(backend, { kind: "renameField", model: "M", from: "old", to: "new", type: "text" }, options());
+    expect(await readAll(backend)).toEqual([{ uuid: "a", other: 1 }]);
+  });
+
+  it("clears a mirrored copy only when it is exact", async () => {
+    const rows = [{ uuid: "a", from: null, to: "kept" }];
+    const loose = await seeded(rows);
+    await applyOp(loose, { kind: "copyField", model: "M", from: "from", to: "to", type: "text", overwrite: true }, options());
+    expect(await readAll(loose)).toEqual([{ uuid: "a", from: null, to: "kept" }]);
+    const exact = await seeded(rows);
+    await applyOp(exact, { kind: "copyField", model: "M", from: "from", to: "to", type: "text", overwrite: true, exact: true }, options());
+    expect(await readAll(exact)).toEqual([{ uuid: "a", from: null }]);
+  });
+
+  it("names the store a raw SQL step can't run on", async () => {
+    const op: MigrationOp = { kind: "rawSql", dialect: "*", statement: "SELECT 1", params: [], phase: "expand" };
+    await expect(applyOp(new InMemoryBackend(), op, options({ backendName: "TheStore" }))).rejects.toThrow(/TheStore/);
+    await expect(applyOp(new InMemoryBackend(), op, options())).rejects.toThrow(/the portable executor/);
+  });
+});
+
+describe("an index op on a schema-aware store", () => {
+  const index = (name: string, unique = false): IndexSpec => ({ name, fields: [{ path: name }], ...(unique ? { unique: true } : {}) });
+  function recording(registered: IndexSpec[] = []) {
+    const calls: Array<{ fields: FieldSpec[] | undefined; indexes: IndexSpec[] }> = [];
+    const backend = Object.assign(new InMemoryBackend(), {
+      registerModel: (_model: string, indexes: IndexSpec[], fields?: FieldSpec[]) => void calls.push({ fields, indexes }),
+      registeredIndexes: () => registered
+    }) as unknown as Backend;
+    return { backend, calls };
+  }
+
+  it("changes only the named index, keeping the layout's others", async () => {
+    const fields: FieldSpec[] = [{ name: "a", type: "text" }];
+    const layout = { M: { fields, indexes: [index("a"), index("b")] } };
+    const { backend, calls } = recording();
+    const registered = new Set<string>();
+    await applyOp(backend, { kind: "addIndex", model: "M", index: index("c", true) }, options({ models: layout, registered }));
+    await applyOp(backend, { kind: "dropIndex", model: "M", index: "a" }, options({ models: layout }));
+    expect(calls).toEqual([
+      { fields, indexes: [index("a"), index("b"), index("c", true)] },
+      { fields, indexes: [index("b")] }
+    ]);
+    expect([...registered]).toEqual(["M"]);
+  });
+
+  it("changes only the named index against what a document store has registered, when there's no layout", async () => {
+    const { backend, calls } = recording([index("a"), index("b")]);
+    await applyOp(backend, { kind: "addIndex", model: "M", index: index("c") }, options({ models: {} }));
+    await applyOp(backend, { kind: "dropIndex", model: "M", index: "a" }, options({ models: {} }));
+    expect(calls.map((call) => call.indexes)).toEqual([[index("a"), index("b"), index("c")], [index("b")]]);
+  });
+
+  it("refuses on a columnar store with no layout, which would provision from nothing", async () => {
+    const { backend } = recording();
+    Object.assign(backend, { columnar: true });
+    await expect(applyOp(backend, { kind: "dropIndex", model: "M", index: "a" }, options({ models: {} }))).rejects.toThrow(SchemaUnknownError);
+  });
+
+  it("is a no-op on a store with no registrations", async () => {
+    expect(await applyOp(new InMemoryBackend(), { kind: "dropIndex", model: "M", index: "a" }, options())).toEqual({ rows: 0 });
   });
 });
