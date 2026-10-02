@@ -73,4 +73,20 @@ describe("writes while the manager is migrating", () => {
     await items.save(items.createInstance({ price: 3 })).persist();
     expect((await items.all().list()).length).toBe(2);
   });
+
+  it("persists writes queued before it starts, rather than committing them with a page or dropping them", async () => {
+    const { orm, items } = app();
+    items.save(items.createInstance({ price: 7 })); // queued, never persisted by the application
+    const failing: Migration = {
+      name: "0001_fails",
+      transforms: {
+        boom: () => {
+          throw new Error("transform failed");
+        }
+      },
+      up: (m) => m.transform("Item", "boom", ["price"])
+    };
+    await expect(orm.migrate([failing])).rejects.toThrow("transform failed");
+    expect((await items.all().list()).map((item) => item.price)).toEqual([7]);
+  });
 });

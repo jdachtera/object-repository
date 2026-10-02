@@ -107,6 +107,7 @@ export async function applyOp(backend: Backend, op: MigrationOp, options: Execut
         options.ctx,
         options.after ?? null
       )) {
+        await options.holdLease?.(); // before anything is queued: a fallback claim persists
         for (const row of page.rows) backend.remove(op.model, row, options.ctx);
         await flushPage(backend, options, page.cursor);
         rows += page.rows.length;
@@ -304,7 +305,6 @@ async function rewrite(
 /** Persist one page together with its resume marker, discarding both if the flush fails. */
 async function flushPage(backend: Backend, options: ExecuteOptions, cursor: string): Promise<void> {
   try {
-    await options.holdLease?.();
     await options.checkpoint?.(cursor);
     await backend.persist(options.ctx);
   } catch (error) {

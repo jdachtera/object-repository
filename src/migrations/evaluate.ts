@@ -199,6 +199,16 @@ export async function evaluateMigrations(
   // Debts whose migration has since been deleted from the array. The journal recorded what they owe
   // precisely so that deleting the source can't quietly cancel them.
   for (const row of rows.values()) {
+    // A rollback interrupted part-way, by a build that declared the migration, leaves the store
+    // half-reverted whether or not this build declares it — and this one couldn't finish it.
+    if (row.phase === "expand" && !declared.has(row.name) && decodeRollback(row.cursor)) {
+      blockers.push({
+        code: "ROLLBACK_INTERRUPTED",
+        migration: row.name,
+        message: `A rollback of "${row.name}" was interrupted part-way, so the store is neither migrated nor reverted. Run the rollback again, with "${row.name}" declared, to finish it.`
+      });
+      continue;
+    }
     if (row.phase !== "contract" || row.status !== "pending" || declared.has(row.name)) continue;
     const migration: Migration = { name: row.name, schemaVersion: row.version, up: () => {} };
     const open = gateOpen(migration, minSupported);

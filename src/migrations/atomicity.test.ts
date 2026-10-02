@@ -473,6 +473,14 @@ describe("an interrupted record pass", () => {
     });
   }
 
+  it("is refused by a build that no longer declares the half-reverted migration", async () => {
+    const backend = await seeded([1, 2, 3, 4, 5]);
+    await runMigrations(backend, [reversible()], { models, batchSize: 2 });
+    await expect(rollbackMigrations(backend, [reversible("i3")], 1, { models, batchSize: 2 })).rejects.toThrow("boom on i3");
+    // The previous release, redeployed: it has never heard of 0030_cents and couldn't finish the revert.
+    await expect(runMigrations(backend, [], { models })).rejects.toThrow(/rollback of "0030_cents" was interrupted/);
+  });
+
   it("doesn't let a later persist commit the half-written page", async () => {
     const backend = await seeded([1, 2, 3]);
     await expect(runMigrations(backend, [cents("i1")], { models, batchSize: 10 })).rejects.toThrow();

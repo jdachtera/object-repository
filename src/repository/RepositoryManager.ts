@@ -362,6 +362,11 @@ export class RepositoryManager {
   private async migrating<T>(what: string, body: () => Promise<T>): Promise<T> {
     if (this.txState.migrating) throw new Error(`${what} while ${this.txState.migrating} is already running on this manager.`);
     if (this.txState.mode !== "none") throw new Error(`${what} can't run inside a transaction.`);
+    // Writes the application queued and hasn't persisted yet go out first, as it asked, under the shape
+    // it wrote them for. Left queued, the runner's first flush would commit them with its own writes,
+    // and a failed run's discard would drop them.
+    await this.windows.release();
+    await this.backend.persist(this.ctx);
     this.txState.migrating = what;
     try {
       return await body();
