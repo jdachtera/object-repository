@@ -29,7 +29,7 @@ import {
   type SchemaState
 } from "./journal.ts";
 import { downOps } from "./ops.ts";
-import { destroysInWholePass, encodeResume, evaluateMigrations, type ResumePoint } from "./evaluate.ts";
+import { decodeRollback, destroysInWholePass, encodeResume, encodeRollback, evaluateMigrations, type ResumePoint } from "./evaluate.ts";
 import type {
   MigrationBlocker,
   MigrateOptions,
@@ -170,7 +170,7 @@ async function applyAll(
       // edited, reordered or deleted, so it must never be lost between two separate writes.
       await runPhase(backend, migration, decision.expand, "expand", options, {
         resume: decision.expandResume,
-        progress: (cursor) => row(migration, "expand", "pending", decision.expand!, bodyHash, now(), cursor),
+        progress: (point) => row(migration, "expand", "pending", decision.expand!, bodyHash, now(), encodeResume(point)),
         done: () => [
           row(migration, "expand", "applied", decision.expand!, bodyHash, now()),
           decision.owed.length
@@ -197,7 +197,7 @@ async function applyAll(
       case "run":
         await runPhase(backend, migration, decision.owed, "contract", options, {
           resume: decision.contractResume,
-          progress: (cursor) => row(migration, "contract", "pending", decision.owed, bodyHash, now(), cursor),
+          progress: (point) => row(migration, "contract", "pending", decision.owed, bodyHash, now(), encodeResume(point)),
           done: () => [row(migration, "contract", "applied", decision.owed, bodyHash, now())]
         });
         report.contracted.push(migration.name);
@@ -273,9 +273,12 @@ async function rollbackAll(backend: Backend, migrations: Migration[], count: num
 
   for (const target of targets) {
     const migration = byName.get(target.name)!;
+    // The resume point lives on the expand row being undone, so an interrupted rollback continues where
+    // it stopped instead of reverting reverted pages again — and a run meanwhile refuses to treat the
+    // half-reverted migration as applied.
     await runPhase(backend, migration, await downOps(migration), "expand", options, {
-      resume: null,
-      progress: null,
+      resume: decodeRollback(target.cursor),
+      progress: (point) => ({ ...target, cursor: encodeRollback(point) }),
       done: () => [],
       // Contract first: interrupted between the two, the journal still reads as a valid state (an
       // expand whose contract is owed) rather than a contract with no expand, which is refused.
@@ -415,8 +418,8 @@ async function restoreRegistrations(backend: Backend, registered: Set<string>, o
 interface PhaseRecord {
   /** Where an interrupted attempt stopped. */
   resume: ResumePoint | null;
-  /** The in-progress row marking a resume point, or `null` for a pass that can't resume (a rollback). */
-  progress: ((cursor: string) => JournalRow) | null;
+  /** The journal row marking a resume point. */
+  progress: (point: ResumePoint) => JournalRow;
   /** The rows recording the phase as complete. */
   done: () => JournalRow[];
   /** Rows to delete on completion (a rollback un-applies them). */
@@ -481,7 +484,7 @@ async function runPhase(
   }
 
   const progress = record.progress;
-  const at = (op: number) => (cursor: string) => progress!(encodeResume({ op, after: cursor }));
+  const at = (op: number) => (cursor: string) => progress({ op, after: cursor });
   // A marker staged with its page shares the page's flush — atomic only where that flush is (not a
   // Mongo bulkWrite per collection, say).
   const sharedFlush = !!journal.stage && backend.capabilities.transactions;
@@ -489,34 +492,40 @@ async function runPhase(
   // retry resumes after it rather than running a JSON-quoting UPDATE twice.
   const recordLowered = (index: number) => async (tx: Backend) => {
     const scoped = journal.within?.(tx) ?? journal;
-    await scoped.write(progress!(encodeResume({ op: index + 1, after: null })));
+    await scoped.write(progress({ op: index + 1, after: null }));
+  };
+  // A finished op is recorded before the next one starts. The next may change the schema outside any
+  // transaction (MySQL's DDL), and a resume that replayed this op over it would act on the wrong
+  // layout — a copy into a field just renamed away would find it empty and fill it again.
+  const done = (index: number) => async () => {
+    if (index < ops.length - 1) await journal.write(progress({ op: index + 1, after: null }));
   };
   await executeOps(backend, migration, ops, phase, options, record.resume, (index) =>
-    progress && sharedFlush
+    sharedFlush
       ? {
           // Queued now, persisted with the page it describes.
           checkpoint: async (cursor) => journal.stage!(at(index)(cursor)),
           heartbeat: async () => lease?.renew(),
-          recordLowered: recordLowered(index)
+          recordLowered: recordLowered(index),
+          completed: done(index)
         }
-      : progress
-        ? {
-            recordLowered: recordLowered(index),
-            // The marker can't share the page's flush. Record it after the page lands; and for an op
-            // that must not run twice, mark the page in flight first, so a resume knows which records
-            // it can't vouch for instead of silently applying them again.
-            ...(reappliesSafely(ops[index]!)
-              ? {}
-              : {
-                  beforePage: async (after: string | null, through: string) =>
-                    journal.write(progress(encodeResume({ op: index, after, inFlight: { through } })))
-                }),
-            heartbeat: async (cursor) => {
-              await journal.write(at(index)(cursor));
-              await lease?.renew();
-            }
+      : {
+          recordLowered: recordLowered(index),
+          completed: done(index),
+          // The marker can't share the page's flush. Record it after the page lands; and for an op
+          // that must not run twice, mark the page in flight first, so a resume knows which records
+          // it can't vouch for instead of silently applying them again.
+          ...(reappliesSafely(ops[index]!)
+            ? {}
+            : {
+                beforePage: async (after: string | null, through: string) =>
+                  journal.write(progress({ op: index, after, inFlight: { through } }))
+              }),
+          heartbeat: async (cursor) => {
+            await journal.write(at(index)(cursor));
+            await lease?.renew();
           }
-        : { heartbeat: async () => lease?.renew() }
+        }
   );
   await settle(journal, record);
 }
@@ -530,6 +539,8 @@ type PageHooks = Pick<ExecuteOptions, "checkpoint" | "beforePage"> & {
   heartbeat?: (cursor: string) => Promise<void>;
   /** Journal a natively lowered op as done, inside the transaction that commits its data changes. */
   recordLowered?: (tx: Backend) => Promise<void>;
+  /** Record a record-by-record op as finished. */
+  completed?: () => Promise<void>;
 };
 
 /** Run `ops` in order, preferring a backend's native lowering and falling back to the reference. */
@@ -547,7 +558,7 @@ async function executeOps(
   for (let index = 0; index < (resume?.op ?? 0); index++) followLayout(options, ops[index]!);
   for (let index = resume?.op ?? 0; index < ops.length; index++) {
     const op = ops[index]!;
-    const { checkpoint, heartbeat, beforePage, recordLowered } = typeof hooks === "function" ? hooks(index) : hooks;
+    const { checkpoint, heartbeat, beforePage, recordLowered, completed } = typeof hooks === "function" ? hooks(index) : hooks;
     const lowered = !isMigrationLowering(backend)
       ? null
       : recordLowered && backend.lowerMigrationOpRecorded
@@ -589,6 +600,7 @@ async function executeOps(
       registered: options.registered
     });
     followLayout(options, op);
+    await completed?.();
   }
 }
 

@@ -60,14 +60,36 @@ export function encodeResume(point: ResumePoint): string {
 function decodeResume(cursor: string | null): ResumePoint | null {
   if (!cursor) return null;
   try {
-    const parsed = JSON.parse(cursor) as Partial<ResumePoint>;
-    if (typeof parsed.op !== "number") return null;
-    const point: ResumePoint = { op: parsed.op, after: typeof parsed.after === "string" ? parsed.after : null };
-    if (typeof parsed.inFlight?.through === "string") point.inFlight = { through: parsed.inFlight.through };
-    return point;
+    return resumeOf(JSON.parse(cursor));
   } catch {
     return null;
   }
+}
+
+/**
+ * A rollback's resume point, kept on the applied expand row it is undoing: where its `down` stopped.
+ * Without it a retried rollback would run `down` from the start, over pages it already reverted.
+ */
+export function encodeRollback(point: ResumePoint): string {
+  return JSON.stringify({ rollback: point });
+}
+
+export function decodeRollback(cursor: string | null): ResumePoint | null {
+  if (!cursor) return null;
+  try {
+    return resumeOf((JSON.parse(cursor) as { rollback?: unknown }).rollback);
+  } catch {
+    return null;
+  }
+}
+
+function resumeOf(value: unknown): ResumePoint | null {
+  if (value === null || typeof value !== "object") return null;
+  const parsed = value as Partial<ResumePoint>;
+  if (typeof parsed.op !== "number") return null;
+  const point: ResumePoint = { op: parsed.op, after: typeof parsed.after === "string" ? parsed.after : null };
+  if (typeof parsed.inFlight?.through === "string") point.inFlight = { through: parsed.inFlight.through };
+  return point;
 }
 
 export interface Evaluation {
@@ -136,6 +158,14 @@ export async function evaluateMigrations(
       expand = phases.expand;
       owed = phases.contract;
     } else {
+      if (decodeRollback(expandRow.cursor)) {
+        blockers.push({
+          code: "ROLLBACK_INTERRUPTED",
+          migration: migration.name,
+          message: `A rollback of "${migration.name}" was interrupted part-way, so the store is neither migrated nor reverted. Run the rollback again to finish it, then migrate.`
+        });
+        continue;
+      }
       const drifted = Boolean(expandRow.opsHash) && expandRow.opsHash !== bodyHash;
       if (drifted) {
         blockers.push({

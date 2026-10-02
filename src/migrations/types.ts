@@ -250,7 +250,8 @@ export type MigrationBlockerCode =
   | "INVALID_SCHEMA_VERSION"
   | "JOURNAL_INCONSISTENT"
   | "UNRECOVERABLE_CONTRACT"
-  | "ROLLBACK_REFUSED";
+  | "ROLLBACK_REFUSED"
+  | "ROLLBACK_INTERRUPTED";
 
 export interface MigrationWarning {
   code: MigrationWarningCode;

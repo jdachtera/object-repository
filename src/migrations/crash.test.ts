@@ -36,6 +36,7 @@ import {
   readBack,
   recordsOf,
   seed,
+  type Intent,
   type Plan
 } from "../testing/migrationScenarios.testutil.js";
 
@@ -320,6 +321,59 @@ const options = (planned: Plan, extra: object = {}) => ({
   ...extra
 });
 
+type Scenario = { initial: FieldSpec[]; rows: JsonObject[]; intents: Intent[] };
+
+/** How many writes an uninterrupted run of `planned` makes on `store`. */
+async function writesOf(store: Store, { initial, rows }: Scenario, planned: Plan): Promise<number> {
+  const dry = (await store.open())!;
+  const counter = new Crasher(Number.POSITIVE_INFINITY, false);
+  try {
+    await seed(dry.backend(), initial, rows);
+    await runMigrations(dry.backend(counter), [migrationOf(planned)], options(planned, { skipLock: true }));
+  } finally {
+    await dry.close();
+  }
+  return counter.count;
+}
+
+/** Crash the run at write `at` (before or after it lands), restart it, and return what it left. */
+async function crashThenRestart(store: Store, { initial, rows }: Scenario, planned: Plan, at: number, after: boolean): Promise<JsonObject[]> {
+  const storage = (await store.open())!;
+  try {
+    await seed(storage.backend(), initial, rows);
+    const crasher = new Crasher(at, after, storage.inspect);
+    try {
+      await runMigrations(storage.backend(crasher), [migrationOf(planned)], options(planned, { skipLock: true }));
+    } catch (error) {
+      if (!(error instanceof Crash)) throw error;
+    }
+    // A restart: a fresh backend over the same storage, nothing in memory carried over. Only a store
+    // that can't commit a page with its marker may ask the operator about one page.
+    try {
+      await runMigrations(storage.backend(), [migrationOf(planned)], options(planned, { skipLock: true }));
+    } catch (error) {
+      if (!(error instanceof MigrationInterruptedError) || !store.answer) throw error;
+      const interruptedPage = store.answer(crasher);
+      await runMigrations(storage.backend(), [migrationOf(planned)], options(planned, { skipLock: true, interruptedPage }));
+    }
+    return await readBack(storage.backend(), planned.final);
+  } finally {
+    await storage.close();
+  }
+}
+
+const I = (kind: Intent["kind"], pick: number, pick2 = 0): Intent => ({ kind, pick, pick2, type: "text", fill: false, overwrite: false, seed: 0 });
+/** Counterexamples these properties have found: crashed at every write, on every store. */
+const REGRESSIONS: Scenario[] = [
+  // MySQL committed a rename's DDL before the copy ahead of it was recorded as done: the resumed copy
+  // found its target renamed away, read it as empty, and filled it again
+  {
+    initial: [{ name: "f", type: "scalar" }, { name: "h", type: "array" }, { name: "d", type: "integer" }],
+    rows: [{ uuid: "r00", f: "", h: [] }],
+    intents: [I("drop", 2), I("copy", 1), I("rename", 0)]
+  }
+];
+
 describe("a migration interrupted anywhere, then run again", () => {
   for (const store of STORES) {
     it(`${store.name} ends exactly where an uninterrupted run does`, async (context) => {
@@ -327,55 +381,38 @@ describe("a migration interrupted anywhere, then run again", () => {
       if (!probe) return context.skip();
       await probe.close();
       await fc.assert(
-        fc.asyncProperty(scenarioArb, async ({ initial, rows, intents, crashAt, after }) => {
+        fc.asyncProperty(scenarioArb, async (scenario) => {
+          const { initial, rows, intents, crashAt, after } = scenario;
           const planned = plan(initial, intents);
           if (!planned.steps.length) return;
           fc.pre(!(store.name === "MySQL (real)" && mariaDb && exceeds15Digits(rows)));
           const expected = await reference(initial, rows, planned);
           fc.pre(expected !== null);
-
-          // How many writes an uninterrupted run makes, so the crash always falls inside the run.
-          const dry = (await store.open())!;
-          const counter = new Crasher(Number.POSITIVE_INFINITY, false);
-          try {
-            await seed(dry.backend(), initial, rows);
-            await runMigrations(dry.backend(counter), [migrationOf(planned)], options(planned, { skipLock: true }));
-          } finally {
-            await dry.close();
-          }
-          fc.pre(counter.count > 0);
-          const at = 1 + (crashAt % counter.count);
-
-          const storage = (await store.open())!;
-          try {
-            await seed(storage.backend(), initial, rows);
-            const crasher = new Crasher(at, after, storage.inspect);
-            try {
-              await runMigrations(storage.backend(crasher), [migrationOf(planned)], options(planned, { skipLock: true }));
-            } catch (error) {
-              if (!(error instanceof Crash)) throw error;
-            }
-            // A restart: a fresh backend over the same storage, nothing in memory carried over. Only a
-            // store that can't commit a page with its marker may ask the operator about one page.
-            try {
-              await runMigrations(storage.backend(), [migrationOf(planned)], options(planned, { skipLock: true }));
-            } catch (error) {
-              if (!(error instanceof MigrationInterruptedError) || !store.answer) throw error;
-              const interruptedPage = store.answer(crasher);
-              await runMigrations(storage.backend(), [migrationOf(planned)], options(planned, { skipLock: true, interruptedPage }));
-            }
-            expect({ steps: planned.describe, crashAt, after, rows: await readBack(storage.backend(), planned.final) }).toEqual({
-              steps: planned.describe,
-              crashAt,
-              after,
-              rows: expected
-            });
-          } finally {
-            await storage.close();
-          }
+          // Count the writes an uninterrupted run makes, so the crash always falls inside the run.
+          const count = await writesOf(store, scenario, planned);
+          fc.pre(count > 0);
+          const actual = await crashThenRestart(store, scenario, planned, 1 + (crashAt % count), after);
+          expect({ steps: planned.describe, crashAt, after, rows: actual }).toEqual({ steps: planned.describe, crashAt, after, rows: expected });
         }),
         { numRuns: RUNS, ...(SEED === undefined ? {} : { seed: SEED }) }
       );
+    }, 900_000);
+
+    it(`${store.name} survives a crash at every write of each known counterexample`, async (context) => {
+      const probe = await store.open();
+      if (!probe) return context.skip();
+      await probe.close();
+      for (const scenario of REGRESSIONS) {
+        const planned = plan(scenario.initial, scenario.intents);
+        const expected = await reference(scenario.initial, scenario.rows, planned);
+        const count = await writesOf(store, scenario, planned);
+        for (let at = 1; at <= count; at++) {
+          for (const after of [false, true]) {
+            const actual = await crashThenRestart(store, scenario, planned, at, after);
+            expect({ steps: planned.describe, at, after, rows: actual }).toEqual({ steps: planned.describe, at, after, rows: expected });
+          }
+        }
+      }
     }, 900_000);
   }
 });

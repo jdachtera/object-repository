@@ -437,6 +437,42 @@ describe("an interrupted record pass", () => {
     expect(await prices(backend)).toEqual([100, 200, 300, 400, 500]);
   });
 
+  /** `cents`, with a `down` dividing by 100 — as unsafe to run twice as the `up`. */
+  const reversible = (failOn?: string): Migration => ({
+    ...cents(),
+    transforms: {
+      ...cents().transforms,
+      uncents: (row: JsonObject) => {
+        if (row.uuid === failOn) throw new Error(`boom on ${failOn}`);
+        return { ...row, price: Number(row.price) / 100 };
+      }
+    },
+    down: (m) => m.transform("Item", "uncents", ["price"])
+  });
+
+  for (const [name, make] of [
+    ["a store that persists a page with its marker", seeded],
+    ["a store that can't", nonAtomic]
+  ] as const) {
+    it(`resumes an interrupted rollback instead of reverting pages twice (${name})`, async () => {
+      const backend = await make([1, 2, 3, 4, 5]);
+      await runMigrations(backend, [reversible()], { models, batchSize: 2 });
+      await expect(rollbackMigrations(backend, [reversible("i3")], 1, { models, batchSize: 2 })).rejects.toThrow("boom on i3");
+      expect(await prices(backend)).toEqual([1, 2, 300, 400, 500]);
+
+      // Half reverted: a run must not take it as applied (and so never finish the revert).
+      await expect(runMigrations(backend, [reversible()], { models, batchSize: 2 })).rejects.toThrow(/rollback .* was interrupted/);
+
+      const report = await rollbackMigrations(backend, [reversible()], 1, { models, batchSize: 2 });
+      expect(report.applied).toEqual(["0030_cents"]);
+      expect(await prices(backend)).toEqual([1, 2, 3, 4, 5]);
+      expect(await new BackendJournal(backend, ctx).load()).toEqual([]);
+
+      await runMigrations(backend, [reversible()], { models, batchSize: 2 });
+      expect(await prices(backend)).toEqual([100, 200, 300, 400, 500]);
+    });
+  }
+
   it("doesn't let a later persist commit the half-written page", async () => {
     const backend = await seeded([1, 2, 3]);
     await expect(runMigrations(backend, [cents("i1")], { models, batchSize: 10 })).rejects.toThrow();
