@@ -34,8 +34,16 @@ export class OpRecorder implements MigrationBuilder {
   retypeField(model: string, field: string, from: StoredType, to: StoredType): void {
     this.ops.push({ kind: "retypeField", model, field, from, to });
   }
-  copyField(model: string, from: string, to: string, type: StoredType, options?: { overwrite?: boolean }): void {
-    this.ops.push({ kind: "copyField", model, from, to, type, overwrite: options?.overwrite ?? false });
+  copyField(model: string, from: string, to: string, type: StoredType, options?: { overwrite?: boolean; fromType?: StoredType }): void {
+    this.ops.push({
+      kind: "copyField",
+      model,
+      from,
+      to,
+      type,
+      overwrite: options?.overwrite ?? false,
+      ...(options?.fromType ? { fromType: options.fromType } : {})
+    });
   }
   addIndex(model: string, index: IndexSpec): void {
     this.ops.push({ kind: "addIndex", model, index });

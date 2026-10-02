@@ -265,7 +265,10 @@ export class SqlBackend
     catalog?: ReadonlyMap<string, string>
   ): Promise<boolean> {
     const declared = this.columnTypes(op.model);
-    if (declared.has(op.from) || declared.has(op.to)) return declared.get(op.from) === op.type && declared.get(op.to) === op.type;
+    if (op.fromType && op.fromType !== op.type) return false;
+    if (declared.has(op.from) || declared.has(op.to)) {
+      return (declared.get(op.from) ?? op.fromType) === op.type && declared.get(op.to) === op.type;
+    }
     const physical = catalog ?? new Map((await this.liveFieldSpecs(op.model)).map((field) => [field.name, field.type]));
     const kind = fieldTypeOfColumn(this.dialect.columnType(op.type));
     return physical.get(op.from) === kind && physical.get(op.to) === kind;

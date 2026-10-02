@@ -575,6 +575,7 @@ async function executeOps(
       ...(options.onProgress ? { onProgress: options.onProgress } : {}),
       backendName: backend.constructor?.name ?? "this backend",
       after,
+      ...("model" in op ? { typesAfter: typesAfter(options, ops, index, op.model) } : {}),
       ...(beforePage ? { beforePage } : {}),
       ...(checkpoint
         ? {
@@ -589,6 +590,29 @@ async function executeOps(
     });
     followLayout(options, op);
   }
+}
+
+/**
+ * `model`'s field types right after `ops[index]`: the run's layout (the shape once the remaining ops
+ * have run) with every later op of the phase undone, back to front. A field a later step renames away
+ * gets the type it has now, and one a later step retypes its current type, rather than being read as
+ * whatever the catalog says (plain text, for every text-backed type) or as its later type.
+ */
+function typesAfter(options: Running, ops: MigrationOp[], index: number, model: string): Map<string, string> {
+  const types = new Map((options.models?.[model]?.fields ?? []).map((field) => [field.name, field.type as string]));
+  for (let later = ops.length - 1; later > index; later--) {
+    const op = ops[later]!;
+    if (!("model" in op) || op.model !== model) continue;
+    if (op.kind === "renameField") {
+      types.delete(op.to);
+      types.set(op.from, op.type);
+    } else if (op.kind === "retypeField" && op.from !== undefined) {
+      types.set(op.field, op.from);
+    } else if (op.kind === "addField" || op.kind === "dropField") {
+      types.delete(op.field); // added later: not there yet; dropped later: its type isn't known here
+    }
+  }
+  return types;
 }
 
 /**

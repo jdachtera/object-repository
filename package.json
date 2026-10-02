@@ -114,6 +114,7 @@
     "@types/ws": "^8.18.1",
     "@vitest/coverage-v8": "2.1.9",
     "fake-indexeddb": "^6.2.5",
+    "fast-check": "^4.10.2",
     "mongodb": "^7.4.0",
     "mongodb-memory-server": "^11.2.0",
     "mysql2": "^3.22.5",

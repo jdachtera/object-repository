@@ -54,6 +54,12 @@ export interface ExecuteOptions {
   beforePage?: (after: string | null, through: string) => Promise<void>;
   /** Collects the models a pass registered with a reduced index set, so the runner can restore them. */
   registered?: Set<string>;
+  /**
+   * Each field's type right after this op, as the runner works it out from the application's layout by
+   * undoing the phase's later ops. The layout alone is the shape after the whole migration: it can give
+   * a field its later type, or omit one a later step renames away.
+   */
+  typesAfter?: ReadonlyMap<string, string>;
 }
 
 /** How many records an op rewrote. */
@@ -207,9 +213,8 @@ async function rewrite(
   change: (record: Readonly<JsonObject>) => JsonObject | null,
   where = everything()
 ): Promise<OpResult> {
-  // A rename's source holds the rename's own type: read as plain text, an array would be wrapped
-  // in another array and a scalar encoded twice on the way to the new field.
-  await reregister(backend, op.model, options, false, op.kind === "renameField" ? [{ name: op.from, type: op.type }] : []);
+  const known = [...(options.typesAfter ?? [])].map(([name, type]) => ({ name, type }));
+  await reregister(backend, op.model, options, false, [...fieldsWritten(op), ...known]);
   const removeOnNull = op.kind === "transform";
   const declared = ["uuid", ...fields.filter((field) => field !== "uuid")];
   let rows = 0;
@@ -300,12 +305,34 @@ async function flushPage(backend: Backend, options: ExecuteOptions, cursor: stri
 }
 
 /** Register a model's layout with a schema-aware backend, refusing to guess when it isn't known. */
+/**
+ * The field an op reads or writes, with the type it holds at that point of the migration. The run's
+ * layout is the application's — the shape after the whole migration — so mid-way it can name a field's
+ * later type, or not name a field a later step renames away (whose column the catalog then reads back
+ * as plain text). Registered that way, an array written by a copy reached the store unencoded, and a
+ * rename read an array back as text and wrapped it in another array.
+ */
+function fieldsWritten(op: MigrationOp): FieldSpec[] {
+  switch (op.kind) {
+    case "renameField":
+      return [{ name: op.from, type: op.type }];
+    case "copyField":
+      return [{ name: op.to, type: op.type }, ...(op.fromType ? [{ name: op.from, type: op.fromType }] : [])];
+    case "addField":
+      return [{ name: op.field, type: op.type }];
+    case "retypeField":
+      return [{ name: op.field, type: op.to }];
+    default:
+      return [];
+  }
+}
+
 async function reregister(
   backend: Backend,
   model: string,
   options: ExecuteOptions,
   withUnique = false,
-  /** Types known for columns the model no longer declares — the catalog reads every text-backed one as text. */
+  /** Types the op itself knows for the fields it touches; they override both the layout and the catalog. */
   hints: FieldSpec[] = []
 ): Promise<void> {
   if (!isSchemaAware(backend)) return;
@@ -324,13 +351,19 @@ async function reregister(
   options.registered?.add(model);
   // Physical columns the model has stopped declaring stay visible to the pass (a transform reading the
   // old column must see its values, not `undefined`); the declared type wins where both exist.
-  let fields = schema.fields;
+  // The layout as it stands at this op, where the runner worked it out: the application's is the
+  // shape after the whole migration, and provisioning from it creates columns a later step is meant to
+  // create — a rename's target, which then keeps the native rename from running and leaves the old
+  // column behind under a name a later step may reuse with another type.
+  let fields: FieldSpec[] = options.typesAfter ? [...options.typesAfter].map(([name, type]) => ({ name, type })) : schema.fields;
   const live = (backend as Partial<{ liveFieldSpecs(model: string): Promise<FieldSpec[]> }>).liveFieldSpecs;
   if (typeof live === "function") {
     const declared = new Set(fields.map((field) => field.name));
-    const undeclared = (await live.call(backend, model)).filter((field) => !declared.has(field.name));
-    fields = [...fields, ...undeclared.map((field) => hints.find((hint) => hint.name === field.name) ?? field)];
+    fields = [...fields, ...(await live.call(backend, model)).filter((field) => !declared.has(field.name))];
   }
+  // Only re-types a field the store knows (declared or physical): a hint never provisions a column.
+  // The first hint for a field wins: the op's own knowledge before the runner's reconstruction.
+  fields = fields.map((field) => hints.find((hint) => hint.name === field.name) ?? field);
   await register(backend, model, fields, indexes);
 }
 

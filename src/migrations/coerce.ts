@@ -63,6 +63,10 @@ export function coerce(value: JsonValue, to: StoredType, from?: StoredType): Jso
     case "json":
       // Already JSON text, unless the source is known to be something else (`text` → `json` quotes).
       if (typeof value === "string" && from === undefined) return value;
+      // A float an engine already rendered as text its own way (`1e15`): its JSON is JavaScript's.
+      if (typeof value === "string" && from === "float" && value.trim() !== "" && Number.isFinite(Number(value))) {
+        return JSON.stringify(Number(value));
+      }
       return JSON.stringify(value);
     case "scalar":
       return value;

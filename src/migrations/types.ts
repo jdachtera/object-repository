@@ -69,6 +69,8 @@ export type MigrationOp =
        * must not leave the canonical field holding the value it cleared.
        */
       exact?: boolean;
+      /** The source's type, for a source nothing else declares (see `MigrationBuilder.copyField`). */
+      fromType?: StoredType;
     }
   | { kind: "renameField"; model: string; from: string; to: string; type: StoredType }
   // `from` is optional because the legacy `alterColumnType` alias cannot state it — it only ever knew
@@ -107,7 +109,13 @@ export interface MigrationBuilder {
   renameField(model: string, from: string, to: string, type: StoredType): void;
   /** Widening only (e.g. integer → float, anything → json/scalar). Narrowing is refused at plan time. */
   retypeField(model: string, field: string, from: StoredType, to: StoredType): void;
-  copyField(model: string, from: string, to: string, type: StoredType, options?: { overwrite?: boolean }): void;
+  /**
+   * Copy `from` into `to` (of `type`). `fromType` names the source's type when nothing else does — a
+   * source the application no longer declares and that no later step names (one the migration drops).
+   * A SQL store can't tell its text-backed types apart, so without it such a source is read as plain
+   * text: an `array`, `scalar` or `json` value arrives as its JSON text.
+   */
+  copyField(model: string, from: string, to: string, type: StoredType, options?: { overwrite?: boolean; fromType?: StoredType }): void;
   addIndex(model: string, index: IndexSpec): void;
   dropIndex(model: string, name: string): void;
   /**

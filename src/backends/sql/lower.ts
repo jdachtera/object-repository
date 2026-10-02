@@ -126,7 +126,8 @@ export function lowerToSql(
  * backend runs the returned DDL and declines the op, so the reference rewrites each value.
  */
 export function retypeThenRewrite(op: MigrationOp): boolean {
-  return op.kind === "retypeField" && op.from === "float" && op.to === "text";
+  // `scalar` stores JSON too, but decodes it back to the number, so only these two read the text.
+  return op.kind === "retypeField" && op.from === "float" && (op.to === "text" || op.to === "json");
 }
 
 /** Which ops change a table's column set, so the backend must refresh what it thinks the layout is. */

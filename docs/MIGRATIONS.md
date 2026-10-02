@@ -197,6 +197,14 @@ Every operation works everywhere. This is only about how:
 | IndexedDB | — | everything |
 | in-memory | — | everything, deliberately: it is the reference the others are compared against |
 
+A SQL table can't tell its text-backed types apart: `text`, `json`, `array` and `scalar` columns all
+read back as text. So when a step reads a field, the runner works out the type that field has at that
+point of the migration: from the application's layout, undoing the migration's later steps (a field a
+later step renames away keeps the type the rename names). Only a field nothing declares and no later
+step names (one a later `dropField` removes) can't be worked out. Copying from such a field, pass its
+type: `m.copyField(model, from, to, type, { fromType })`. Without it a SQL store reads the source as
+plain text, so an `array`, `json` or `scalar` value arrives as its JSON text.
+
 ## Client and server
 
 A client and server running different builds is the normal state during a rolling deploy — and the
