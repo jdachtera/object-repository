@@ -21,6 +21,8 @@ function matches(doc: Record<string, unknown>, filter: MongoFilter): boolean {
       const ops = cond as Record<string, unknown>;
       if ("$in" in ops) {
         if (!(ops.$in as unknown[]).some((v) => norm(v) === norm(doc[key]))) return false;
+      } else if ("$eq" in ops) {
+        if (norm(doc[key]) !== norm(ops.$eq)) return false;
       } else return false; // other operators unused in this test
     } else if (norm(doc[key]) !== norm(cond)) {
       return false;
@@ -53,7 +55,10 @@ class Coll implements MongoCollection {
     }
     if (options.upsert) {
       const inserted: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(filter)) if (!(v && typeof v === "object" && !(v instanceof Oid))) inserted[k] = v;
+      for (const [k, v] of Object.entries(filter)) {
+        if (!(v && typeof v === "object" && !(v instanceof Oid))) inserted[k] = v;
+        else if (!(v instanceof Oid) && "$eq" in v) inserted[k] = (v as { $eq: unknown }).$eq; // as Mongo does
+      }
       Object.assign(inserted, u.$set ?? {}, u.$setOnInsert ?? {});
       this.docs.push(inserted);
     }
@@ -147,5 +152,30 @@ describe("MongoBackend with objectIdIdentity (ObjectId _id and FK fields)", () =
     const [fav] = await favs.all().filter(eq("userId", user.uuid)).list();
     expect(fav!.userId).toBe(user.uuid);
     expect(fav!.label).toBe("liked");
+  });
+});
+
+describe("migrations over an ObjectId identity", () => {
+  // Like the real driver's ObjectId: anything that isn't 24 hex characters throws.
+  class StrictOid extends Oid {
+    constructor(hex: string) {
+      if (!/^[0-9a-f]{24}$/.test(hex)) throw new Error(`input must be a 24 character hex string: ${hex}`);
+      super(hex);
+    }
+  }
+
+  it("keys the library's own bookkeeping with plain strings, which an ObjectId can't encode", async () => {
+    const db = new Db();
+    const identity = objectIdIdentity(StrictOid as unknown as new (hex: string) => unknown);
+    const orm = new RepositoryManager({ backend: new MongoBackend(db, identity), generateId: () => "b".repeat(24) });
+    const users = orm.define({ name: "User", properties: { email: text() } });
+    await users.save(users.createInstance({ email: "a@x.com" })).persist();
+
+    const report = await orm.migrate([{ name: "0001_tier", up: (m) => m.addField("User", "tier", "text", { fill: "free" }) }]);
+    expect(report.applied).toEqual(["0001_tier"]);
+    const journal = db.collection("_object_repository_migration_log").docs;
+    expect(journal.length).toBeGreaterThan(0);
+    expect(journal.every((row) => typeof row.uuid === "string")).toBe(true);
+    expect(db.collection("User").docs[0]!._id).toBeInstanceOf(Oid); // application data keeps its identity
   });
 });

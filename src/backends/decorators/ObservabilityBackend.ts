@@ -14,6 +14,7 @@
  * cost surfaces on `persist`.
  */
 import type {
+  MigrationTargeting,
   AggregatingBackend,
   Backend,
   CountingBackend,
@@ -127,6 +128,7 @@ export function observe(backend: Backend, options: ObservabilityOptions = {}): B
   };
 
   if (backend.discardPending) wrapped.discardPending = () => backend.discardPending!();
+  (wrapped as Backend & MigrationTargeting).migrationTarget = () => backend;
 
   // Optional capabilities: expose each only when the inner backend has it, so push-down is preserved.
   if (isSchemaAware(backend)) {

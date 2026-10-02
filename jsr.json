@@ -11,6 +11,7 @@
     "./mysql": "./src/backends/sql/MySqlBackend.ts",
     "./mongo": "./src/backends/mongo/index.ts",
     "./decorators": "./src/backends/decorators/index.ts",
+    "./migrations": "./src/migrations/index.ts",
     "./sync": "./src/sync/index.ts",
     "./transport": "./src/transport/index.ts",
     "./compat/mongo": "./src/compat/mongo.ts",

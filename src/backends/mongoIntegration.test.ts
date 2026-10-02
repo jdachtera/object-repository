@@ -7,6 +7,7 @@
  * reachable here (sandbox/offline), the whole suite skips — it never breaks the build.
  */
 import { describe, it, beforeAll, afterAll, expect } from "vitest";
+import { requireLiveDb } from "../testing/liveDb.testutil.js";
 import { MongoClient, ObjectId, type Db } from "mongodb";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { MongoBackend, objectIdIdentity, type MongoDatabase, type MongoIdentity } from "./mongo/MongoBackend.js";
@@ -30,7 +31,8 @@ beforeAll(async () => {
     client = new MongoClient(url);
     await client.connect();
     db = client.db("orm_integration");
-  } catch {
+  } catch (error) {
+      requireLiveDb(error);
     db = undefined; // no server reachable → skip the suite
   }
 }, 120_000);

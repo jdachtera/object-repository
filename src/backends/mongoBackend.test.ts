@@ -21,19 +21,19 @@ const ctx = SYSTEM_CONTEXT;
 describe("Mongo filter compilation (no server)", () => {
   const cases: Array<[string, ExpressionNode, MongoFilter]> = [
     ["all", all().serialize(), {}],
-    ["eq", eq("name", "Peter").serialize(), { name: "Peter" }],
+    ["eq", eq("name", "Peter").serialize(), { name: { $eq: "Peter" } }],
     ["neq", neq("name", "Peter").serialize(), { name: { $ne: "Peter" } }],
     ["gt", gt("age", 30).serialize(), { age: { $gt: 30 } }],
     ["in", inList("city", ["B", "P"]).serialize(), { city: { $in: ["B", "P"] } }],
     ["nin", notInList("city", ["B", "P"]).serialize(), { city: { $nin: ["B", "P"] } }],
     ["between", between("age", 30, 40).serialize(), { age: { $gte: 30, $lte: 40 } }],
-    ["contains", contains("langs", "de").serialize(), { langs: "de" }],
+    ["contains", contains("langs", "de").serialize(), { langs: { $eq: "de" } }],
     ["exists", exists("publishAt").serialize(), { publishAt: { $exists: true } }],
     ["exists(false)", exists("deletedAt", false).serialize(), { deletedAt: { $exists: false } }],
     ["size", size("tags", 3).serialize(), { tags: { $size: 3 } }],
-    ["and", and(eq("a", 1), gt("b", 2)).serialize(), { $and: [{ a: 1 }, { b: { $gt: 2 } }] }],
-    ["or", or(eq("a", 1), eq("a", 2)).serialize(), { $or: [{ a: 1 }, { a: 2 }] }],
-    ["not", not(eq("a", 1)).serialize(), { $nor: [{ a: 1 }] }]
+    ["and", and(eq("a", 1), gt("b", 2)).serialize(), { $and: [{ a: { $eq: 1 } }, { b: { $gt: 2 } }] }],
+    ["or", or(eq("a", 1), eq("a", 2)).serialize(), { $or: [{ a: { $eq: 1 } }, { a: { $eq: 2 } }] }],
+    ["not", not(eq("a", 1)).serialize(), { $nor: [{ a: { $eq: 1 } }] }]
   ];
 
   for (const [name, node, expected] of cases) {
@@ -67,6 +67,7 @@ function matchMongo(doc: Record<string, unknown>, filter: MongoFilter): boolean 
 
 function matchOp(actual: unknown, op: string, val: unknown): boolean {
   switch (op) {
+    case "$eq": return Array.isArray(actual) ? actual.includes(val) : actual === val;
     case "$ne": return actual !== val;
     case "$gt": return (actual as number) > (val as number);
     case "$lt": return (actual as number) < (val as number);
@@ -231,6 +232,7 @@ class FakeCollection implements MongoCollection {
       const inserted: Record<string, unknown> = {};
       for (const [key, cond] of Object.entries(filter)) {
         if (cond === null || typeof cond !== "object") inserted[key] = cond;
+        else if ("$eq" in (cond as object)) inserted[key] = (cond as { $eq: unknown }).$eq; // as Mongo does
       }
       const u = update as { $set?: Record<string, unknown>; $setOnInsert?: Record<string, unknown> };
       Object.assign(inserted, u.$set ?? {}, u.$setOnInsert ?? {});
@@ -544,5 +546,29 @@ describe("MongoBackend (round-trip against an in-memory Mongo evaluator)", () =>
     const byYear = await events.all().groupByExpr(year(field("ts")), (a) => ({ n: a.count(), total: a.sum("amount") }));
     expect(byYear.find((g) => g.key === 2023)).toEqual({ key: 2023, n: 1, total: 10 });
     expect(byYear.find((g) => g.key === 2024)).toEqual({ key: 2024, n: 2, total: 25 });
+  });
+});
+
+describe("a query plan can't inject Mongo operators", () => {
+  it("refuses a $-prefixed field name, which Mongo would run as an operator ($where runs JavaScript)", () => {
+    expect(() => compileMongoFilter(eq("$where", "sleep(1000)").serialize())).toThrow(/may not start with "\$"/);
+    expect(() => compileMongoFilter(eq("profile.$where", "x").serialize())).toThrow(/may not start with "\$"/);
+  });
+
+  it("compares an object value literally instead of executing it", () => {
+    // `password: { $ne: null }` as a bare value would match every user with a password.
+    expect(compileMongoFilter(eq("password", { $ne: null } as never).serialize())).toEqual({
+      password: { $eq: { $ne: null } }
+    });
+  });
+});
+
+describe("Mongo paging windows", () => {
+  it("returns no rows for an empty or inverted window (Mongo's limit 0 means no limit)", async () => {
+    const find = vi.fn(() => ({ toArray: async () => [{ uuid: "a" }, { uuid: "b" }] }));
+    const backend = new MongoBackend({ collection: () => ({ find }) } as never);
+    const plan = { model: "T", where: { type: "all" as const }, order: [], paging: { start: 2, end: 2 } };
+    expect(await backend.query(plan, {} as never)).toEqual([]);
+    expect(find).not.toHaveBeenCalled();
   });
 });

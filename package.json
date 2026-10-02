@@ -61,6 +61,10 @@
       "types": "./dist/backends/decorators/index.d.ts",
       "import": "./dist/backends/decorators/index.js"
     },
+    "./migrations": {
+      "types": "./dist/migrations/index.d.ts",
+      "import": "./dist/migrations/index.js"
+    },
     "./sync": {
       "types": "./dist/sync/index.d.ts",
       "import": "./dist/sync/index.js"
@@ -94,7 +98,8 @@
     "demo:chat": "pnpm run build && node examples/realtime-chat.ts",
     "demo:stats": "pnpm run build && node examples/stats-aggregation.ts",
     "demo:web": "pnpm run build && node examples/web/server.mjs",
-    "demo:web:verify": "pnpm run build && node examples/web/verify.mjs"
+    "demo:web:verify": "pnpm run build && node examples/web/verify.mjs",
+    "test:mutation": "stryker run"
   },
   "peerDependencies": {
     "zod": "^3.24.0"
@@ -105,28 +110,34 @@
     }
   },
   "devDependencies": {
-    "@types/node": "^22.10.0",
-    "@types/pg": "^8.20.0",
-    "@types/ws": "^8.18.1",
-    "@vitest/coverage-v8": "2.1.9",
+    "@stryker-mutator/core": "^9.6.1",
+    "@stryker-mutator/vitest-runner": "^9.6.1",
+    "@types/node": "^22.20.5",
+    "@types/pg": "^8.23.1",
+    "@types/ws": "^8.18.2",
+    "@vitest/coverage-v8": "3.2.7",
     "fake-indexeddb": "^6.2.5",
-    "mongodb": "^7.4.0",
-    "mongodb-memory-server": "^11.2.0",
-    "mysql2": "^3.22.5",
-    "pg": "^8.22.0",
+    "fast-check": "^4.10.2",
+    "mongodb": "^7.7.0",
+    "mongodb-memory-server": "^11.3.0",
+    "mysql2": "^3.24.5",
+    "pg": "^8.23.1",
     "pg-mem": "^3.0.14",
-    "playwright-core": "^1.49.1",
-    "tsup": "^8.3.0",
-    "typedoc": "^0.28.19",
-    "typedoc-plugin-markdown": "^4.12.0",
-    "typescript": "^5.7.0",
-    "vitest": "^2.1.0",
-    "ws": "^8.21.0",
-    "zod": "^3.24.0"
+    "playwright-core": "^1.63.0",
+    "tsup": "^8.5.1",
+    "typedoc": "^0.28.20",
+    "typedoc-plugin-markdown": "^4.13.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7",
+    "ws": "^8.22.0",
+    "zod": "^3.25.76"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
       "esbuild"
-    ]
+    ],
+    "overrides": {
+      "qs": ">=6.16.0"
+    }
   }
 }

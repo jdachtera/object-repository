@@ -137,3 +137,80 @@ describe("PolicyBackend (through the Repository stack)", () => {
     );
   });
 });
+
+describe("PolicyBackend authorizes the stored row, not just the record a client sends", () => {
+  async function seededStore() {
+    const inner = new InMemoryBackend();
+    inner.save("Note", { uuid: "n1", owner: "alice", text: "a1" }, ctxFor("alice"));
+    inner.save("Note", { uuid: "n3", owner: "bob", text: "b1" }, ctxFor("bob"));
+    await inner.persist(ctxFor("alice"));
+    return { inner, backend: new PolicyBackend(inner, ownerPolicy) };
+  }
+  const stored = async (inner: InMemoryBackend, uuid: string) =>
+    (await inner.query(plan("Note", eq("uuid", uuid).serialize()), ctxFor("alice")))[0];
+
+  it("refuses to take over another tenant's row by writing a record that claims to be your own", async () => {
+    const { inner, backend } = await seededStore();
+    backend.save("Note", { uuid: "n1", owner: "bob", text: "mine now" }, ctxFor("bob"));
+    await expect(backend.persist(ctxFor("bob"))).rejects.toThrow(PolicyError);
+    expect(await stored(inner, "n1")).toMatchObject({ owner: "alice", text: "a1" });
+  });
+
+  it("refuses to delete another tenant's row", async () => {
+    const { inner, backend } = await seededStore();
+    backend.remove("Note", { uuid: "n1", owner: "bob" }, ctxFor("bob"));
+    await expect(backend.persist(ctxFor("bob"))).rejects.toThrow(PolicyError);
+    expect(await stored(inner, "n1")).toBeDefined();
+  });
+
+  it("refuses a uuid that isn't a string, which every store would stringify to a real row", async () => {
+    const { inner, backend } = await seededStore();
+    // `String(["n1"])` is "n1": a delete by it would reach alice's row without its stored-row check.
+    expect(() => backend.remove("Note", { uuid: ["n1"], owner: "bob" } as never, ctxFor("bob"))).toThrow(PolicyError);
+    expect(() => backend.save("Note", { uuid: ["n1"], owner: "bob" } as never, ctxFor("bob"))).toThrow(PolicyError);
+    expect(() => backend.remove("Note", { owner: "bob" } as never, ctxFor("bob"))).toThrow(PolicyError);
+    await backend.persist(ctxFor("bob"));
+    expect(await stored(inner, "n1")).toMatchObject({ owner: "alice" });
+  });
+
+  it("refuses the whole batch, so a legitimate write queued with it doesn't slip through", async () => {
+    const { inner, backend } = await seededStore();
+    backend.save("Note", { uuid: "n3", owner: "bob", text: "b1 edited" }, ctxFor("bob"));
+    backend.save("Note", { uuid: "n1", owner: "bob", text: "mine now" }, ctxFor("bob"));
+    await expect(backend.persist(ctxFor("bob"))).rejects.toThrow(PolicyError);
+    expect(await stored(inner, "n3")).toMatchObject({ text: "b1" });
+  });
+
+  it("still lets a tenant update its own rows and insert new ones", async () => {
+    const { inner, backend } = await seededStore();
+    backend.save("Note", { uuid: "n3", owner: "bob", text: "b1 edited" }, ctxFor("bob"));
+    backend.save("Note", { uuid: "n9", owner: "bob", text: "new" }, ctxFor("bob"));
+    await backend.persist(ctxFor("bob"));
+    expect(await stored(inner, "n3")).toMatchObject({ text: "b1 edited" });
+    expect(await stored(inner, "n9")).toMatchObject({ owner: "bob" });
+  });
+
+  it("refuses a non-string uuid at the transport, before it reaches any store", async () => {
+    const { BackendAdapter } = await import("../transport/BackendAdapter.js");
+    const { inner, backend } = await seededStore();
+    const adapter = new BackendAdapter(backend);
+    const response = await adapter.handle(
+      { method: "persist", params: { saves: [], removes: [{ model: "Note", record: { uuid: ["n1"], owner: "bob" } }] } } as never,
+      ctxFor("bob")
+    );
+    expect(response).toMatchObject({ ok: false, error: { code: "INVALID_RECORD" } });
+    expect(await stored(inner, "n1")).toMatchObject({ owner: "alice" });
+  });
+
+  it("closes the takeover over the transport, where the client chooses the uuid", async () => {
+    const { BackendAdapter } = await import("../transport/BackendAdapter.js");
+    const { InProcessTransport } = await import("../transport/InProcessTransport.js");
+    const { RemoteBackend } = await import("../transport/RemoteBackend.js");
+    const { inner, backend } = await seededStore();
+    const asBob = new InProcessTransport(new BackendAdapter(backend)); // the caller's context reaches the adapter
+    const remote = new RemoteBackend(asBob, inner.capabilities);
+    remote.save("Note", { uuid: "n1", owner: "bob", text: "mine now" }, ctxFor("bob"));
+    await expect(remote.persist(ctxFor("bob"))).rejects.toThrow();
+    expect(await stored(inner, "n1")).toMatchObject({ owner: "alice" });
+  });
+});

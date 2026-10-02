@@ -6,6 +6,7 @@
  * and sync engine are built against them in later roadmap steps.
  */
 export type {
+  SchemaVersioning,
   JsonValue,
   JsonObject,
   Uuid,
@@ -53,6 +54,9 @@ export type {
   UpsertingBackend,
   RawQueryable,
   TransactionalBackend,
+  LeasingBackend,
+  MigrationLoweringBackend,
+  MigrationTargeting,
   ChangeEvent,
   ChangeListener,
   Unsubscribe
@@ -66,7 +70,11 @@ export {
   isMultiPatching,
   isUpserting,
   isRawQueryable,
-  isTransactional
+  isTransactional,
+  isLeasing,
+  isMigrationLowering,
+  isReservedModel,
+  migrationTarget
 } from "./Backend.ts";
 
 export type {
@@ -87,3 +95,4 @@ export type {
   WireError,
   WireUnsubscribe
 } from "./Transport.ts";
+export { checkSchemaCompatibility, enforceSchema, isSchemaRefusal, type SchemaAdvertisement, type SchemaCompatibility, type SchemaRefusalCode } from "./schema.ts";

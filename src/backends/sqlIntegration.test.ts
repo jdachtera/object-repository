@@ -8,8 +8,12 @@
  * operators, so nested-path push-down can only be verified against a real engine here.
  */
 import { describe, it, beforeAll, afterAll, expect } from "vitest";
+import { exclusiveLiveDbs, requireLiveDb } from "../testing/liveDb.testutil.js";
 import pg from "pg";
 import { createPool, type Pool as MySqlPool } from "mysql2/promise";
+import type { MigrationBuilder } from "../migrations/types.js";
+import { runMigrations } from "../migrations/run.js";
+import { planMigrations } from "../migrations/plan.js";
 import { PostgresBackend } from "./sql/PostgresBackend.js";
 import { MySqlBackend } from "./sql/MySqlBackend.js";
 import { InMemoryBackend } from "./memory/InMemoryBackend.js";
@@ -76,6 +80,14 @@ async function idsFor(be: Backend, where: Expression): Promise<string[]> {
 const PG_URL = process.env.PG_URL ?? "postgres://test:test@127.0.0.1:5432/test";
 const MYSQL_URL = process.env.MYSQL_URL ?? "mysql://test:test@127.0.0.1:3306/test";
 
+let releaseLiveDbs: () => Promise<void> = async () => {};
+beforeAll(async () => {
+  releaseLiveDbs = await exclusiveLiveDbs(PG_URL, MYSQL_URL);
+}, 700_000);
+afterAll(async () => {
+  await releaseLiveDbs();
+});
+
 const DATA = [
   { name: "Ann", age: 30, city: "eu" },
   { name: "Bob", age: 45, city: "us" },
@@ -89,7 +101,8 @@ describe("Postgres (real engine)", () => {
     try {
       pool = new pg.Pool({ connectionString: PG_URL });
       for (const t of ["int_person", "int_tx", "nested_m", "iso_pg", "uniq_pg", "types_pg", "emb_pg", "win_pg", "cd_pg", "dirty_pg", "null_pg", "prechk_pg", "prechk2_pg", "soft_pg", "rel_cust_pg", "rel_ord_pg"]) await pool.query(`DROP TABLE IF EXISTS "${t}"`);
-    } catch {
+    } catch (error) {
+      requireLiveDb(error);
       pool = undefined;
     }
   });
@@ -481,6 +494,52 @@ describe("Postgres (real engine)", () => {
     expect((cErr as UniqueConstraintError).fields).toEqual(["day", "room"]);
   });
 
+  it("migrates, journals, and is a no-op on re-run — against a real server", async () => {
+    // pg-mem accepts a NUL byte in text; PostgreSQL rejects it. A journal id containing one was written
+    // by every test here and could never be written in production, so this has to run on the real engine.
+    if (!pool) return;
+    await pool.query(`DROP TABLE IF EXISTS "mig_pg", "_object_repository_migration_log", "_object_repository_schema_state"`);
+    const orm = new RepositoryManager({ backend: new PostgresBackend(pool) });
+    const migrations = [
+      { name: "m1_create", up: (m: MigrationBuilder) => m.createTable("mig_pg", [{ name: "n", type: "integer" }]) },
+      { name: "m2_addcol", up: (m: MigrationBuilder) => m.addColumn("mig_pg", "label", "text") },
+      { name: "m3_rename", up: (m: MigrationBuilder) => m.renameColumn("mig_pg", "label", "tag") }
+    ];
+    expect((await orm.migrate(migrations)).applied).toEqual(["m1_create", "m2_addcol", "m3_rename"]);
+    await orm.raw({ sql: `INSERT INTO "mig_pg" ("uuid", "n", "tag", "_extra") VALUES ($1, $2, $3, $4)`, params: ["r1", 5, "hi", null] });
+    expect(await orm.raw<{ tag: string }>({ sql: `SELECT "tag" FROM "mig_pg"` })).toEqual([{ tag: "hi" }]);
+
+    const again = await orm.migrate(migrations);
+    expect(again.applied).toEqual([]);
+    expect(again.skipped).toEqual(["m1_create", "m2_addcol", "m3_rename"]);
+  });
+
+  it("runs the documented rename timeline against a real server", async () => {
+    if (!pool) return;
+    await pool.query(`DROP TABLE IF EXISTS "tl_pg", "_object_repository_migration_log", "_object_repository_schema_state"`);
+    const migrations = [
+      { name: "tl_rename", schemaVersion: 7, up: (m: MigrationBuilder) => m.renameField("tl_pg", "name", "fullName", "text") }
+    ];
+    const v6 = new RepositoryManager({ backend: new PostgresBackend(pool) });
+    const users = v6.define({ name: "tl_pg", properties: { name: text() } });
+    users.save(users.createInstance({ uuid: "u1", name: "Ann" }));
+    await users.persist();
+
+    const shipped = await new RepositoryManager({
+      backend: new PostgresBackend(pool),
+      schema: { schemaVersion: 7, minSupportedSchemaVersion: 5 }
+    }).migrate(migrations);
+    expect(shipped.expanded).toEqual(["tl_rename"]);
+    expect(shipped.deferred).toHaveLength(1);
+
+    const released = await new RepositoryManager({
+      backend: new PostgresBackend(pool),
+      schema: { schemaVersion: 7, minSupportedSchemaVersion: 7 }
+    }).migrate(migrations, { applyContracts: true });
+    expect(released.contracted).toEqual(["tl_rename"]);
+    expect(await pool.query(`SELECT "fullName" FROM "tl_pg"`).then((r) => r.rows)).toEqual([{ fullName: "Ann" }]);
+  });
+
   it("round-trips scalar types faithfully (int / float / date / bool)", async () => {
     if (!pool) return;
     const orm = new RepositoryManager({ backend: new PostgresBackend(pool) });
@@ -497,6 +556,94 @@ describe("Postgres (real engine)", () => {
     expect((back.d as Date).getTime()).toBe(when.getTime()); // date stored as epoch bigint, decoded to Date
     expect(back.b).toBe(true);
   });
+  it("builds the unique indexes a migration pass set aside, once the data allows it", async () => {
+    if (!pool) return;
+    await pool.query(`DROP TABLE IF EXISTS "dedupe_pg", "_object_repository_migration_log", "_object_repository_schema_state"`);
+    const backend = new PostgresBackend(pool);
+    const byEmail = { name: "email", fields: [{ path: "email" }], unique: true };
+    const models = { dedupe_pg: { fields: [{ name: "email", type: "text" as const }], indexes: [byEmail] } };
+    await backend.registerModel("dedupe_pg", [], models.dedupe_pg.fields);
+    backend.save("dedupe_pg", { uuid: "u1", email: "a@x" }, ctx);
+    backend.save("dedupe_pg", { uuid: "u2", email: "a@x" }, ctx);
+    await backend.persist(ctx);
+    await backend.registerModel("dedupe_pg", [byEmail], models.dedupe_pg.fields); // over duplicates: fails quietly
+
+    await runMigrations(
+      backend,
+      [
+        {
+          name: "0070_dedupe",
+          transforms: { dedupe: (row: Record<string, unknown>) => (row.uuid === "u2" ? null : row) } as never,
+          up: (m) => m.transform("dedupe_pg", "dedupe", ["email"], undefined, { phase: "contract" })
+        }
+      ],
+      { models, applyContracts: true, skipLock: true }
+    );
+    backend.save("dedupe_pg", { uuid: "u3", email: "a@x" }, ctx);
+    await expect(backend.persist(ctx)).rejects.toThrow();
+  });
+  it("a record pass after a retype in the same run reads the new type", async () => {
+    if (!pool) return;
+    await pool.query(`DROP TABLE IF EXISTS "retyped_pg", "_object_repository_migration_log", "_object_repository_schema_state"`);
+    const backend = new PostgresBackend(pool);
+    const seen: string[] = [];
+    await runMigrations(
+      backend,
+      [
+        {
+          name: "0080_widgets",
+          transforms: {
+            look: ((row: Record<string, unknown>) => {
+              seen.push(typeof row.n);
+              return row;
+            }) as never
+          },
+          up: (m) => {
+            m.createModel("retyped_pg", [{ name: "n", type: "integer" }]);
+            m.sql(`INSERT INTO "retyped_pg" ("uuid", "n") VALUES ('w1', 5)`);
+            m.retypeField("retyped_pg", "n", "integer", "text");
+            m.transform("retyped_pg", "look", ["n"], undefined, { phase: "expand" });
+          }
+        }
+      ],
+      { skipLock: true }
+    );
+    expect(seen).toEqual(["string"]);
+    const [row] = await backend.query({ model: "retyped_pg", where: { type: "all" }, order: [], paging: { start: 0 } }, ctx);
+    expect(row!.n).toBe("5");
+  });
+  it("a rename onto a field the model already declares keeps that field registered", async () => {
+    if (!pool) return;
+    await pool.query(`DROP TABLE IF EXISTS "renamed_pg", "_object_repository_migration_log", "_object_repository_schema_state"`);
+    await pool.query(`CREATE TABLE "renamed_pg" ("uuid" text PRIMARY KEY, "name" text, "_extra" text)`);
+    await pool.query(`INSERT INTO "renamed_pg" ("uuid", "name") VALUES ('u1', 'Ann')`);
+    const backend = new PostgresBackend(pool);
+    const models = { renamed_pg: { fields: [{ name: "fullName", type: "text" as const }], indexes: [] } };
+    await backend.registerModel("renamed_pg", [], models.renamed_pg.fields); // define(): provisions `fullName`
+    await runMigrations(backend, [{ name: "0090_rename", up: (m) => m.renameField("renamed_pg", "name", "fullName", "text") }], {
+      models,
+      skipLock: true
+    });
+    backend.save("renamed_pg", { uuid: "u2", fullName: "Bo" }, ctx);
+    await backend.persist(ctx);
+    const { rows } = await pool.query(`SELECT "uuid", "fullName" FROM "renamed_pg" ORDER BY "uuid"`);
+    expect(rows).toEqual([
+      { uuid: "u1", fullName: "Ann" },
+      { uuid: "u2", fullName: "Bo" } // in its column, not the overflow
+    ]);
+  });
+  it("a transaction keeps the order of writes queued before and during it", async () => {
+    if (!pool) return;
+    await pool.query(`DROP TABLE IF EXISTS "txorder_pg"`);
+    const backend = new PostgresBackend(pool);
+    await backend.registerModel("txorder_pg", [], [{ name: "v", type: "integer" }]);
+    backend.save("txorder_pg", { uuid: "x", v: 1 }, ctx); // queued before
+    await backend.transaction(async () => {
+      backend.save("txorder_pg", { uuid: "x", v: 2 }, ctx); // the outer backend again, meanwhile
+    }, ctx);
+    const { rows } = await pool.query(`SELECT "v" FROM "txorder_pg" WHERE "uuid" = 'x'`);
+    expect(rows.map((row: { v: string }) => Number(row.v))).toEqual([2]);
+  });
 });
 
 describe("MySQL (real engine)", () => {
@@ -505,7 +652,8 @@ describe("MySQL (real engine)", () => {
     try {
       pool = createPool(MYSQL_URL);
       for (const t of ["int_person_my", "nested_m", "uniq_my", "upsert_my", "mig_my", "types_my", "_object_repository_migrations", "emb_my", "win_my", "cd_my", "dirty_my", "null_my", "longtext_my", "idxtext_my", "prechk_my"]) await pool.query(`DROP TABLE IF EXISTS \`${t}\``);
-    } catch {
+    } catch (error) {
+      requireLiveDb(error);
       pool = undefined;
     }
   });
@@ -686,11 +834,11 @@ describe("MySQL (real engine)", () => {
     users.save(ann).save(bob).save(cy);
     await users.persist();
 
-    const updates = seen.filter((s) => s.includes("ON DUPLICATE KEY UPDATE"));
-    const ageOnly = updates.filter((s) => s.includes("ON DUPLICATE KEY UPDATE `age` = VALUES(`age`)") && !s.includes("`name` = VALUES"));
-    const cityOnly = updates.filter((s) => s.includes("ON DUPLICATE KEY UPDATE `city` = VALUES(`city`)") && !s.includes("`age` = VALUES"));
-    expect(ageOnly).toHaveLength(1); // ann + bob batched into one multi-row statement
-    expect(ageOnly[0]).toContain("), ("); // two value tuples in that one statement, one round trip
+    const updates = seen.filter((s) => s.startsWith("UPDATE `dirty_my`"));
+    const ageOnly = updates.filter((s) => s.includes("SET `age` = CASE") && !s.includes("`name` = CASE"));
+    const cityOnly = updates.filter((s) => s.includes("SET `city` = CASE") && !s.includes("`age` = CASE"));
+    expect(ageOnly).toHaveLength(1); // ann + bob batched into one statement
+    expect(ageOnly[0]!.match(/WHEN \?/g)).toHaveLength(2); // both rows in that one statement, one round trip
     expect(cityOnly).toHaveLength(1); // cy, alone (different dirty signature)
 
     // Re-read through a fresh, unrelated repository — a real query, not the identity-map cache.
@@ -763,6 +911,343 @@ describe("MySQL (real engine)", () => {
     expect(idx[0]?.Sub_part).toBe(255);
   });
 
+  it("a row another writer deletes between the check and the update is written, not silently lost", async () => {
+    if (!pool) return;
+    await pool.query("DROP TABLE IF EXISTS `race2_my`");
+    const plain = new MySqlBackend(pool);
+    await plain.registerModel("race2_my", [], [{ name: "name", type: "text" }]);
+    plain.save("race2_my", { uuid: "r1", name: "old" }, ctx);
+    await plain.persist(ctx);
+
+    let raced = false;
+    const racing = new MySqlBackend({
+      query: (sql: string, params: unknown[]) => pool!.query(sql, params),
+      getConnection: async () => {
+        const conn = await pool!.getConnection();
+        return {
+          query: async (sql: string, params: unknown[]) => {
+            const result = await conn.query(sql, params);
+            if (!raced && sql.startsWith("SELECT `uuid`") && !sql.includes("FOR UPDATE")) {
+              raced = true;
+              await pool!.query("DELETE FROM `race2_my` WHERE `uuid` = 'r1'"); // another writer
+            }
+            return result;
+          },
+          beginTransaction: () => conn.beginTransaction(),
+          commit: () => conn.commit(),
+          rollback: () => conn.rollback(),
+          release: () => conn.release()
+        };
+      }
+    } as never);
+    await racing.registerModel("race2_my", [], [{ name: "name", type: "text" }]);
+    racing.save("race2_my", { uuid: "r1", name: "mine" }, ctx);
+    await racing.persist(ctx);
+    expect(raced).toBe(true);
+    const [rows] = (await pool.query("SELECT `uuid`, `name` FROM `race2_my`")) as unknown as [Array<{ uuid: string; name: string }>];
+    expect(rows).toEqual([{ uuid: "r1", name: "mine" }]);
+  });
+
+  const dropMigrationTables = async (table: string) => {
+    for (const t of [table, "_object_repository_migration_log", "_object_repository_schema_state"]) await pool!.query(`DROP TABLE IF EXISTS \`${t}\``);
+  };
+
+  it("a migration indexes a TEXT column before the model is defined in this process", async () => {
+    if (!pool) return;
+    await dropMigrationTables("idxmig_my");
+    await pool.query("CREATE TABLE `idxmig_my` (`uuid` varchar(36) PRIMARY KEY, `email` longtext, `_extra` longtext)");
+    const backend = new MySqlBackend(pool); // fresh: nothing registered, as at a deploy step
+    const index = { name: "email", fields: [{ path: "email" }], unique: true };
+    await runMigrations(backend, [{ name: "0001_idx", up: (m) => m.addIndex("idxmig_my", index) }], {
+      models: { idxmig_my: { fields: [{ name: "email", type: "text" }], indexes: [index] } }
+    });
+    const [rows] = (await pool.query("SHOW INDEX FROM `idxmig_my` WHERE Key_name = 'idxmig_my_email'")) as unknown as [Array<{ Sub_part: number }>];
+    expect(rows.map((row) => row.Sub_part)).toEqual([255]);
+  });
+
+  it("a migration creates a model's indexes table-scoped and prefix-lengthed", async () => {
+    if (!pool) return;
+    await dropMigrationTables("newmodel_my");
+    const index = { name: "email", fields: [{ path: "email" }], unique: true };
+    await runMigrations(
+      new MySqlBackend(pool),
+      [{ name: "0001_create", up: (m) => m.createModel("newmodel_my", [{ name: "email", type: "text" }], [index]) }],
+      { models: { newmodel_my: { fields: [{ name: "email", type: "text" }], indexes: [index] } } }
+    );
+    const [rows] = (await pool.query("SHOW INDEX FROM `newmodel_my` WHERE Column_name = 'email'")) as unknown as [Array<{ Key_name: string; Sub_part: number }>];
+    expect(rows.map((row) => [row.Key_name, row.Sub_part])).toEqual([["newmodel_my_email", 255]]);
+  });
+
+  it("a field add after a registration in the same phase finds the column registration added", async () => {
+    if (!pool) return;
+    await dropMigrationTables("livecols_my");
+    await pool.query("CREATE TABLE `livecols_my` (`uuid` varchar(36) PRIMARY KEY, `name` longtext, `_extra` longtext)");
+    await pool.query("INSERT INTO `livecols_my` (`uuid`, `name`) VALUES ('l1', 'Ann')");
+    const models = { livecols_my: { fields: [{ name: "name", type: "text" as const }, { name: "tier", type: "text" as const }], indexes: [] } };
+    const report = await runMigrations(
+      new MySqlBackend(pool),
+      [
+        {
+          name: "0001_tier",
+          transforms: { touch: (row) => row },
+          up: (m) => {
+            m.addIndex("livecols_my", { name: "name", fields: [{ path: "name" }] }); // reads the columns
+            m.transform("livecols_my", "touch", ["name"]); // registers the layout: provisions `tier`
+            m.addField("livecols_my", "tier", "text", { fill: "free" });
+          }
+        }
+      ],
+      { models }
+    );
+    expect(report.applied).toEqual(["0001_tier"]);
+    const [rows] = (await pool.query("SELECT `tier` FROM `livecols_my`")) as unknown as [Array<{ tier: string }>];
+    expect(rows).toEqual([{ tier: "free" }]);
+  });
+
+  const cents = (failOn?: string) => ({
+    name: "0001_cents",
+    transforms: {
+      cents: (row: Record<string, unknown>) => {
+        if (row.uuid === failOn) throw new Error(`boom on ${failOn}`);
+        return { ...row, price: Number(row.price) * 100 };
+      }
+    }
+  });
+  const pricesIn = async (table: string) =>
+    ((await pool!.query(`SELECT \`price\` FROM \`${table}\` ORDER BY \`uuid\``)) as unknown as [Array<{ price: number }>])[0].map((row) => Number(row.price));
+
+  it("a phase whose DDL commits mid-way resumes instead of re-applying a transform", async () => {
+    if (!pool) return;
+    await dropMigrationTables("ddlcommit_my");
+    const backend = new MySqlBackend(pool);
+    const models = { ddlcommit_my: { fields: [{ name: "price", type: "integer" as const }], indexes: [] } };
+    await backend.registerModel("ddlcommit_my", [], models.ddlcommit_my.fields);
+    [1, 2, 3, 4].forEach((price, i) => backend.save("ddlcommit_my", { uuid: `i${i}`, price }, ctx));
+    await backend.persist(ctx);
+
+    const migration = (failOn?: string) => ({
+      ...cents(failOn),
+      up: (m: MigrationBuilder) => {
+        m.addField("ddlcommit_my", "note", "text"); // DDL: MySQL commits whatever is open
+        m.transform("ddlcommit_my", "cents", ["price"], undefined, { phase: "expand" });
+      }
+    });
+    await expect(runMigrations(backend, [migration("i2")], { models, batchSize: 2 })).rejects.toThrow("boom on i2");
+    await runMigrations(backend, [migration()], { models, batchSize: 2 });
+    expect(await pricesIn("ddlcommit_my")).toEqual([100, 200, 300, 400]);
+  });
+
+  it("a resumed phase doesn't re-provision a column an op before the resume point dropped", async () => {
+    if (!pool) return;
+    await dropMigrationTables("resumedrop_my");
+    const backend = new MySqlBackend(pool);
+    const models = {
+      resumedrop_my: { fields: [{ name: "price", type: "integer" as const }, { name: "legacy", type: "text" as const }], indexes: [] }
+    };
+    await backend.registerModel("resumedrop_my", [], models.resumedrop_my.fields);
+    [1, 2, 3, 4].forEach((price, i) => backend.save("resumedrop_my", { uuid: `i${i}`, price, legacy: "x" }, ctx));
+    await backend.persist(ctx);
+
+    const migration = (failOn?: string) => ({
+      ...cents(failOn),
+      up: (m: MigrationBuilder) => {
+        m.dropField("resumedrop_my", "legacy");
+        m.transform("resumedrop_my", "cents", ["price"], undefined, { phase: "contract" });
+      }
+    });
+    await expect(runMigrations(backend, [migration("i2")], { models, batchSize: 2, applyContracts: true })).rejects.toThrow("boom on i2");
+    // A fresh process: its layouts still declare `legacy`.
+    await runMigrations(new MySqlBackend(pool), [migration()], { models, batchSize: 2, applyContracts: true });
+    const [columns] = (await pool.query("SHOW COLUMNS FROM `resumedrop_my`")) as unknown as [Array<{ Field: string }>];
+    expect(columns.map((column) => column.Field)).not.toContain("legacy");
+    expect(await pricesIn("resumedrop_my")).toEqual([100, 200, 300, 400]);
+  });
+
+  it("a plan previews the SQL a run will execute, following earlier ops", async () => {
+    if (!pool) return;
+    await dropMigrationTables("preview_my");
+    await pool.query("CREATE TABLE `preview_my` (`uuid` varchar(36) PRIMARY KEY, `name` longtext, `_extra` longtext)");
+    const plan = await planMigrations(new MySqlBackend(pool), [
+      {
+        name: "0001_preview",
+        up: (m) => {
+          m.renameField("preview_my", "name", "fullName", "text");
+          m.addField("preview_my", "nick", "text");
+          m.copyField("preview_my", "fullName", "nick", "text");
+        }
+      }
+    ]);
+    expect(plan.steps.map((step) => [step.op.kind, step.lowering])).toEqual([
+      ["renameField", "native"],
+      ["addField", "native"],
+      ["copyField", "native"]
+    ]);
+    expect(plan.steps[0]!.preview).toEqual(["ALTER TABLE `preview_my` RENAME COLUMN `name` TO `fullName`"]);
+  });
+
+  it("a native JSON-quoting retype isn't run again when a later op in its phase fails", async () => {
+    if (!pool) return;
+    await dropMigrationTables("retypecrash_my");
+    const backend = new MySqlBackend(pool);
+    const before = { retypecrash_my: { fields: [{ name: "name", type: "text" as const }, { name: "price", type: "integer" as const }], indexes: [] } };
+    await backend.registerModel("retypecrash_my", [], before.retypecrash_my.fields);
+    ["a", "b", "c", "d"].forEach((name, i) => backend.save("retypecrash_my", { uuid: `i${i}`, name, price: i + 1 }, ctx));
+    await backend.persist(ctx);
+
+    const models = { retypecrash_my: { fields: [{ name: "name", type: "json" as const }, { name: "price", type: "integer" as const }], indexes: [] } };
+    const migration = (failOn?: string) => ({
+      ...cents(failOn),
+      up: (m: MigrationBuilder) => {
+        m.retypeField("retypecrash_my", "name", "text", "json"); // native: UPDATE … JSON_QUOTE
+        m.transform("retypecrash_my", "cents", ["price"], undefined, { phase: "expand" });
+      }
+    });
+    // Fails on the transform's first page: nothing after the retype has been journalled yet.
+    await expect(runMigrations(backend, [migration("i0")], { models, batchSize: 2 })).rejects.toThrow("boom on i0");
+    await runMigrations(new MySqlBackend(pool), [migration()], { models, batchSize: 2 });
+    const [rows] = (await pool.query("SELECT `name` FROM `retypecrash_my` ORDER BY `uuid`")) as unknown as [Array<{ name: string }>];
+    expect(rows.map((row) => row.name)).toEqual(['"a"', '"b"', '"c"', '"d"']);
+    expect(await pricesIn("retypecrash_my")).toEqual([100, 200, 300, 400]);
+  });
+
+  it("a plan's preview ignores a withheld contract's effect on later steps", async () => {
+    if (!pool) return;
+    await dropMigrationTables("withheld_my");
+    await pool.query("CREATE TABLE `withheld_my` (`uuid` varchar(36) PRIMARY KEY, `name` longtext, `nick` longtext, `_extra` longtext)");
+    const plan = await planMigrations(
+      new MySqlBackend(pool),
+      [
+        { name: "0001_rename", schemaVersion: 5, up: (m) => m.renameField("withheld_my", "name", "fullName", "text") },
+        { name: "0002_nick", up: (m) => m.copyField("withheld_my", "name", "nick", "text") }
+      ],
+      { schemaVersion: 5, minSupportedSchemaVersion: 0 }
+    );
+    const copy = plan.steps.find((step) => step.migration === "0002_nick")!;
+    expect(copy.lowering).toBe("native"); // the rename's drop of `name` is withheld: `name` is still there
+  });
+
+  it("follows a committed column drop even when journalling it then fails", async () => {
+    if (!pool) return;
+    await dropMigrationTables("stalecols_my");
+    const backend = new MySqlBackend(pool);
+    const models = { stalecols_my: { fields: [{ name: "name", type: "text" as const }, { name: "legacy", type: "text" as const }], indexes: [] } };
+    await backend.registerModel("stalecols_my", [], models.stalecols_my.fields);
+    backend.save("stalecols_my", { uuid: "s1", name: "a", legacy: "x" }, ctx);
+    await backend.persist(ctx);
+
+    const transaction = backend.transaction.bind(backend);
+    backend.transaction = async () => {
+      throw new Error("connection lost"); // the journal write after the DDL
+    };
+    await expect(
+      runMigrations(backend, [{ name: "0001_drop", up: (m) => m.dropField("stalecols_my", "legacy") }], { models, applyContracts: true, skipLock: true })
+    ).rejects.toThrow("connection lost");
+    backend.transaction = transaction;
+
+    backend.save("stalecols_my", { uuid: "s2", name: "b" }, ctx);
+    await expect(backend.persist(ctx)).resolves.toBeDefined(); // not "Unknown column 'legacy'"
+  });
+
+  it("a field add after a raw SQL step that added the column sees it", async () => {
+    if (!pool) return;
+    await dropMigrationTables("rawcols_my");
+    await pool.query("CREATE TABLE `rawcols_my` (`uuid` varchar(36) PRIMARY KEY, `name` longtext, `_extra` longtext)");
+    const report = await runMigrations(
+      new MySqlBackend(pool),
+      [
+        {
+          name: "0001_nick",
+          up: (m) => {
+            m.addIndex("rawcols_my", { name: "name", fields: [{ path: "name" }] }); // reads the columns
+            m.sql("ALTER TABLE `rawcols_my` ADD COLUMN `nickname` longtext");
+            m.addField("rawcols_my", "nickname", "text", { fill: "-" });
+          }
+        }
+      ],
+      { models: { rawcols_my: { fields: [{ name: "name", type: "text" }, { name: "nickname", type: "text" }], indexes: [] } } }
+    );
+    expect(report.applied).toEqual(["0001_nick"]);
+  });
+
+  it("a marker queued by a page with nothing to write doesn't overwrite a later op's", async () => {
+    if (!pool) return;
+    await dropMigrationTables("stalemark_my");
+    const backend = new MySqlBackend(pool);
+    const before = {
+      stalemark_my: {
+        fields: [{ name: "code", type: "text" as const }, { name: "note", type: "text" as const }, { name: "name", type: "text" as const }, { name: "price", type: "integer" as const }],
+        indexes: []
+      }
+    };
+    await backend.registerModel("stalemark_my", [], before.stalemark_my.fields);
+    ["a", "b", "c", "d"].forEach((name, i) => backend.save("stalemark_my", { uuid: `i${i}`, code: "c", note: "set", name, price: i + 1 }, ctx));
+    await backend.persist(ctx);
+
+    const models = {
+      stalemark_my: { fields: before.stalemark_my.fields.map((f) => (f.name === "name" ? { name: "name", type: "json" as const } : f)), indexes: [] }
+    };
+    const migration = (failOn?: string) => ({
+      ...cents(failOn),
+      up: (m: MigrationBuilder) => {
+        // Not a plain assignment (the copy's type isn't the columns'), so a record pass: and with every
+        // target already set, one whose pages have nothing to write.
+        m.copyField("stalemark_my", "code", "note", "json");
+        m.retypeField("stalemark_my", "name", "text", "json"); // native: UPDATE … JSON_QUOTE
+        m.transform("stalemark_my", "cents", ["price"], undefined, { phase: "expand" });
+      }
+    });
+    await expect(runMigrations(backend, [migration("i0")], { models, batchSize: 2 })).rejects.toThrow("boom on i0");
+    await runMigrations(new MySqlBackend(pool), [migration()], { models, batchSize: 2 });
+    const [rows] = (await pool.query("SELECT `name` FROM `stalemark_my` ORDER BY `uuid`")) as unknown as [Array<{ name: string }>];
+    expect(rows.map((row) => row.name)).toEqual(['"a"', '"b"', '"c"', '"d"']);
+  });
+
+  it("a unique-key clash whose value mentions the primary key is still refused", async () => {
+    if (!pool) return;
+    await pool.query("DROP TABLE IF EXISTS `uniq2_my`");
+    const orm = new RepositoryManager({ backend: new MySqlBackend(pool) });
+    const users = orm.define({ name: "uniq2_my", properties: { email: text({ unique: true }) } });
+    const tricky = "x' for key 'PRIMARY";
+    await users.save(users.createInstance({ email: tricky })).persist();
+    users.save(users.createInstance({ email: tricky }));
+    await expect(users.persist()).rejects.toThrow(/Duplicate entry/);
+    expect(await users.all().count()).toBe(1);
+  });
+
+  it("a concurrent writer inserting the same new uuid first settles as last-write-wins, not an error", async () => {
+    if (!pool) return;
+    await pool.query("DROP TABLE IF EXISTS `race_my`");
+    await new MySqlBackend(pool).registerModel("race_my", [], [{ name: "name", type: "text" }]);
+    let raced = false;
+    // Between this writer's existence check and its insert, another process inserts the same uuid.
+    const racing = new MySqlBackend({
+      query: (sql: string, params: unknown[]) => pool!.query(sql, params),
+      getConnection: async () => {
+        const conn = await pool!.getConnection();
+        return {
+          query: async (sql: string, params: unknown[]) => {
+            const result = await conn.query(sql, params);
+            if (!raced && sql.startsWith("SELECT `uuid`")) {
+              raced = true;
+              await pool!.query("INSERT INTO `race_my` (`uuid`, `name`) VALUES ('r1', 'other')");
+            }
+            return result;
+          },
+          beginTransaction: () => conn.beginTransaction(),
+          commit: () => conn.commit(),
+          rollback: () => conn.rollback(),
+          release: () => conn.release()
+        };
+      }
+    } as never);
+    await racing.registerModel("race_my", [], [{ name: "name", type: "text" }]);
+    racing.save("race_my", { uuid: "r1", name: "mine" }, ctx);
+    await racing.persist(ctx);
+    expect(raced).toBe(true);
+    const [rows] = (await pool.query("SELECT `uuid`, `name` FROM `race_my`")) as unknown as [Array<{ uuid: string; name: string }>];
+    expect(rows).toEqual([{ uuid: "r1", name: "mine" }]);
+  });
+
   it("re-saving a uuid updates in place via ON DUPLICATE KEY UPDATE (no duplicate row)", async () => {
     if (!pool) return;
     const orm = new RepositoryManager({ backend: new MySqlBackend(pool) });
@@ -777,34 +1262,32 @@ describe("MySQL (real engine)", () => {
     expect((await items.get(r.uuid))!.name).toBe("y");
   });
 
-  // A declared unique index IS created on MySQL, but persist()'s upsert semantics diverge from Postgres:
-  // MySQL's `INSERT … ON DUPLICATE KEY UPDATE` matches on *every* unique key (it can't be scoped to the
-  // uuid primary key the way Postgres's `ON CONFLICT (uuid)` is), so a colliding secondary-unique value
-  // is absorbed as a no-op UPDATE of the existing row rather than raised as an error. The upshot: on
-  // MySQL a save whose unique field collides with a different row is silently dropped (the existing row
-  // wins, count stays 1, no throw) — whereas the same save rejects on Postgres. This is a documented
-  // engine divergence (see README "Cross-engine caveats"); the test pins the real behavior so a future
-  // change to the write strategy is a deliberate, visible edit.
-  it("creates the UNIQUE index; a secondary-key collision is absorbed by upsert (MySQL divergence)", async () => {
+  // `INSERT … ON DUPLICATE KEY UPDATE` fires on *every* unique key, so persisting a new record whose
+  // unique field collided with a different row used to overwrite that row. New uuids are now plainly
+  // inserted and existing ones updated by uuid, so the collision is an error — as on Postgres.
+  it("creates the UNIQUE index, and a secondary-key collision is refused — never another row rewritten", async () => {
     if (!pool) return;
     const orm = new RepositoryManager({ backend: new MySqlBackend(pool) });
-    const users = orm.define({ name: "uniq_my", properties: { email: text({ unique: true }) } });
-    await orm.transaction(async () => users.save(users.createInstance({ email: "a@x.io" })));
+    const users = orm.define({ name: "uniq_my", properties: { email: text({ unique: true }), name: text() } });
+    const alice = users.createInstance({ email: "a@x.io", name: "Alice" });
+    await orm.transaction(async () => users.save(alice));
 
     // the index really exists and is UNIQUE (Non_unique = 0)
     const idx = (await pool.query("SHOW INDEX FROM `uniq_my` WHERE `Key_name` = 'uniq_my_email'"))[0] as { Non_unique: number }[];
     expect(idx[0]?.Non_unique).toBe(0);
 
-    // a *different* record with the same email does not throw and is not inserted — the existing row wins
-    users.save(users.createInstance({ email: "a@x.io" }));
-    await expect(users.persist()).resolves.toBeDefined();
-    expect(await users.all().count()).toBe(1);
+    // a *different* record with the same email is refused, and Alice's row is untouched
+    users.save(users.createInstance({ email: "a@x.io", name: "Mallory" }));
+    await expect(users.persist()).rejects.toThrow();
+    const fresh = new RepositoryManager({ backend: new MySqlBackend(pool) }).define({ name: "uniq_my", properties: { email: text(), name: text() } });
+    expect(await fresh.all().count()).toBe(1);
+    expect((await fresh.get(alice.uuid))!.name).toBe("Alice");
   });
 
   it("the pre-write unique check closes the MySQL secondary-unique divergence (opt-in)", async () => {
     if (!pool) return;
-    // Default OFF: a colliding secondary-unique value is silently absorbed (pinned above). With the
-    // flag ON, it raises the same UniqueConstraintError as every other engine, before the write.
+    // Default OFF: the database refuses the colliding insert (above). With the flag ON, it raises the
+    // same friendly UniqueConstraintError as every other engine, before the write.
     const orm = new RepositoryManager({ backend: new MySqlBackend(pool, undefined, { uniquePreCheck: true }) });
     const users = orm.define({ name: "prechk_my", properties: { email: text({ unique: true }) } });
     await orm.transaction(async () => users.save(users.createInstance({ email: "a@x.io" })));
@@ -816,18 +1299,32 @@ describe("MySQL (real engine)", () => {
 
   it("applies a migration (add + rename column) against a real schema", async () => {
     if (!pool) return;
+    // The journal persists in the database, so a previous run's rows would make this one a no-op.
+    await pool.query("DROP TABLE IF EXISTS `mig_my`, `_object_repository_migration_log`, `_object_repository_schema_state`");
     const orm = new RepositoryManager({ backend: new MySqlBackend(pool) });
-    const report = await orm.migrate([
-      { name: "m1_create", up: (m) => m.createTable("mig_my", [{ name: "n", type: "integer" }]) },
-      { name: "m2_addcol", up: (m) => m.addColumn("mig_my", "label", "text") },
-      { name: "m3_rename", up: (m) => m.renameColumn("mig_my", "label", "tag") }
-    ]);
+    const migrations = [
+      { name: "m1_create", up: (m: MigrationBuilder) => m.createTable("mig_my", [{ name: "n", type: "integer" }]) },
+      { name: "m2_addcol", up: (m: MigrationBuilder) => m.addColumn("mig_my", "label", "text") },
+      { name: "m3_rename", up: (m: MigrationBuilder) => m.renameColumn("mig_my", "label", "tag") }
+    ];
+    const report = await orm.migrate(migrations);
     expect(report.applied).toEqual(["m1_create", "m2_addcol", "m3_rename"]);
     // the renamed column exists and accepts data
     await orm.raw({ sql: "INSERT INTO `mig_my` (`uuid`, `n`, `tag`, `_extra`) VALUES (?, ?, ?, ?)", params: ["r1", 5, "hi", null] });
     expect(await orm.raw<{ tag: string }>({ sql: "SELECT `tag` FROM `mig_my`" })).toEqual([{ tag: "hi" }]);
-    // re-running is a no-op
-    expect((await orm.migrate([{ name: "m1_create", up: () => {} }])).applied).toEqual([]);
+    // re-running the same set is a no-op. (It must be the same bodies: an applied migration whose
+    // body changed is refused as CHECKSUM_DRIFT, so an empty stand-in no longer works here.)
+    expect((await orm.migrate(migrations)).applied).toEqual([]);
+  });
+
+  it("journals a migration name longer than the key column, which only a hashed id can fit", async () => {
+    if (!pool) return;
+    await pool.query("DROP TABLE IF EXISTS `mig_long_my`, `_object_repository_migration_log`, `_object_repository_schema_state`");
+    const orm = new RepositoryManager({ backend: new MySqlBackend(pool) });
+    const name = `0042_${"a_rather_descriptive_migration_name_".repeat(3)}`; // well past varchar(64)
+    const migrations = [{ name, up: (m: MigrationBuilder) => m.createTable("mig_long_my", [{ name: "n", type: "integer" }]) }];
+    expect((await orm.migrate(migrations)).applied).toEqual([name]);
+    expect((await orm.migrate(migrations)).skipped).toEqual([name]);
   });
 
   it("round-trips scalar types faithfully (int / float / date / bool)", async () => {
@@ -894,13 +1391,15 @@ describe("cross-engine parity vs the in-memory reference", () => {
     try {
       pg_ = new pg.Pool({ connectionString: PG_URL });
       for (const t of PARITY_TABLES) await pg_.query(`DROP TABLE IF EXISTS "${t}"`);
-    } catch {
+    } catch (error) {
+      requireLiveDb(error);
       pg_ = undefined;
     }
     try {
       my_ = createPool({ uri: MYSQL_URL });
       for (const t of PARITY_TABLES) await my_.query(`DROP TABLE IF EXISTS \`${t}\``);
-    } catch {
+    } catch (error) {
+      requireLiveDb(error);
       my_ = undefined;
     }
   });

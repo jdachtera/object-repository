@@ -17,6 +17,7 @@ export default defineConfig({
     "src/backends/sql/MySqlBackend.ts",
     "src/backends/mongo/index.ts",
     "src/backends/decorators/index.ts",
+    "src/migrations/index.ts",
     "src/sync/index.ts",
     "src/transport/index.ts",
     "src/compat/mongo.ts",
