@@ -163,6 +163,16 @@ describe("PolicyBackend authorizes the stored row, not just the record a client 
     expect(await stored(inner, "n1")).toBeDefined();
   });
 
+  it("refuses a uuid that isn't a string, which every store would stringify to a real row", async () => {
+    const { inner, backend } = await seededStore();
+    // `String(["n1"])` is "n1": a delete by it would reach alice's row without its stored-row check.
+    expect(() => backend.remove("Note", { uuid: ["n1"], owner: "bob" } as never, ctxFor("bob"))).toThrow(PolicyError);
+    expect(() => backend.save("Note", { uuid: ["n1"], owner: "bob" } as never, ctxFor("bob"))).toThrow(PolicyError);
+    expect(() => backend.remove("Note", { owner: "bob" } as never, ctxFor("bob"))).toThrow(PolicyError);
+    await backend.persist(ctxFor("bob"));
+    expect(await stored(inner, "n1")).toMatchObject({ owner: "alice" });
+  });
+
   it("refuses the whole batch, so a legitimate write queued with it doesn't slip through", async () => {
     const { inner, backend } = await seededStore();
     backend.save("Note", { uuid: "n3", owner: "bob", text: "b1 edited" }, ctxFor("bob"));
@@ -178,6 +188,18 @@ describe("PolicyBackend authorizes the stored row, not just the record a client 
     await backend.persist(ctxFor("bob"));
     expect(await stored(inner, "n3")).toMatchObject({ text: "b1 edited" });
     expect(await stored(inner, "n9")).toMatchObject({ owner: "bob" });
+  });
+
+  it("refuses a non-string uuid at the transport, before it reaches any store", async () => {
+    const { BackendAdapter } = await import("../transport/BackendAdapter.js");
+    const { inner, backend } = await seededStore();
+    const adapter = new BackendAdapter(backend);
+    const response = await adapter.handle(
+      { method: "persist", params: { saves: [], removes: [{ model: "Note", record: { uuid: ["n1"], owner: "bob" } }] } } as never,
+      ctxFor("bob")
+    );
+    expect(response).toMatchObject({ ok: false, error: { code: "INVALID_RECORD" } });
+    expect(await stored(inner, "n1")).toMatchObject({ owner: "alice" });
   });
 
   it("closes the takeover over the transport, where the client chooses the uuid", async () => {

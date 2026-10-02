@@ -120,6 +120,11 @@ export class BackendAdapter implements TransportAdapter {
           };
           for (const change of [...saves, ...removes]) {
             if (!this.modelAllowed(change.model)) return err("FORBIDDEN_MODEL", `Model "${change.model}" is not exposed.`);
+            // Every store stringifies a uuid it deletes or updates by, so `["<uuid>"]` would name a real
+            // row while slipping past checks that look for a string. A save may omit it (a fresh insert).
+            const uuid = (change.record as { uuid?: unknown } | null)?.uuid;
+            const fresh = saves.includes(change) && (uuid === undefined || uuid === null || uuid === "");
+            if (!fresh && (typeof uuid !== "string" || !uuid)) return err("INVALID_RECORD", "A record's uuid must be a non-empty string.");
           }
           for (const change of saves) this.backend.save(change.model, change.record, ctx);
           for (const change of removes) this.backend.remove(change.model, change.record, ctx);

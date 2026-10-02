@@ -170,11 +170,22 @@ export class PolicyBackend implements Backend, SchemaAwareBackend, CountingBacke
    * made; the stored row it would replace is checked at `persist`, which is where the store can be read.
    */
   save(model: string, record: JsonObject, ctx: Context, dirty?: readonly string[]): void {
+    // No uuid (or an empty one) is a fresh insert, which the store gives a new uuid; any other
+    // non-string would skip the stored-row check below yet still name a row once a store stringifies it.
+    const uuid = record.uuid;
+    if (uuid !== undefined && uuid !== null && typeof uuid !== "string") {
+      throw new PolicyError(`Write to "${model}" denied: a record's uuid must be a string.`);
+    }
     this.authorizeWrite(model, record, ctx);
     this.pending.push({ kind: "save", model, record, ctx, dirty });
   }
 
   remove(model: string, record: JsonObject, ctx: Context): void {
+    // A remove always names a stored row, so it is always checked against it: a uuid that isn't a
+    // non-empty string (`["<uuid>"]`, which every store stringifies to the real one) is refused.
+    if (typeof record.uuid !== "string" || !record.uuid) {
+      throw new PolicyError(`Remove from "${model}" denied: a record's uuid must be a non-empty string.`);
+    }
     this.authorizeWrite(model, record, ctx);
     this.pending.push({ kind: "remove", model, record, ctx });
   }

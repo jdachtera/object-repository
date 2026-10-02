@@ -98,7 +98,8 @@
     "demo:chat": "pnpm run build && node examples/realtime-chat.ts",
     "demo:stats": "pnpm run build && node examples/stats-aggregation.ts",
     "demo:web": "pnpm run build && node examples/web/server.mjs",
-    "demo:web:verify": "pnpm run build && node examples/web/verify.mjs"
+    "demo:web:verify": "pnpm run build && node examples/web/verify.mjs",
+    "test:mutation": "stryker run"
   },
   "peerDependencies": {
     "zod": "^3.24.0"
@@ -109,6 +110,8 @@
     }
   },
   "devDependencies": {
+    "@stryker-mutator/core": "^9.6.1",
+    "@stryker-mutator/vitest-runner": "^9.6.1",
     "@types/node": "^22.10.0",
     "@types/pg": "^8.20.0",
     "@types/ws": "^8.18.1",

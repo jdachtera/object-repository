@@ -5,3 +5,5 @@ coverage
 dist
 docs/api
 *.tsbuildinfo
+reports/
+.stryker-tmp/
