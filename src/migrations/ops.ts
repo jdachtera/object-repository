@@ -92,7 +92,8 @@ export class OpRecorder implements MigrationBuilder {
       kind: "addIndex",
       model,
       index: { name, fields: columns.map((path) => ({ path })), ...(unique ? { unique: true } : {}) },
-      ...(columnTypes ? { columnTypes } : {})
+      ...(columnTypes ? { columnTypes } : {}),
+      exactName: true
     });
   }
 }
@@ -110,6 +111,9 @@ const STORED_TYPES: ReadonlySet<string> = new Set<StoredType>([
 
 /** Narrow a caller-supplied type tag, tolerating the legacy aliases' loose `string`. */
 function asStoredType(type: string): StoredType {
+  // `uuid` was the original builder's name for a key column: text, which an index can cover (MySQL
+  // prefixes it), where the `scalar` fallback is a LONGTEXT it can't.
+  if (type === "uuid") return "text";
   return (STORED_TYPES.has(type) ? type : "scalar") as StoredType;
 }
 

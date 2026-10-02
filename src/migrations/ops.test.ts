@@ -114,9 +114,14 @@ describe("the legacy builder aliases", () => {
       // No `from`: the legacy alias never knew the original type, so the widening check can't run
       // and it keeps its historical behaviour of simply applying.
       { kind: "retypeField", model: "User", field: "age", to: "float" },
-      { kind: "addIndex", model: "User", index: { name: "by_name", fields: [{ path: "name" }], unique: true } },
+      // Named exactly as given, as the original builder did: raw SQL may name it later.
+      { kind: "addIndex", model: "User", index: { name: "by_name", fields: [{ path: "name" }], unique: true }, exactName: true },
       { kind: "dropModel", model: "Stale" }
     ]);
+  });
+
+  it("keeps the original builder's uuid column type indexable: text, not the LONGTEXT fallback", () => {
+    expect(record((m) => m.addColumn("Order", "userId", "uuid"))).toEqual([{ kind: "addField", model: "Order", field: "userId", type: "text" }]);
   });
 
   it("keeps MySQL's index column types, which have nowhere to live on IndexSpec", () => {

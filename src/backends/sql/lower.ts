@@ -103,7 +103,8 @@ export function lowerToSql(
       // provisioning skips such an index, rather than emit DDL that throws.
       if (!paths.every((path) => path === "uuid" || present.has(path))) return null;
       const types = op.columnTypes ? new Map(Object.entries(op.columnTypes)) : columnTypes;
-      return [ddl(dialect.createIndex(op.model, physicalIndexName(op.model, op.index.name), paths, !!op.index.unique, types))];
+      const name = op.exactName ? op.index.name : physicalIndexName(op.model, op.index.name);
+      return [ddl(dialect.createIndex(op.model, name, paths, !!op.index.unique, types))];
     }
 
     case "dropIndex":

@@ -82,7 +82,18 @@ export type MigrationOp =
   | { kind: "transform"; model: string; transform: string; fields: string[]; where?: ExpressionNode; phase?: Phase }
   // `columnTypes` rides alongside rather than inside `IndexSpec`: it exists only so MySQL can add a
   // key-length prefix to a TEXT-backed column, which no other store has an opinion about.
-  | { kind: "addIndex"; model: string; index: IndexSpec; columnTypes?: Record<string, string> }
+  | {
+      kind: "addIndex";
+      model: string;
+      index: IndexSpec;
+      columnTypes?: Record<string, string>;
+      /**
+       * Create the index under `index.name` exactly, rather than scoped to its table as provisioning
+       * names it. Set by the legacy `createIndex` alias, whose raw-SQL callers name the index in later
+       * statements (`DROP INDEX by_email`).
+       */
+      exactName?: true;
+    }
   | { kind: "dropIndex"; model: string; index: string }
   | { kind: "rawSql"; dialect: "postgres" | "mysql" | "*"; statement: string; params: JsonValue[]; phase: Phase };
 

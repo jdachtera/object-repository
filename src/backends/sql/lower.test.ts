@@ -159,6 +159,17 @@ describe("lowering to MySQL", () => {
     expect(statement!.sql).toBe("CREATE UNIQUE INDEX `Song_by_name` ON `Song` (`name`(255))");
   });
 
+  it("keeps the exact name of an index made by the legacy createIndex alias", () => {
+    const [statement] = lowerToSql(
+      { kind: "addIndex", model: "Song", index: { name: "by_name", fields: [{ path: "name" }] }, exactName: true },
+      mysqlDialect,
+      present,
+      new Map([["name", "text"]])
+    )!;
+    // As the original builder named it: a later raw `DROP INDEX by_name ON Song` still finds it.
+    expect(statement!.sql).toBe("CREATE INDEX `by_name` ON `Song` (`name`(255))");
+  });
+
   it("prefixes an index over a TEXT column from the live column types when the op carries none", () => {
     const [statement] = lowerToSql(
       { kind: "addIndex", model: "Song", index: { name: "by_name", fields: [{ path: "name" }] } },
