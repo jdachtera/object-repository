@@ -130,3 +130,25 @@ describe("commands integrate with the data system", () => {
     expect((await clientUsers.all().list()).map((u) => u.name).sort()).toEqual(["Ada", "Bob", "Cy"]);
   });
 });
+
+describe("the changes a command reply carries", () => {
+  it("leave out models the adapter doesn't expose, as the change feed does", async () => {
+    const backend = new InMemoryBackend();
+    const writes = {
+      touch: command({
+        handler: async (_input, ctx: Context) => {
+          backend.save("Note", { uuid: "n1", text: "public" }, ctx);
+          backend.save("Secret", { uuid: "s1", text: "hidden" }, ctx);
+          backend.save("_object_repository_migration_log", { uuid: "j1", name: "0001" }, ctx);
+          await backend.persist(ctx);
+          return "ok";
+        }
+      })
+    };
+    const adapter = new BackendAdapter(backend, undefined, writes, ["Note"]);
+    const reply = await adapter.handle({ method: "command", params: { name: "touch", input: undefined } }, { identity: { id: "client" } });
+    expect(reply.ok).toBe(true);
+    const { changes } = (reply as { result: { changes: Array<{ model: string }> } }).result;
+    expect(changes.map((change) => change.model)).toEqual(["Note"]);
+  });
+});

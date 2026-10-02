@@ -151,7 +151,11 @@ export class BackendAdapter implements TransportAdapter {
     if (!this.commands) return err("UNSUPPORTED_METHOD", "This adapter has no commands registered.");
     const { name, input } = (params ?? {}) as { name?: unknown; input?: unknown };
     const changes: ChangeEvent[] = [];
-    const unsubscribe = this.backend.changes((event) => changes.push(event), ctx);
+    // Only models the client may see — the change feed's rule: a command that writes the journal, or a
+    // concurrent write to a model this adapter doesn't expose, must not hand the client those rows.
+    const unsubscribe = this.backend.changes((event) => {
+      if (this.modelAllowed(event.model)) changes.push(event);
+    }, ctx);
     try {
       const value = await executeCommand(this.commands, name, input, ctx);
       return ok({ value, changes } satisfies CommandReply);
