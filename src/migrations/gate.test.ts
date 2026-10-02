@@ -649,3 +649,79 @@ describe("a rollback that fails part-way", () => {
     expect(reverted).toEqual(["m2"]);
   });
 });
+
+describe("rollback refusals judge the migration being reverted, not its neighbours", () => {
+  it("reverts a plain migration applied after one still mid-window", async () => {
+    const backend = await seeded();
+    const windowed: Migration = { ...rename(), down: (m) => m.renameField("User", "fullName", "name", "text") };
+    const plain: Migration = { name: "m2", up: (m) => m.addField("User", "tier", "text", { fill: "x" }), down: (m) => m.dropField("User", "tier") };
+    await run(backend, [windowed, plain], { schemaVersion: 7, minSupportedSchemaVersion: 5 });
+    await expect(rollbackMigrations(backend, [windowed, plain], 1, { models, now })).resolves.toMatchObject({ applied: ["m2"] });
+  });
+
+  it("reverts a plain migration applied after one that destroyed data", async () => {
+    const backend = await seeded();
+    const destructive: Migration = { name: "m1", up: (m) => m.dropField("User", "name"), down: (m) => m.addField("User", "name", "text") };
+    const plain: Migration = { name: "m2", up: (m) => m.addField("User", "tier", "text"), down: (m) => m.dropField("User", "tier") };
+    await run(backend, [destructive, plain]);
+    await expect(rollbackMigrations(backend, [destructive, plain], 1, { models, now })).resolves.toMatchObject({ applied: ["m2"] });
+    await expect(rollbackMigrations(backend, [destructive, plain], 1, { models, now })).rejects.toThrow(/destroyed data/);
+  });
+
+  it("lists a migration whose expand and contract ran in one call once", async () => {
+    const backend = await seeded();
+    const report = await run(backend, [rename()], { schemaVersion: 7, minSupportedSchemaVersion: 7, applyContracts: true });
+    expect(report.applied).toEqual(["0012_fullname"]);
+  });
+});
+
+describe("history adopted from the original SQL-only tracking table", () => {
+  const legacy = (names: string[] | (() => Promise<string[]>)) => {
+    const backend = new InMemoryBackend();
+    return Object.assign(backend, { legacyMigrationNames: typeof names === "function" ? names : async () => names });
+  };
+
+  it("is written to the journal once, both phases applied, in the legacy order", async () => {
+    const backend = legacy(["0001_a", "0002_b"]);
+    await run(backend, []);
+    const rows = await new BackendJournal(backend, ctx).load();
+    expect(rows.map((row) => `${row.name}:${row.phase}:${row.status}`).sort()).toEqual([
+      "0001_a:contract:applied",
+      "0001_a:expand:applied",
+      "0002_b:contract:applied",
+      "0002_b:expand:applied"
+    ]);
+    const stamp = (name: string) => rows.find((row) => row.name === name && row.phase === "expand")!.appliedAt;
+    expect(stamp("0001_a")).toBeLessThan(stamp("0002_b"));
+    expect(stamp("0002_b")).toBeLessThan(clock); // stamped before the run, not after
+
+    // A declared migration of the same name counts as applied, and isn't run again.
+    const again: Migration = { name: "0002_b", up: (m) => m.addField("User", "x", "text", { fill: "!" }) };
+    await expect(run(backend, [again])).resolves.toMatchObject({ applied: [], skipped: ["0002_b"] });
+  });
+
+  it("is rolled back newest first, and only when asked to", async () => {
+    const backend = legacy(["0001_a", "0002_b"]);
+    const declared = ["0001_a", "0002_b"].map((name): Migration => ({ name, up: () => {}, down: () => {} }));
+    await run(backend, declared);
+    await expect(rollbackMigrations(backend, declared, 1, { models, now })).rejects.toThrow(/rollbackAdopted/);
+    await expect(rollbackMigrations(backend, declared, 1, { models, now, rollbackAdopted: true })).resolves.toMatchObject({ applied: ["0002_b"] });
+  });
+
+  it("is ignored once the journal has rows of its own", async () => {
+    const names = ["0001_a"];
+    const backend = legacy(async () => names);
+    await run(backend, [{ name: "m1", up: (m) => m.addField("User", "x", "text") }]);
+    names.push("0002_late"); // recorded in the old table by a build that wasn't upgraded
+    await run(backend, [{ name: "m1", up: (m) => m.addField("User", "x", "text") }]);
+    const rows = await new BackendJournal(backend, ctx).load();
+    expect(rows.some((row) => row.name === "0002_late")).toBe(false);
+  });
+
+  it("is nothing when the legacy table is empty or unreadable", async () => {
+    for (const backend of [legacy([]), legacy(async () => Promise.reject(new Error("no such table")))]) {
+      await run(backend, []);
+      expect(await new BackendJournal(backend, ctx).load()).toEqual([]);
+    }
+  });
+});

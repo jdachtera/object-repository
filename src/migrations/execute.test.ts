@@ -480,3 +480,42 @@ describe("an index op on a schema-aware store", () => {
     expect(await applyOp(new InMemoryBackend(), { kind: "dropIndex", model: "M", index: "a" }, options())).toEqual({ rows: 0 });
   });
 });
+
+describe("the layout a columnar store is registered with, step by step", () => {
+  it("is the shape at each step, never the final one early", async () => {
+    const registered: string[] = [];
+    const backend = Object.assign(new InMemoryBackend(), {
+      columnar: true,
+      registerModel: (model: string, _indexes: IndexSpec[], fields?: FieldSpec[]) => {
+        if (model === "M") registered.push((fields ?? []).map((field) => `${field.name}:${field.type}`).join(","));
+      }
+    });
+    backend.save("M", { uuid: "a", old: "x", n: 1, gone: 1 }, ctx);
+    await backend.persist(ctx);
+    const final: FieldSpec[] = [
+      { name: "new", type: "text" },
+      { name: "n", type: "float" },
+      { name: "added", type: "text" }
+    ];
+    const migration: Migration = {
+      name: "m1",
+      transforms: { same: (row) => row },
+      up: (m) => {
+        m.transform("M", "same", ["n"], undefined, { phase: "expand" });
+        m.renameField("M", "old", "new", "text");
+        m.retypeField("M", "n", "integer", "float");
+        m.addField("M", "added", "text", { fill: "f" });
+        m.dropField("M", "gone");
+      }
+    };
+    await runMigrations(backend as unknown as Backend, [migration], { models: { M: { fields: final, indexes: [] } }, skipLock: true });
+    expect(registered).toEqual([
+      "n:integer,old:text", // the transform: before the rename and the retype
+      "new:text,n:integer", // the rename: renamed, not yet retyped
+      "new:text,n:float", // the retype
+      "new:text,n:float,added:text", // the fill
+      "new:text,n:float,added:text", // the drop (`gone` was never declared)
+      "new:text,n:float,added:text" // the full registration restored at the end
+    ]);
+  });
+});
