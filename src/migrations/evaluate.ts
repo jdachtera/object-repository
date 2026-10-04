@@ -7,7 +7,7 @@
  * the point: a blocker discovered after an earlier migration's contract already executed is a
  * post-mortem, not a safeguard.
  */
-import { classify, narrowingRetypes, opsHash, OpRecorder, splitPhases } from "./ops.ts";
+import { classify, narrowingRetypes, phaseReorders, opsHash, OpRecorder, splitPhases } from "./ops.ts";
 import { rowId, type JournalRow } from "./journal.ts";
 import type { DeferredContract, Migration, MigrationBlocker, MigrationOp } from "./types.ts";
 
@@ -116,6 +116,7 @@ export async function evaluateMigrations(
     const recorder = new OpRecorder();
     await migration.up(recorder);
     blockers.push(...narrowingRetypes(migration.name, recorder.ops));
+    if (migration.schemaVersion !== undefined) blockers.push(...phaseReorders(migration.name, recorder.ops));
     const bodyHash = opsHash(recorder.ops);
     const open = gateOpen(migration, minSupported);
 

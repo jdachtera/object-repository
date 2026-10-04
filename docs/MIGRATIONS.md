@@ -205,6 +205,16 @@ rather than insert a duplicate); a `uuid` it leaves out is kept. What it changed
 each record before and after, so a field it forgot to list in `fields` is still written on every store.
 It sees every physical column, including one the model has stopped declaring.
 
+A unique `addIndex` over data that already holds duplicates fails the run with `UniqueConstraintError`
+on every store, before any store tries to build it. A key with a null or absent part isn't enforced,
+as in SQL.
+
+In a migration with a `schemaVersion`, the contract steps run later than the expand steps written
+after them. A contract step followed by an expand step on the same field — a drop and then an add of
+the same name, a rename and then a retype of either half, anything withheld on a model before a
+`transform` of it — would change meaning, so it is refused (`PHASE_REORDER`). Reorder the steps or
+split the migration.
+
 A value converted by a retype, a fill or a typed copy lands as the same stored value on every
 store. One that can't be converted exactly (`"abc"` to a number, `3.7` to an integer) fails the run
 rather than being stored as a guess.

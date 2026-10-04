@@ -7,8 +7,9 @@ import fc from "fast-check";
 import { isWidening } from "../migrations/ops.js";
 import { everything } from "../migrations/paging.js";
 import { SYSTEM_CONTEXT, type JsonObject, type JsonValue } from "../core/types.js";
-import type { Backend, FieldSpec } from "../core/Backend.js";
+import type { Backend, FieldSpec, IndexSpec } from "../core/Backend.js";
 import type { Migration, MigrationBuilder, RecordTransform, StoredType } from "../migrations/types.js";
+import { rollbackMigrations, runMigrations, type RunnerOptions } from "../migrations/run.js";
 
 const ctx = SYSTEM_CONTEXT;
 export const MODEL = "Prop";
@@ -69,7 +70,7 @@ export function recordsOf(layout: FieldSpec[], max = 6): fc.Arbitrary<JsonObject
 
 /** An intent, turned into a valid step against whatever layout the steps before it left. */
 export interface Intent {
-  kind: "add" | "drop" | "rename" | "copy" | "retype" | "transform";
+  kind: "add" | "drop" | "rename" | "copy" | "retype" | "transform" | "index" | "unindex";
   pick: number;
   pick2: number;
   type: StoredType;
@@ -77,6 +78,8 @@ export interface Intent {
   overwrite: boolean;
   seed: number;
 }
+
+export const ALL_KINDS: Intent["kind"][] = ["add", "drop", "rename", "copy", "retype", "transform", "index", "unindex"];
 
 export function intentArb(kinds: Intent["kind"][] = ["add", "drop", "rename", "copy", "retype"]): fc.Arbitrary<Intent> {
   return fc.record({
@@ -94,8 +97,14 @@ export type Step = (m: MigrationBuilder) => void;
 
 export interface Plan {
   steps: Step[];
+  /** The steps undoing `steps`, in the order a rollback runs them; `null` when one can't be undone. */
+  down: Step[] | null;
   describe: string[];
+  /** The layout before the steps. */
+  initial: FieldSpec[];
   final: FieldSpec[];
+  /** The indexes the steps leave, for the application's layout. */
+  indexes: IndexSpec[];
   transforms: Record<string, RecordTransform>;
 }
 
@@ -105,6 +114,17 @@ export function plan(initial: FieldSpec[], intents: Intent[]): Plan {
   const steps: Step[] = [];
   const describe: string[] = [];
   const transforms: Record<string, RecordTransform> = {};
+  const indexes = new Map<string, IndexSpec>();
+  // Built back to front: each step's inverse goes first. A retype has none (narrowing is refused).
+  let down: Step[] | null = [];
+  const undo = (step: Step | null) => {
+    if (!step) down = null;
+    else down?.unshift(step);
+  };
+  /** A field leaving under its name takes its indexes' tracking with it (a SQL index follows the column). */
+  const forget = (field: string) => {
+    for (const [name, index] of indexes) if (index.fields[0]!.path === field) indexes.delete(name);
+  };
   for (const intent of intents) {
     const present = [...layout.keys()];
     const absent = NAMES.filter((name) => !layout.has(name));
@@ -115,6 +135,7 @@ export function plan(initial: FieldSpec[], intents: Intent[]): Plan {
         const field = absent[intent.pick % absent.length]!;
         const fill = intent.fill ? fc.sample(valueOf(intent.type), { seed: intent.seed, numRuns: 1 })[0] : undefined;
         steps.push((m) => m.addField(MODEL, field, intent.type, fill === undefined ? undefined : { fill }));
+        undo((m) => m.dropField(MODEL, field));
         describe.push(`addField ${field}:${intent.type}${fill === undefined ? "" : ` fill=${JSON.stringify(fill)}`}`);
         layout.set(field, intent.type);
         break;
@@ -124,7 +145,10 @@ export function plan(initial: FieldSpec[], intents: Intent[]): Plan {
         const field = pickPresent(intent.pick);
         steps.push((m) => m.dropField(MODEL, field));
         describe.push(`dropField ${field}`);
+        const type = layout.get(field)!;
+        undo((m) => m.addField(MODEL, field, type)); // the schema back, not the values: a rollback refuses
         layout.delete(field);
+        forget(field);
         break;
       }
       case "rename": {
@@ -133,7 +157,9 @@ export function plan(initial: FieldSpec[], intents: Intent[]): Plan {
         const to = absent[intent.pick2 % absent.length]!;
         const type = layout.get(from)!;
         steps.push((m) => m.renameField(MODEL, from, to, type));
+        undo((m) => m.renameField(MODEL, to, from, type));
         describe.push(`renameField ${from}→${to}:${type}`);
+        forget(from);
         layout.delete(from);
         layout.set(to, type);
         break;
@@ -155,6 +181,7 @@ export function plan(initial: FieldSpec[], intents: Intent[]): Plan {
         const from = layout.get(field)!;
         if (from === intent.type || !isWidening(from, intent.type)) continue;
         steps.push((m) => m.retypeField(MODEL, field, from, intent.type));
+        undo(null);
         describe.push(`retypeField ${field} ${from}→${intent.type}`);
         layout.set(field, intent.type);
         break;
@@ -167,16 +194,100 @@ export function plan(initial: FieldSpec[], intents: Intent[]): Plan {
         const id = `times10_${steps.length}`;
         transforms[id] = (row) => (typeof row[field] === "number" ? { ...row, [field]: (row[field] as number) * 10 } : row);
         steps.push((m) => m.transform(MODEL, id, [field], undefined, { phase: "expand" }));
+        const inverse = `div10_${steps.length}`;
+        transforms[inverse] = (row) => (typeof row[field] === "number" ? { ...row, [field]: (row[field] as number) / 10 } : row);
+        undo((m) => m.transform(MODEL, inverse, [field], undefined, { phase: "expand" }));
         describe.push(`transform ${field} ×10`);
+        break;
+      }
+      case "index": {
+        // On a field of a type every store can index directly; `overwrite` doubles as "unique".
+        const candidates = present.filter((name) => ["text", "integer", "float", "boolean"].includes(layout.get(name)!));
+        if (!candidates.length) continue;
+        const field = candidates[intent.pick % candidates.length]!;
+        const name = `i_${field}`;
+        if (indexes.has(name)) continue;
+        const index: IndexSpec = { name, fields: [{ path: field }], ...(intent.overwrite ? { unique: true } : {}) };
+        steps.push((m) => m.addIndex(MODEL, index));
+        undo((m) => m.dropIndex(MODEL, name));
+        describe.push(`addIndex ${name}${intent.overwrite ? " unique" : ""}`);
+        indexes.set(name, index);
+        break;
+      }
+      case "unindex": {
+        const names = [...indexes.keys()];
+        if (!names.length) continue;
+        const name = names[intent.pick % names.length]!;
+        const index = indexes.get(name)!;
+        steps.push((m) => m.dropIndex(MODEL, name));
+        undo((m) => m.addIndex(MODEL, index));
+        describe.push(`dropIndex ${name}`);
+        indexes.delete(name);
         break;
       }
     }
   }
-  return { steps, describe, final: [...layout].map(([name, type]) => ({ name, type })), transforms };
+  return { steps, down, describe, initial, final: [...layout].map(([name, type]) => ({ name, type })), indexes: [...indexes.values()], transforms };
 }
 
-export function migrationOf(planned: Plan): Migration {
-  return { name: "0001_random", transforms: planned.transforms, up: (m) => planned.steps.forEach((step) => step(m)) };
+export function migrationOf(planned: Plan, schemaVersion?: number): Migration {
+  const down = planned.down;
+  return {
+    name: "0001_random",
+    ...(schemaVersion === undefined ? {} : { schemaVersion }),
+    transforms: planned.transforms,
+    up: (m) => planned.steps.forEach((step) => step(m)),
+    ...(down ? { down: (m: MigrationBuilder) => down.forEach((step) => step(m)) } : {})
+  };
+}
+
+/**
+ * How a scenario is deployed:
+ * - `plain`: one `migrate()`, the whole migration at once.
+ * - `gated`: versioned, over two deploys — the expand half, then the contract half once released.
+ * - `rollback`: migrated, then rolled back by the build before it.
+ */
+export type Mode = "plain" | "gated" | "rollback";
+export const MODES: Mode[] = ["plain", "gated", "rollback"];
+
+/** One deploy: a runner call against `backend`, given the options it shares with the others. */
+export type Deploy = (backend: Backend, options: RunnerOptions) => Promise<unknown>;
+
+export interface Script {
+  deploys: Deploy[];
+  /** The layout the application reads the result with: the build that ran last. */
+  read: FieldSpec[];
+}
+
+export function scriptOf(planned: Plan, mode: Mode): Script {
+  // The application's layout declares the indexes the migration leaves, unique ones aside: declared
+  // over data that still holds duplicates (its contract not yet released), IndexedDB fails the next
+  // operation once to say so, by design. The migration's own `addIndex` steps cover unique indexes.
+  const after = { [MODEL]: { fields: planned.final, indexes: planned.indexes.filter((index) => !index.unique) } };
+  switch (mode) {
+    case "plain":
+      return { deploys: [(b, o) => runMigrations(b, [migrationOf(planned)], { ...o, models: after })], read: planned.final };
+    case "gated": {
+      const migration = migrationOf(planned, 2);
+      return {
+        deploys: [
+          (b, o) => runMigrations(b, [migration], { ...o, models: after, schemaVersion: 2, minSupportedSchemaVersion: 1 }),
+          (b, o) => runMigrations(b, [migration], { ...o, models: after, schemaVersion: 2, minSupportedSchemaVersion: 2, applyContracts: true })
+        ],
+        read: planned.final
+      };
+    }
+    case "rollback": {
+      const before = { [MODEL]: { fields: planned.initial, indexes: [] } };
+      return {
+        deploys: [
+          (b, o) => runMigrations(b, [migrationOf(planned)], { ...o, models: after }),
+          (b, o) => rollbackMigrations(b, [migrationOf(planned)], 1, { ...o, models: before })
+        ],
+        read: planned.initial
+      };
+    }
+  }
 }
 
 // --- stores -------------------------------------------------------------------------------------

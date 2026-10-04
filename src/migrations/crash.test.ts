@@ -21,22 +21,24 @@ import { SQLiteBackend } from "../backends/sqlite/SQLiteBackend.js";
 import { IndexedDBBackend } from "../backends/indexeddb/IndexedDBBackend.js";
 import { PostgresBackend } from "../backends/sql/PostgresBackend.js";
 import { MySqlBackend } from "../backends/sql/MySqlBackend.js";
-import { runMigrations } from "./run.js";
 import { MigrationLockedError } from "./journal.js";
 import { MigrationInterruptedError } from "./errors.js";
 import type { JsonObject } from "../core/types.js";
 import type { Backend, FieldSpec } from "../core/Backend.js";
 import {
+  ALL_KINDS,
   MODEL,
+  MODES,
   exceeds15Digits,
   intentArb,
   layoutArb,
-  migrationOf,
   plan,
   readBack,
   recordsOf,
+  scriptOf,
   seed,
   type Intent,
+  type Mode,
   type Plan
 } from "../testing/migrationScenarios.testutil.js";
 
@@ -298,65 +300,72 @@ const scenarioArb = layoutArb.chain((initial) =>
   fc.record({
     initial: fc.constant(initial),
     rows: recordsOf(initial, 8),
-    intents: fc.array(intentArb(["add", "drop", "rename", "copy", "retype", "transform"]), { minLength: 1, maxLength: 5 }),
+    intents: fc.array(intentArb(ALL_KINDS), { minLength: 1, maxLength: 5 }),
+    mode: fc.constantFrom(...MODES),
     crashAt: fc.nat(),
     after: fc.boolean()
   })
 );
 
-async function reference(initial: FieldSpec[], rows: JsonObject[], planned: Plan): Promise<JsonObject[] | null> {
+type Scenario = { initial: FieldSpec[]; rows: JsonObject[]; intents: Intent[]; mode: Mode };
+
+/** What the scenario's deploys leave on the in-memory reference, or `null` if one is refused. */
+async function reference({ initial, rows, mode }: Scenario, planned: Plan): Promise<JsonObject[] | null> {
   const backend = new InMemoryBackend();
   await seed(backend, initial, rows);
+  const script = scriptOf(planned, mode);
   try {
-    await runMigrations(backend, [migrationOf(planned)], { models: { [MODEL]: { fields: planned.final, indexes: [] } }, skipLock: true, batchSize: BATCH });
+    for (const deploy of script.deploys) await deploy(backend, { skipLock: true, batchSize: BATCH });
   } catch {
-    return null; // the migration itself is refused: not what these properties are about
+    return null; // refused: not what these properties are about
   }
-  return readBack(backend, planned.final);
+  return readBack(backend, script.read);
 }
 
-const options = (planned: Plan, extra: object = {}) => ({
-  models: { [MODEL]: { fields: planned.final, indexes: [] } },
-  batchSize: BATCH,
-  ...extra
-});
-
-type Scenario = { initial: FieldSpec[]; rows: JsonObject[]; intents: Intent[] };
-
-/** How many writes an uninterrupted run of `planned` makes on `store`. */
-async function writesOf(store: Store, { initial, rows }: Scenario, planned: Plan): Promise<number> {
+/** How many writes the uninterrupted deploys make on `store`. */
+async function writesOf(store: Store, { initial, rows, mode }: Scenario, planned: Plan): Promise<number> {
   const dry = (await store.open())!;
   const counter = new Crasher(Number.POSITIVE_INFINITY, false);
   try {
     await seed(dry.backend(), initial, rows);
-    await runMigrations(dry.backend(counter), [migrationOf(planned)], options(planned, { skipLock: true }));
+    for (const deploy of scriptOf(planned, mode).deploys) await deploy(dry.backend(counter), { skipLock: true, batchSize: BATCH });
   } finally {
     await dry.close();
   }
   return counter.count;
 }
 
-/** Crash the run at write `at` (before or after it lands), restart it, and return what it left. */
-async function crashThenRestart(store: Store, { initial, rows }: Scenario, planned: Plan, at: number, after: boolean): Promise<JsonObject[]> {
+/**
+ * Crash at write `at` (before or after it lands), wherever in the deploys it falls; restart the deploy
+ * it fell in, then run the rest; return what they left.
+ */
+async function crashThenRestart(store: Store, { initial, rows, mode }: Scenario, planned: Plan, at: number, after: boolean): Promise<JsonObject[]> {
   const storage = (await store.open())!;
+  const script = scriptOf(planned, mode);
   try {
     await seed(storage.backend(), initial, rows);
     const crasher = new Crasher(at, after, storage.inspect);
-    try {
-      await runMigrations(storage.backend(crasher), [migrationOf(planned)], options(planned, { skipLock: true }));
-    } catch (error) {
-      if (!(error instanceof Crash)) throw error;
+    let next = 0;
+    for (; next < script.deploys.length; next++) {
+      try {
+        await script.deploys[next]!(storage.backend(crasher), { skipLock: true, batchSize: BATCH });
+      } catch (error) {
+        if (!(error instanceof Crash)) throw error;
+        break;
+      }
     }
     // A restart: a fresh backend over the same storage, nothing in memory carried over. Only a store
     // that can't commit a page with its marker may ask the operator about one page.
-    try {
-      await runMigrations(storage.backend(), [migrationOf(planned)], options(planned, { skipLock: true }));
-    } catch (error) {
-      if (!(error instanceof MigrationInterruptedError) || !store.answer) throw error;
-      const interruptedPage = store.answer(crasher);
-      await runMigrations(storage.backend(), [migrationOf(planned)], options(planned, { skipLock: true, interruptedPage }));
+    for (let index = next; index < script.deploys.length; index++) {
+      const deploy = script.deploys[index]!;
+      try {
+        await deploy(storage.backend(), { skipLock: true, batchSize: BATCH });
+      } catch (error) {
+        if (!(error instanceof MigrationInterruptedError) || !store.answer || index !== next) throw error;
+        await deploy(storage.backend(), { skipLock: true, batchSize: BATCH, interruptedPage: store.answer(crasher) });
+      }
     }
-    return await readBack(storage.backend(), planned.final);
+    return await readBack(storage.backend(), script.read);
   } finally {
     await storage.close();
   }
@@ -370,14 +379,16 @@ const REGRESSIONS: Scenario[] = [
   {
     initial: [{ name: "f", type: "scalar" }, { name: "h", type: "array" }, { name: "d", type: "integer" }],
     rows: [{ uuid: "r00", f: "", h: [] }],
-    intents: [I("drop", 2), I("copy", 1), I("rename", 0)]
+    intents: [I("drop", 2), I("copy", 1), I("rename", 0)],
+    mode: "plain"
   },
   // A failed run restored its registrations with the layout it was heading for, provisioning a rename's
   // target early; the retry found the column there and copied a scalar into a still-integer column
   {
     initial: [{ name: "b", type: "integer" }, { name: "g", type: "scalar" }, { name: "h", type: "array" }, { name: "f", type: "text" }],
     rows: [{ uuid: "r00", g: "" }],
-    intents: [I("transform", 0), I("rename", 0), I("rename", 0)]
+    intents: [I("transform", 0), I("rename", 0), I("rename", 0)],
+    mode: "plain"
   }
 ];
 
@@ -389,17 +400,18 @@ describe("a migration interrupted anywhere, then run again", () => {
       await probe.close();
       await fc.assert(
         fc.asyncProperty(scenarioArb, async (scenario) => {
-          const { initial, rows, intents, crashAt, after } = scenario;
+          const { initial, rows, intents, mode, crashAt, after } = scenario;
           const planned = plan(initial, intents);
           if (!planned.steps.length) return;
           fc.pre(!(store.name === "MySQL (real)" && mariaDb && exceeds15Digits(rows)));
-          const expected = await reference(initial, rows, planned);
+          const expected = await reference(scenario, planned);
           fc.pre(expected !== null);
-          // Count the writes an uninterrupted run makes, so the crash always falls inside the run.
+          // Count the writes the uninterrupted deploys make, so the crash always falls inside them.
           const count = await writesOf(store, scenario, planned);
           fc.pre(count > 0);
           const actual = await crashThenRestart(store, scenario, planned, 1 + (crashAt % count), after);
-          expect({ steps: planned.describe, crashAt, after, rows: actual }).toEqual({ steps: planned.describe, crashAt, after, rows: expected });
+          const steps = [`(${mode})`, ...planned.describe];
+          expect({ steps, crashAt, after, rows: actual }).toEqual({ steps, crashAt, after, rows: expected });
         }),
         { numRuns: RUNS, ...(SEED === undefined ? {} : { seed: SEED }) }
       );
@@ -411,7 +423,7 @@ describe("a migration interrupted anywhere, then run again", () => {
       await probe.close();
       for (const scenario of REGRESSIONS) {
         const planned = plan(scenario.initial, scenario.intents);
-        const expected = await reference(scenario.initial, scenario.rows, planned);
+        const expected = await reference(scenario, planned);
         const count = await writesOf(store, scenario, planned);
         for (let at = 1; at <= count; at++) {
           for (const after of [false, true]) {
@@ -435,17 +447,15 @@ describe("two runners started together", () => {
           const planned = plan(initial, intents);
           if (!planned.steps.length) return;
           fc.pre(!(store.name === "MySQL (real)" && mariaDb && exceeds15Digits(rows)));
-          const expected = await reference(initial, rows, planned);
+          const expected = await reference({ initial, rows, intents, mode: "plain" }, planned);
           fc.pre(expected !== null);
 
           const storage = (await store.open())!;
           try {
             await seed(storage.backend(), initial, rows);
             // Both hold the lease protocol; one runs, the other is turned away or finds it done.
-            const both = await Promise.allSettled([
-              runMigrations(storage.backend(), [migrationOf(planned)], options(planned)),
-              runMigrations(storage.backend(), [migrationOf(planned)], options(planned))
-            ]);
+            const [deploy] = scriptOf(planned, "plain").deploys;
+            const both = await Promise.allSettled([deploy!(storage.backend(), { batchSize: BATCH }), deploy!(storage.backend(), { batchSize: BATCH })]);
             for (const result of both) {
               if (result.status === "rejected") expect(result.reason).toBeInstanceOf(MigrationLockedError);
             }

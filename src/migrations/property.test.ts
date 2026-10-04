@@ -26,21 +26,23 @@ import { IndexedDBBackend } from "../backends/indexeddb/IndexedDBBackend.js";
 import { PostgresBackend } from "../backends/sql/PostgresBackend.js";
 import { MySqlBackend } from "../backends/sql/MySqlBackend.js";
 import { MongoBackend } from "../backends/mongo/MongoBackend.js";
-import { runMigrations } from "./run.js";
 import type { JsonObject } from "../core/types.js";
 import type { Backend, FieldSpec } from "../core/Backend.js";
 import type { StoredType } from "./types.js";
 import {
+  ALL_KINDS,
   MODEL,
+  MODES,
   exceeds15Digits,
   intentArb,
   layoutArb,
-  migrationOf,
   plan,
   readBack,
   recordsOf,
+  scriptOf,
   seed,
   type Intent,
+  type Mode,
   type Plan
 } from "../testing/migrationScenarios.testutil.js";
 
@@ -50,14 +52,18 @@ const SEED = process.env.PROPERTY_SEED === undefined ? undefined : Number(proces
 
 type Outcome = { refused: string } | { rows: JsonObject[] };
 
-async function outcome(backend: Backend, initial: FieldSpec[], rows: JsonObject[], planned: Plan): Promise<Outcome> {
+/** Every deploy of the scenario's script in turn; the first refusal ends it. */
+async function outcome(backend: Backend, initial: FieldSpec[], rows: JsonObject[], planned: Plan, mode: Mode): Promise<Outcome> {
   await seed(backend, initial, rows);
-  try {
-    await runMigrations(backend, [migrationOf(planned)], { models: { [MODEL]: { fields: planned.final, indexes: [] } }, skipLock: true });
-  } catch (error) {
-    return { refused: (error as Error).name };
+  const script = scriptOf(planned, mode);
+  for (const deploy of script.deploys) {
+    try {
+      await deploy(backend, { skipLock: true });
+    } catch (error) {
+      return { refused: (error as Error).name };
+    }
   }
-  return { rows: await readBack(backend, planned.final) };
+  return { rows: await readBack(backend, script.read) };
 }
 
 // --- backends -----------------------------------------------------------------------------------
@@ -152,7 +158,7 @@ const BACKENDS: Array<[string, () => Promise<Backend | null>]> = [
 // documents, and real Postgres covers the same lowering.
 void newDb;
 
-type Scenario = { initial: FieldSpec[]; rows: JsonObject[]; intents: Intent[] };
+type Scenario = { initial: FieldSpec[]; rows: JsonObject[]; intents: Intent[]; mode: Mode };
 const I = (kind: Intent["kind"], pick: number, pick2: number, type: StoredType = "text", overwrite = false): Intent => ({
   kind,
   pick,
@@ -162,8 +168,9 @@ const I = (kind: Intent["kind"], pick: number, pick2: number, type: StoredType =
   overwrite,
   seed: 0
 });
+const plain = (scenario: Omit<Scenario, "mode">): Scenario => ({ ...scenario, mode: "plain" });
 /** Every counterexample these properties have found, shrunk: run first, on every run. */
-const REGRESSIONS: Scenario[] = [
+const REGRESSIONS: Scenario[] = ([
   // float → json: MySQL renders 1e15 its own way
   { initial: [{ name: "h", type: "text" }, { name: "b", type: "array" }, { name: "d", type: "float" }], rows: [{ uuid: "r0", d: 1e15 }, { uuid: "r1" }], intents: [I("retype", 1001519696, 0, "json")] },
   // a copy into a field a later step renames: registered as catalog text, the array reached Postgres raw
@@ -195,13 +202,14 @@ const REGRESSIONS: Scenario[] = [
     rows: [{ uuid: "r0", g: 0 }],
     intents: [I("rename", 0, 0), I("copy", 1782889749, 642242670), I("drop", 517760001, 0)]
   }
-];
+] as Array<Omit<Scenario, "mode">>).map(plain);
 
 const scenarioArb = layoutArb.chain((initial) =>
   fc.record({
     initial: fc.constant(initial),
     rows: recordsOf(initial),
-    intents: fc.array(intentArb(["add", "drop", "rename", "copy", "retype", "transform"]), { minLength: 1, maxLength: 5 })
+    intents: fc.array(intentArb(ALL_KINDS), { minLength: 1, maxLength: 5 }),
+    mode: fc.constantFrom(...MODES)
   })
 );
 
@@ -211,14 +219,14 @@ describe("random migrations over random records", () => {
       const probe = await make();
       if (!probe) return context.skip();
       await fc.assert(
-        fc.asyncProperty(scenarioArb, async ({ initial, rows, intents }) => {
+        fc.asyncProperty(scenarioArb, async ({ initial, rows, intents, mode }) => {
           const planned = plan(initial, intents);
-          const description = planned.describe;
+          const description = [`(${mode})`, ...planned.describe];
           if (!planned.steps.length) return;
           fc.pre(!(name === "MySQL (real)" && mariaDb && exceeds15Digits(rows)));
-          const expected = await outcome(new InMemoryBackend(), initial, rows, planned);
+          const expected = await outcome(new InMemoryBackend(), initial, rows, planned, mode);
           const backend = (await make())!;
-          const actual = await outcome(backend, initial, rows, planned);
+          const actual = await outcome(backend, initial, rows, planned, mode);
           (backend as Partial<{ close(): void }>).close?.();
           expect({ steps: description, ...actual }).toEqual({ steps: description, ...expected });
         }),

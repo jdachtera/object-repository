@@ -3,10 +3,14 @@
  * no store is involved.
  */
 import { describe, it, expect } from "vitest";
-import { OpRecorder, classify, isWidening, splitPhases, phaseOps, downOps, opsHash, assertNoNarrowingRetype } from "./ops.js";
+import { OpRecorder, classify, isWidening, splitPhases, phaseOps, downOps, opsHash, assertNoNarrowingRetype, phaseReorders } from "./ops.js";
+import { runMigrations } from "./run.js";
+import { InMemoryBackend } from "../backends/memory/InMemoryBackend.js";
+import { UniqueConstraintError } from "../backends/util/unique.js";
+import { SYSTEM_CONTEXT, type JsonObject } from "../core/types.js";
 import { MigrationBlockedError, MigrationNotSupportedError, SchemaUnknownError, SchemaVersionError } from "./errors.js";
 import { eq } from "../expressions/index.js";
-import type { MigrationOp } from "./types.js";
+import type { Migration, MigrationOp } from "./types.js";
 
 const record = (build: (m: OpRecorder) => void): MigrationOp[] => {
   const recorder = new OpRecorder();
@@ -77,12 +81,12 @@ describe("renameField decomposition", () => {
     expect(splitPhases(ops, false)).toEqual({
       expand: [
         { kind: "addField", model: "User", field: "fullName", type: "text" },
-        { kind: "copyField", model: "User", from: "name", to: "fullName", type: "text", overwrite: false }
+        { kind: "copyField", model: "User", from: "name", to: "fullName", type: "text", overwrite: false, fromType: "text" }
       ],
       contract: [
         // The step everybody forgets: old writers kept writing `name` for the whole window, so the
         // drop must be preceded by a copy that DOES overwrite.
-        { kind: "copyField", model: "User", from: "name", to: "fullName", type: "text", overwrite: true, exact: true },
+        { kind: "copyField", model: "User", from: "name", to: "fullName", type: "text", overwrite: true, exact: true, fromType: "text" },
         { kind: "dropField", model: "User", field: "name", closes: { renamedTo: "fullName" } }
       ]
     });
@@ -290,5 +294,68 @@ describe("opsHash", () => {
       m.addField("User", "a", "text");
     });
     expect(opsHash(a)).not.toBe(opsHash(b));
+  });
+});
+
+describe("a versioned migration whose split would reorder it", () => {
+  const codes = (ops: MigrationOp[]) => phaseReorders("m", ops).map((blocker) => blocker.code);
+  const add = (field: string): MigrationOp => ({ kind: "addField", model: "U", field, type: "text" });
+  const drop = (field: string): MigrationOp => ({ kind: "dropField", model: "U", field });
+  const rename = (from: string, to: string): MigrationOp => ({ kind: "renameField", model: "U", from, to, type: "text" });
+
+  it("refuses an expand step after a contract step on the same field", () => {
+    expect(codes([drop("x"), add("x")])).toEqual(["PHASE_REORDER"]); // the late drop deletes the new field
+    expect(codes([rename("a", "b"), add("a")])).toEqual(["PHASE_REORDER"]); // a is still the legacy field
+    expect(codes([rename("a", "b"), { kind: "retypeField", model: "U", field: "b", from: "text", to: "json" }])).toEqual(["PHASE_REORDER"]);
+    expect(codes([{ kind: "copyField", model: "U", from: "a", to: "b", type: "text", overwrite: true }, { kind: "copyField", model: "U", from: "b", to: "c", type: "text", overwrite: false }])).toEqual([
+      "PHASE_REORDER"
+    ]);
+    // A transform sees whole records: anything withheld on the model before it would still be there.
+    expect(codes([drop("x"), { kind: "transform", model: "U", transform: "t", fields: ["y"], phase: "expand" }])).toEqual(["PHASE_REORDER"]);
+    expect(codes([{ kind: "addIndex", model: "U", index: { name: "i", fields: [{ path: "x" }], unique: true } }, add("x")])).toEqual(["PHASE_REORDER"]);
+  });
+
+  it("allows steps the split leaves in order", () => {
+    expect(codes([add("x"), drop("x")])).toEqual([]); // expand then contract: the split keeps that order
+    expect(codes([drop("x"), add("y")])).toEqual([]); // different fields
+    expect(codes([drop("x"), { kind: "addField", model: "V", field: "x", type: "text" }])).toEqual([]); // different models
+    expect(codes([rename("a", "b"), add("c")])).toEqual([]);
+    expect(codes([drop("x"), drop("y")])).toEqual([]); // contract after contract keeps its order
+  });
+
+  it("is checked only for a migration the split applies to", async () => {
+    const backend = new InMemoryBackend();
+    const reorder = (schemaVersion?: number): Migration => ({
+      name: "m",
+      ...(schemaVersion === undefined ? {} : { schemaVersion }),
+      up: (m) => {
+        m.dropField("U", "x");
+        m.addField("U", "x", "text");
+      }
+    });
+    const models = { U: { fields: [], indexes: [] } };
+    await expect(runMigrations(backend, [reorder(2)], { models, schemaVersion: 2 })).rejects.toMatchObject({ blockers: [{ code: "PHASE_REORDER" }] });
+    await expect(runMigrations(new InMemoryBackend(), [reorder()], { models })).resolves.toMatchObject({ applied: ["m"] });
+  });
+});
+
+describe("a unique index over data that already violates it", () => {
+  const models = { U: { fields: [], indexes: [] } };
+  const unique = (field: string): Migration => ({ name: `u_${field}`, up: (m) => m.addIndex("U", { name: field, fields: [{ path: field }], unique: true }) });
+  async function seeded(rows: JsonObject[]) {
+    const backend = new InMemoryBackend();
+    for (const row of rows) backend.save("U", row, SYSTEM_CONTEXT);
+    await backend.persist(SYSTEM_CONTEXT);
+    return backend;
+  }
+
+  it("is refused with the same error on every store, before any store builds it", async () => {
+    const backend = await seeded([{ uuid: "a", email: "x" }, { uuid: "b", email: "x" }]);
+    await expect(runMigrations(backend, [unique("email")], { models, batchSize: 1 })).rejects.toBeInstanceOf(UniqueConstraintError);
+  });
+
+  it("allows any number of records without a value, as SQL does", async () => {
+    const backend = await seeded([{ uuid: "a" }, { uuid: "b", email: null }, { uuid: "c", email: "x" }]);
+    await expect(runMigrations(backend, [unique("email")], { models })).resolves.toMatchObject({ applied: ["u_email"] });
   });
 });

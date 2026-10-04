@@ -11,7 +11,9 @@
  * Contracts whose gate has cleared are reported as `releasable` and wait for someone to say so.
  */
 import type { Backend, FieldSpec } from "../core/Backend.ts";
-import { isMigrationLowering, isSchemaAware, isTransactional, migrationTarget } from "../core/Backend.ts";
+import { isMigrationLowering, isModelProbing, isSchemaAware, isTransactional, migrationTarget } from "../core/Backend.ts";
+import { UniqueConstraintError, uniqueKey } from "../backends/util/unique.ts";
+import { everything, pageByUuid } from "./paging.ts";
 import type { Context } from "../core/types.ts";
 import { SYSTEM_CONTEXT } from "../core/types.ts";
 import { generateUuid } from "../core/uuid.ts";
@@ -575,6 +577,7 @@ async function executeOps(
     const { checkpoint, heartbeat, beforePage, holdLease, recordLowered, completed } = typeof hooks === "function" ? hooks(index) : hooks;
     // A natively lowered op writes too (MySQL's DDL commits at once): prove the lease before it.
     await holdLease?.();
+    if (op.kind === "addIndex" && op.index.unique) await assertUnique(backend, op.model, op.index.fields.map((field) => field.path), options);
     const lowered = !isMigrationLowering(backend)
       ? null
       : recordLowered && backend.lowerMigrationOpRecorded
@@ -618,6 +621,25 @@ async function executeOps(
     });
     followLayout(options, op);
     await completed?.();
+  }
+}
+
+/**
+ * Refuse a unique index the data already violates, before any store tries to build it. Each store
+ * fails differently on its own — a driver error naming its own index, an IndexedDB upgrade that has to
+ * be undone, or (the in-memory reference) nothing at all — so the same migration would stop on one
+ * store and quietly succeed on another. A key with a null or absent part isn't enforced, as in SQL.
+ */
+async function assertUnique(backend: Backend, model: string, fields: string[], options: Running): Promise<void> {
+  if (isModelProbing(backend) && !(await backend.hasModel(model))) return;
+  const seen = new Set<string>();
+  for await (const page of pageByUuid(backend, model, everything(), options.batchSize ?? DEFAULT_BATCH, options.ctx)) {
+    for (const row of page.rows) {
+      const key = uniqueKey(row, fields);
+      if (key === null) continue;
+      if (seen.has(key)) throw new UniqueConstraintError(model, fields);
+      seen.add(key);
+    }
   }
 }
 

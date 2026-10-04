@@ -236,8 +236,11 @@ function desugar(ops: MigrationOp[]): PhasedOps {
   for (const op of ops) {
     if (op.kind === "renameField") {
       expand.push({ kind: "addField", model: op.model, field: op.to, type: op.type });
-      expand.push({ kind: "copyField", model: op.model, from: op.from, to: op.to, type: op.type, overwrite: false });
-      contract.push({ kind: "copyField", model: op.model, from: op.from, to: op.to, type: op.type, overwrite: true, exact: true });
+      // Both halves of a rename hold the rename's type. Said explicitly, because the legacy field is in
+      // no layout once the application has moved on: read by the catalog alone, a scalar's JSON text
+      // comes back as plain text, and the release copies `"0"` over `0`.
+      expand.push({ kind: "copyField", model: op.model, from: op.from, to: op.to, type: op.type, overwrite: false, fromType: op.type });
+      contract.push({ kind: "copyField", model: op.model, from: op.from, to: op.to, type: op.type, overwrite: true, exact: true, fromType: op.type });
       contract.push({ kind: "dropField", model: op.model, field: op.from, closes: { renamedTo: op.to } });
       continue;
     }
@@ -258,6 +261,82 @@ export function narrowingRetypes(migration: string, ops: MigrationOp[]): Migrati
     });
   }
   return blockers;
+}
+
+/**
+ * A versioned migration runs in two halves: its expand steps now, its contract steps (drops, an
+ * overwriting copy, a unique index, a rename's release) only once released. A contract step written
+ * *before* an expand step that touches the same field therefore runs after it, not before — and the
+ * migration means something else: a field dropped and re-added is deleted by the late drop, a retyped
+ * rename target gets the late re-copy in the old type, a transform sees a field that was meant to be
+ * gone. Refused, naming the pair: reorder them, or put the later step in a migration of its own.
+ */
+export function phaseReorders(migration: string, ops: MigrationOp[]): MigrationBlocker[] {
+  const blockers: MigrationBlocker[] = [];
+  const deferred: Array<{ op: MigrationOp; touches: string[] }> = [];
+  for (const op of ops) {
+    const touches = touched(op);
+    if (classify(op) === "expand") {
+      const earlier = deferred.find((entry) => overlaps(entry.touches, touches));
+      if (earlier) {
+        blockers.push({
+          code: "PHASE_REORDER",
+          migration,
+          message: `"${migration}" has a ${describeOp(earlier.op)} before a ${describeOp(op)} on the same field. With a schemaVersion the first is a contract step, withheld until released, so it would run after the second rather than before. Reorder them, or move the second into a later migration.`
+        });
+      }
+    } else {
+      deferred.push({ op, touches });
+    }
+  }
+  return blockers;
+}
+
+/** The `model\0field` keys an op reads or writes; `model\0*` for one that sees whole records. */
+function touched(op: MigrationOp): string[] {
+  if (!("model" in op)) return [];
+  const key = (field: string) => `${op.model}\0${field}`;
+  switch (op.kind) {
+    case "addField":
+    case "dropField":
+    case "retypeField":
+      return [key(op.field)];
+    case "renameField":
+    case "copyField":
+      return [key(op.from), key(op.to)];
+    case "addIndex":
+      return [...op.index.fields.map((field) => key(field.path)), key(`#${op.index.name}`)];
+    case "dropIndex":
+      return [key(`#${op.index}`)];
+    default:
+      return [key("*")]; // a transform, a model created or dropped
+  }
+}
+
+function overlaps(a: string[], b: string[]): boolean {
+  const model = (key: string) => key.slice(0, key.indexOf("\0"));
+  return a.some((x) => b.some((y) => x === y || (model(x) === model(y) && (x.endsWith("\0*") || y.endsWith("\0*")))));
+}
+
+function describeOp(op: MigrationOp): string {
+  if (!("model" in op)) return op.kind;
+  switch (op.kind) {
+    case "addField":
+    case "dropField":
+    case "retypeField":
+      return `${op.kind}(${op.model}.${op.field})`;
+    case "renameField":
+    case "copyField":
+      return `${op.kind}(${op.model}.${op.from} → ${op.to})`;
+    case "addIndex":
+      return `addIndex(${op.model}.${op.index.name})`;
+    case "dropIndex":
+      return `dropIndex(${op.model}.${op.index})`;
+    case "transform":
+      return `transform(${op.model}, ${op.transform})`;
+    default:
+      return `${op.kind}(${op.model})`;
+  }
 }
 
 /** Refuse a narrowing retype before anything runs. */
