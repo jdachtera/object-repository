@@ -55,7 +55,9 @@ jobs:
       - run: pnpm run typecheck
       # The full suite, live engines included — the pre-commit hook excludes them, so this is the only
       # place they gate anything.
-      - run: pnpm exec vitest run --coverage --coverage.reporter=text
+      # The github-actions reporter turns each failing test into a check annotation, readable through the
+      # API, where the job log is buried under the service containers' shutdown output.
+      - run: pnpm exec vitest run --coverage --coverage.reporter=text --reporter=default --reporter=github-actions
       - run: pnpm run build
 
   # Deeper, slower checks than every push needs: every dependency audited, and the property-based
@@ -103,7 +105,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm audit --audit-level moderate
-      - run: pnpm exec vitest run src/migrations/property.test.ts src/migrations/crash.test.ts
+      - run: pnpm exec vitest run src/migrations/property.test.ts src/migrations/crash.test.ts --reporter=default --reporter=github-actions
 
   # Mutation testing of the migration core: too slow for every push (hours), so nightly. The report
   # (reports/mutation/index.html) lists every mutant the tests didn't notice.
