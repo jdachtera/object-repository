@@ -135,9 +135,9 @@ const MYSQL_TYPES: Record<string, string> = {
 };
 
 /** MySQL stored-type tags backed by a TEXT/BLOB column — an index over one needs a key-length prefix. */
-const MYSQL_PREFIXED_TYPES = new Set(["text", "json", "array", "embedded", "scalar"]);
+export const MYSQL_PREFIXED_TYPES = new Set(["text", "json", "array", "embedded", "scalar"]);
 /** Chars of an indexed TEXT column MySQL indexes (255×4B utf8mb4 < InnoDB's 3072B key limit). */
-const MYSQL_INDEX_PREFIX = 255;
+export const MYSQL_INDEX_PREFIX = 255;
 
 /** Reserved overflow column: fields with no declared scalar column (e.g. embedded relations) live here as JSON. */
 export const OVERFLOW_COLUMN = "_extra";

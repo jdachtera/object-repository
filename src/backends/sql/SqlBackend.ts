@@ -36,7 +36,7 @@ import { generateUuid } from "../../core/uuid.ts";
 import { reduceAggregatePlan } from "../../expressions/aggregateReduce.ts";
 import { scan } from "../util/scan.ts";
 import { compileAggregate, compileWhere, compileWindow } from "./compile.ts";
-import { encodeValue, fieldTypeOfColumn, OVERFLOW_COLUMN, physicalIndexName, type SqlDialect } from "./dialect.ts";
+import { encodeValue, fieldTypeOfColumn, MYSQL_INDEX_PREFIX, MYSQL_PREFIXED_TYPES, OVERFLOW_COLUMN, physicalIndexName, type SqlDialect } from "./dialect.ts";
 import { runMigrations, rollbackMigrations, MIGRATIONS_TABLE } from "./migrate.ts";
 import type { MigratableBackend, Migration, MigrationReport } from "./migrate.ts";
 import { UniqueConstraintError, uniqueKey, uniqueKeySets, sameBatchConflict } from "../util/unique.ts";
@@ -199,8 +199,9 @@ export class SqlBackend
       result = await this.dropIndexNamed(op.model, op.index);
     } else {
       if (op.kind === "copyField" && !(await this.copiesAsStored(op))) return null;
-      const statements = lowerToSql(op, this.dialect, present, "model" in op ? await this.indexColumnTypes(op) : undefined);
+      let statements = lowerToSql(op, this.dialect, present, "model" in op ? await this.indexColumnTypes(op) : undefined);
       if (!statements) return null;
+      if (op.kind === "retypeField" && this.dialect.name === "mysql") statements = await this.keepingIndexes(op, statements);
       if (retypeThenRewrite(op)) {
         // Convert the column natively, then decline: the reference pass rewrites each value into
         // `coerce()`'s text form (safe to repeat, so no journalling needed here).
@@ -222,6 +223,48 @@ export class SqlBackend
       }, ctx);
     }
     return result;
+  }
+
+  /**
+   * MySQL won't change an indexed column to TEXT: a TEXT column is indexed only with a key-length
+   * prefix, which the index it already has lacks. The column change becomes one ALTER that drops each
+   * index covering it, modifies it, and adds them back with the prefix provisioning would give them.
+   * One statement, so a crash can't leave the indexes dropped.
+   */
+  private async keepingIndexes(op: Extract<MigrationOp, { kind: "retypeField" }>, statements: Statement[]): Promise<Statement[]> {
+    const type = this.dialect.columnType(op.to);
+    const alter = this.dialect.finalize(this.dialect.alterColumnType(op.model, op.field, type));
+    if (!statements.some((statement) => statement.sql === alter)) return statements;
+    const rows = await this.exec.run(
+      "SELECT index_name AS name, column_name AS col, non_unique AS nonUnique, sub_part AS sub, collation AS coll FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name <> 'PRIMARY' ORDER BY index_name, seq_in_index",
+      [op.model]
+    );
+    const indexes = new Map<string, { unique: boolean; columns: Array<{ name: string; sub: number | null; desc: boolean }> }>();
+    for (const row of rows) {
+      const name = String(row.name);
+      const index = indexes.get(name) ?? { unique: Number(row.nonUnique) === 0, columns: [] };
+      index.columns.push({ name: String(row.col), sub: row.sub === null || row.sub === undefined ? null : Number(row.sub), desc: row.coll === "D" });
+      indexes.set(name, index);
+    }
+    const covering = [...indexes].filter(([, index]) => index.columns.some((column) => column.name === op.field));
+    if (!covering.length) return statements;
+    const types = this.columnTypes(op.model);
+    types.set(op.field, op.to);
+    const columns = (index: { columns: Array<{ name: string; sub: number | null; desc: boolean }> }) =>
+      index.columns
+        .map((column) => {
+          const prefix = MYSQL_PREFIXED_TYPES.has(types.get(column.name) ?? "") ? `(${MYSQL_INDEX_PREFIX})` : column.sub ? `(${column.sub})` : "";
+          return `${this.dialect.column(column.name)}${prefix}${column.desc ? " DESC" : ""}`;
+        })
+        .join(", ");
+    const sql =
+      `ALTER TABLE ${this.dialect.ref(op.model)} ` +
+      [
+        ...covering.map(([name]) => `DROP INDEX ${this.dialect.column(name)}`),
+        `MODIFY COLUMN ${this.dialect.column(op.field)} ${type}`,
+        ...covering.map(([name, index]) => `ADD ${index.unique ? "UNIQUE " : ""}INDEX ${this.dialect.column(name)} (${columns(index)})`)
+      ].join(", ");
+    return statements.map((statement) => (statement.sql === alter ? { sql: this.dialect.finalize(sql), params: [] } : statement));
   }
 
   private async runStatements(op: MigrationOp, statements: Statement[], exec: SqlExecutor): Promise<number> {

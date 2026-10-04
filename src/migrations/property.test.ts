@@ -232,6 +232,14 @@ const REGRESSIONS: Scenario[] = ([
       mode: "plain",
       late: []
     },
+    // MySQL 8 won't make an indexed column TEXT without a key-length prefix
+    {
+      initial: [{ name: "b", type: "scalar" }, { name: "d", type: "integer" }, { name: "a", type: "scalar" }, { name: "f", type: "integer" }],
+      rows: [{ uuid: "r00" }],
+      intents: [I("index", 701927631, 0), I("retype", 1043312667, 0), I("add", 0, 0)],
+      mode: "plain",
+      late: []
+    },
     // a copy into a field a unique index of the same run covers: refused by every store but the reference
     {
       initial: [{ name: "g", type: "float" }, { name: "d", type: "array" }, { name: "f", type: "float" }],
