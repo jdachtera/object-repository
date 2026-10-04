@@ -224,6 +224,14 @@ const REGRESSIONS: Scenario[] = ([
       mode: "plain",
       late: []
     },
+    // a unique index over a field no record holds: Mongo indexed every missing value as one `null`
+    {
+      initial: [{ name: "d", type: "text" }, { name: "e", type: "integer" }, { name: "f", type: "json" }],
+      rows: [{ uuid: "r00" }, { uuid: "r01", e: 1 }],
+      intents: [I("index", 0, 0, "text", true)],
+      mode: "plain",
+      late: []
+    },
     // a copy into a field a unique index of the same run covers: refused by every store but the reference
     {
       initial: [{ name: "g", type: "float" }, { name: "d", type: "array" }, { name: "f", type: "float" }],

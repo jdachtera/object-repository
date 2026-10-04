@@ -166,5 +166,10 @@ describe("MongoBackend against a real mongod", () => {
     expect(indexes.find((ix) => ix.name === "ttl")!.expireAfterSeconds).toBe(3600);
     expect(indexes.find((ix) => ix.name === "search")!.key).toMatchObject({ _fts: "text" });
     expect(indexes.find((ix) => ix.name === "partial")!.partialFilterExpression).toEqual({ a: { $exists: true } });
+
+    // As in SQL, a key with a missing or null part isn't enforced; a full duplicate is refused.
+    await collection.insertMany([{ _id: "n1" }, { _id: "n2" }, { _id: "n3", a: null, b: "x" }, { _id: "n4", a: null, b: "x" }] as never);
+    await collection.insertOne({ _id: "d1", a: "1", b: "2" } as never);
+    await expect(collection.insertOne({ _id: "d2", a: "1", b: "2" } as never)).rejects.toMatchObject({ code: 11000 });
   });
 });

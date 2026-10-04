@@ -139,6 +139,9 @@ function toStoredFields(
   return out;
 }
 
+/** Every BSON type a stored value can have but `null`: what a unique index's key fields must hold. */
+const NON_NULL_TYPES = ["double", "string", "object", "array", "binData", "objectId", "bool", "date", "int", "long", "decimal"];
+
 /** The `{ key: encodedId }` filter selecting one record by its model id. */
 function keyFilter(id: string, identity: MongoIdentity): MongoFilter {
   return { [identity.field]: identity.encode(id) };
@@ -245,7 +248,22 @@ export class MongoBackend
         if (index.sparse) options.sparse = true;
         if (index.ttlSeconds !== undefined) options.expireAfterSeconds = index.ttlSeconds;
         if (index.where) options.partialFilterExpression = this.filter(model, index.where);
-        return collection.createIndex(keys, options);
+        else if (index.unique && !index.sparse && !index.text) {
+          // Mongo indexes a missing or null field as `null`, and two nulls collide: a second record
+          // leaving an optional unique field out would be refused. Every other store (and the
+          // migration runner's check) follows SQL, where a key with a null part isn't enforced.
+          // Index only documents holding a value in every key field.
+          options.partialFilterExpression = Object.fromEntries(
+            Object.keys(keys).filter((field) => field !== this.identityFor(model).field).map((field) => [field, { $type: NON_NULL_TYPES }])
+          );
+        }
+        return collection.createIndex(keys, options).catch((error: unknown) => {
+          // A database provisioned before that filter has the index under the same name without it.
+          // Re-creating it with other options fails (IndexOptionsConflict); keep the one there: it
+          // still enforces uniqueness, only stricter about missing values until it is rebuilt.
+          if ((error as { code?: number }).code === 85 && options.partialFilterExpression && !index.where) return undefined;
+          throw error;
+        });
       })
     );
   }

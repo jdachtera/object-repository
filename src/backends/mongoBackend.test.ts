@@ -358,11 +358,24 @@ describe("MongoBackend (round-trip against an in-memory Mongo evaluator)", () =>
 
     expect(byName("ab").keys).toEqual({ a: 1, b: -1 });
     expect((byName("ab").options as { unique?: boolean }).unique).toBe(true);
+    // A record missing (or nulling) a key field isn't indexed, as a SQL unique index ignores NULLs.
+    const nonNull = { $type: ["double", "string", "object", "array", "binData", "objectId", "bool", "date", "int", "long", "decimal"] };
+    expect((byName("ab").options as { partialFilterExpression?: unknown }).partialFilterExpression).toEqual({ a: nonNull, b: nonNull });
     expect((byName("ttl").options as { expireAfterSeconds?: number }).expireAfterSeconds).toBe(3600);
     expect(byName("search").keys).toEqual({ title: "text" });
     expect((byName("partial").options as { partialFilterExpression?: unknown }).partialFilterExpression).toEqual({
       a: { $exists: true }
     });
+  });
+
+  it("keeps a unique index a database already has under the same name with other options", async () => {
+    const db = new FakeDb();
+    const collection = db.collection("Doc") as FakeCollection;
+    collection.createIndex = async () => Promise.reject(Object.assign(new Error("Index already exists with different options"), { code: 85 }));
+    const backend = new MongoBackend(db);
+    await expect(backend.registerModel("Doc", [{ name: "email", fields: [{ path: "email" }], unique: true }])).resolves.toBeUndefined();
+    collection.createIndex = async () => Promise.reject(Object.assign(new Error("disk full"), { code: 14031 }));
+    await expect(backend.registerModel("Doc", [{ name: "email2", fields: [{ path: "email" }], unique: true }])).rejects.toThrow("disk full");
   });
 
   it("runs the full Repository stack over MongoBackend", async () => {

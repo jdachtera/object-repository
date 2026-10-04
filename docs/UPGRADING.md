@@ -80,6 +80,11 @@ ignore until you use it. Everything under **Behaviour changes** affects code tha
 
 ### Stores
 
+- **Mongo unique indexes ignore a missing or null key, as SQL does.** Mongo indexed a missing field
+  as `null`, so a second record leaving an optional unique field out was refused as a duplicate. A
+  unique index without its own `where` is now built over documents that hold a value in every key
+  field. An index a database already has under the same name keeps its old definition (Mongo can't
+  change it in place); drop it and let `define()` rebuild it to get the new behaviour.
 - **MySQL refuses a secondary unique-key collision at `persist`.** A save that collides with another
   row on a secondary unique index now throws the driver's duplicate-key error at `persist()`, as
   Postgres does. Before, `ON DUPLICATE KEY UPDATE` silently overwrote the other row. Use
