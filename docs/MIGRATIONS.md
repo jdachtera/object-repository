@@ -207,7 +207,8 @@ It sees every physical column, including one the model has stopped declaring.
 
 A unique `addIndex` over data that already holds duplicates fails the run with `UniqueConstraintError`
 on every store, before any store tries to build it. A key with a null or absent part isn't enforced,
-as in SQL.
+as in SQL. Once built, the index holds for the rest of the run: a later copy, fill or transform that
+would duplicate a value fails it.
 
 In a migration with a `schemaVersion`, the contract steps run later than the expand steps written
 after them. A contract step followed by an expand step on the same field — a drop and then an add of
@@ -396,6 +397,16 @@ Stated plainly, because a safety mechanism you misunderstand is worse than none.
     to the restored one. Reload records after a rollback.
 11. **MariaDB.** The supported MySQL target is MySQL 8. MariaDB's text protocol renders a `DOUBLE`
     with 15 significant digits, so a float needing more is rounded on every read — migration or not.
+
+12. **Older builds writing a retyped field during a window.** A widening `retypeField` in a versioned
+    migration runs at the expand, while older builds still write the old type. SQL converts what they
+    write as the column's type does; a document store keeps it as written; and an older build writing
+    text into a field retyped to `json` stores raw, non-JSON text everywhere. Retype in a migration that
+    runs after every older build is gone, or add a new field of the new type behind a rename window.
+13. **Renaming an indexed field.** On SQL an index follows its column through a rename. On SQLite,
+    IndexedDB and Mongo it stays on the old field path, so it no longer covers the renamed field, and a
+    field later added under the old name falls under it. Drop the index before the rename and add it
+    on the new name after.
 
 ## Upgrading an existing database
 

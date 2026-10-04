@@ -32,6 +32,7 @@ import {
   exceeds15Digits,
   intentArb,
   layoutArb,
+  lateRowsOf,
   plan,
   readBack,
   recordsOf,
@@ -302,18 +303,19 @@ const scenarioArb = layoutArb.chain((initial) =>
     rows: recordsOf(initial, 8),
     intents: fc.array(intentArb(ALL_KINDS), { minLength: 1, maxLength: 5 }),
     mode: fc.constantFrom(...MODES),
+    late: lateRowsOf(initial),
     crashAt: fc.nat(),
     after: fc.boolean()
   })
 );
 
-type Scenario = { initial: FieldSpec[]; rows: JsonObject[]; intents: Intent[]; mode: Mode };
+type Scenario = { initial: FieldSpec[]; rows: JsonObject[]; intents: Intent[]; mode: Mode; late?: JsonObject[] };
 
 /** What the scenario's deploys leave on the in-memory reference, or `null` if one is refused. */
-async function reference({ initial, rows, mode }: Scenario, planned: Plan): Promise<JsonObject[] | null> {
+async function reference({ initial, rows, mode, late }: Scenario, planned: Plan): Promise<JsonObject[] | null> {
   const backend = new InMemoryBackend();
   await seed(backend, initial, rows);
-  const script = scriptOf(planned, mode);
+  const script = scriptOf(planned, mode, late);
   try {
     for (const deploy of script.deploys) await deploy(backend, { skipLock: true, batchSize: BATCH });
   } catch {
@@ -323,12 +325,12 @@ async function reference({ initial, rows, mode }: Scenario, planned: Plan): Prom
 }
 
 /** How many writes the uninterrupted deploys make on `store`. */
-async function writesOf(store: Store, { initial, rows, mode }: Scenario, planned: Plan): Promise<number> {
+async function writesOf(store: Store, { initial, rows, mode, late }: Scenario, planned: Plan): Promise<number> {
   const dry = (await store.open())!;
   const counter = new Crasher(Number.POSITIVE_INFINITY, false);
   try {
     await seed(dry.backend(), initial, rows);
-    for (const deploy of scriptOf(planned, mode).deploys) await deploy(dry.backend(counter), { skipLock: true, batchSize: BATCH });
+    for (const deploy of scriptOf(planned, mode, late).deploys) await deploy(dry.backend(counter), { skipLock: true, batchSize: BATCH });
   } finally {
     await dry.close();
   }
@@ -339,9 +341,9 @@ async function writesOf(store: Store, { initial, rows, mode }: Scenario, planned
  * Crash at write `at` (before or after it lands), wherever in the deploys it falls; restart the deploy
  * it fell in, then run the rest; return what they left.
  */
-async function crashThenRestart(store: Store, { initial, rows, mode }: Scenario, planned: Plan, at: number, after: boolean): Promise<JsonObject[]> {
+async function crashThenRestart(store: Store, { initial, rows, mode, late }: Scenario, planned: Plan, at: number, after: boolean): Promise<JsonObject[]> {
   const storage = (await store.open())!;
-  const script = scriptOf(planned, mode);
+  const script = scriptOf(planned, mode, late);
   try {
     await seed(storage.backend(), initial, rows);
     const crasher = new Crasher(at, after, storage.inspect);
@@ -403,7 +405,7 @@ describe("a migration interrupted anywhere, then run again", () => {
           const { initial, rows, intents, mode, crashAt, after } = scenario;
           const planned = plan(initial, intents);
           if (!planned.steps.length) return;
-          fc.pre(!(store.name === "MySQL (real)" && mariaDb && exceeds15Digits(rows)));
+          fc.pre(!(store.name === "MySQL (real)" && mariaDb && exceeds15Digits([...rows, ...scenario.late])));
           const expected = await reference(scenario, planned);
           fc.pre(expected !== null);
           // Count the writes the uninterrupted deploys make, so the crash always falls inside them.

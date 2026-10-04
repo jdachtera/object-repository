@@ -11,13 +11,11 @@
  * Contracts whose gate has cleared are reported as `releasable` and wait for someone to say so.
  */
 import type { Backend, FieldSpec } from "../core/Backend.ts";
-import { isMigrationLowering, isModelProbing, isSchemaAware, isTransactional, migrationTarget } from "../core/Backend.ts";
-import { UniqueConstraintError, uniqueKey } from "../backends/util/unique.ts";
-import { everything, pageByUuid } from "./paging.ts";
+import { isMigrationLowering, isSchemaAware, isTransactional, migrationTarget } from "../core/Backend.ts";
 import type { Context } from "../core/types.ts";
 import { SYSTEM_CONTEXT } from "../core/types.ts";
 import { generateUuid } from "../core/uuid.ts";
-import { applyOp, reappliesSafely, type ExecuteOptions } from "./execute.ts";
+import { applyOp, assertUniqueBuildable, reappliesSafely, type ExecuteOptions } from "./execute.ts";
 import { MigrationBlockedError, MigrationInterruptedError, SchemaVersionError } from "./errors.ts";
 import {
   acquireLock,
@@ -84,7 +82,7 @@ export async function runMigrations(
 
   const models = { ...(options.models ?? {}) }; // followed as ops run; the caller's copy is untouched
   return withLease(store, ctx, now, { ...options, models }, (lease, registered) =>
-    applyAll(store, migrations, { ...options, models, ctx, now, journal, lease, registered })
+    applyAll(store, migrations, { ...options, models, ctx, now, journal, lease, registered, built: new Set() })
   );
 }
 
@@ -238,7 +236,7 @@ export async function rollbackMigrations(
   // a deploy's migrate would otherwise interleave with it.
   const models = { ...(options.models ?? {}) };
   return withLease(store, ctx, now, { ...options, models }, (lease, registered) =>
-    rollbackAll(store, migrations, count, { ...options, models, ctx, now, journal, lease, registered })
+    rollbackAll(store, migrations, count, { ...options, models, ctx, now, journal, lease, registered, built: new Set() })
   );
 }
 
@@ -396,6 +394,8 @@ type Running = RunnerOptions & {
   journal: MigrationJournal;
   lease: Lease | null;
   registered: Set<string>;
+  /** Unique indexes an op of this run has built (`model\0name`): see `ExecuteOptions.built`. */
+  built: Set<string>;
 };
 
 /**
@@ -571,31 +571,19 @@ async function executeOps(
 ): Promise<void> {
   // The ops before the resume point ran in an earlier attempt: this run's layouts must still follow
   // them, or a re-registration would re-provision a field one of them dropped.
-  for (let index = 0; index < (resume?.op ?? 0); index++) followLayout(options, ops[index]!);
+  const built = (op: MigrationOp) => {
+    if (op.kind === "addIndex" && op.index.unique) options.built.add(`${op.model}\0${op.index.name}`);
+  };
+  for (let index = 0; index < (resume?.op ?? 0); index++) {
+    followLayout(options, ops[index]!);
+    built(ops[index]!);
+  }
   for (let index = resume?.op ?? 0; index < ops.length; index++) {
     const op = ops[index]!;
     const { checkpoint, heartbeat, beforePage, holdLease, recordLowered, completed } = typeof hooks === "function" ? hooks(index) : hooks;
-    // A natively lowered op writes too (MySQL's DDL commits at once): prove the lease before it.
-    await holdLease?.();
-    if (op.kind === "addIndex" && op.index.unique) await assertUnique(backend, op.model, op.index.fields.map((field) => field.path), options);
-    const lowered = !isMigrationLowering(backend)
-      ? null
-      : recordLowered && backend.lowerMigrationOpRecorded
-        ? await backend.lowerMigrationOpRecorded(op, options.ctx, recordLowered)
-        : await backend.lowerMigrationOp(op, options.ctx);
-    if (lowered) {
-      followLayout(options, op);
-      continue; // the backend did it natively — same effect, lower cost
-    }
-
     let after = resume && index === resume.op ? resume.after : null;
-    if (resume?.inFlight && index === resume.op && !reappliesSafely(op)) {
-      // The interrupted run may have written some, all or none of this page: only the operator can say.
-      if (!options.interruptedPage) throw new MigrationInterruptedError(migration.name, op, resume.after, resume.inFlight.through);
-      if (options.interruptedPage === "skip") after = resume.inFlight.through;
-    }
     let cursor = "";
-    await applyOp(backend, op, {
+    const executing: ExecuteOptions = {
       ctx: options.ctx,
       batchSize: options.batchSize ?? DEFAULT_BATCH,
       migration: migration.name,
@@ -617,29 +605,32 @@ async function executeOps(
           }
         : { checkpoint: (at: string) => void (cursor = at) }),
       ...(heartbeat ? { heartbeat: () => heartbeat(cursor) } : {}),
-      registered: options.registered
-    });
-    followLayout(options, op);
-    await completed?.();
-  }
-}
-
-/**
- * Refuse a unique index the data already violates, before any store tries to build it. Each store
- * fails differently on its own — a driver error naming its own index, an IndexedDB upgrade that has to
- * be undone, or (the in-memory reference) nothing at all — so the same migration would stop on one
- * store and quietly succeed on another. A key with a null or absent part isn't enforced, as in SQL.
- */
-async function assertUnique(backend: Backend, model: string, fields: string[], options: Running): Promise<void> {
-  if (isModelProbing(backend) && !(await backend.hasModel(model))) return;
-  const seen = new Set<string>();
-  for await (const page of pageByUuid(backend, model, everything(), options.batchSize ?? DEFAULT_BATCH, options.ctx)) {
-    for (const row of page.rows) {
-      const key = uniqueKey(row, fields);
-      if (key === null) continue;
-      if (seen.has(key)) throw new UniqueConstraintError(model, fields);
-      seen.add(key);
+      registered: options.registered,
+      built: options.built
+    };
+    // A natively lowered op writes too (MySQL's DDL commits at once): prove the lease before it.
+    await holdLease?.();
+    if (op.kind === "addIndex" && op.index.unique) await assertUniqueBuildable(backend, op, executing);
+    const lowered = !isMigrationLowering(backend)
+      ? null
+      : recordLowered && backend.lowerMigrationOpRecorded
+        ? await backend.lowerMigrationOpRecorded(op, options.ctx, recordLowered)
+        : await backend.lowerMigrationOp(op, options.ctx);
+    if (lowered) {
+      followLayout(options, op);
+      built(op);
+      continue; // the backend did it natively — same effect, lower cost
     }
+
+    if (resume?.inFlight && index === resume.op && !reappliesSafely(op)) {
+      // The interrupted run may have written some, all or none of this page: only the operator can say.
+      if (!options.interruptedPage) throw new MigrationInterruptedError(migration.name, op, resume.after, resume.inFlight.through);
+      if (options.interruptedPage === "skip") after = resume.inFlight.through;
+    }
+    await applyOp(backend, op, { ...executing, after });
+    followLayout(options, op);
+    built(op);
+    await completed?.();
   }
 }
 

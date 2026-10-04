@@ -154,6 +154,9 @@ export function plan(initial: FieldSpec[], intents: Intent[]): Plan {
       case "rename": {
         if (!present.length || !absent.length) continue;
         const from = pickPresent(intent.pick);
+        // Not an indexed field: SQL carries its indexes along with the column, document stores leave
+        // them on the old path (docs/MIGRATIONS.md, "What this does not protect you from").
+        if ([...indexes.values()].some((index) => index.fields[0]!.path === from)) continue;
         const to = absent[intent.pick2 % absent.length]!;
         const type = layout.get(from)!;
         steps.push((m) => m.renameField(MODEL, from, to, type));
@@ -259,7 +262,16 @@ export interface Script {
   read: FieldSpec[];
 }
 
-export function scriptOf(planned: Plan, mode: Mode): Script {
+/**
+ * Records an older build writes during a window, under the layout it knows (the one before the
+ * migration): fresh uuids, so they are told apart from the seeded ones.
+ */
+export function lateRowsOf(layout: FieldSpec[]): fc.Arbitrary<JsonObject[]> {
+  return recordsOf(layout, 3).map((rows) => rows.map((row, i) => ({ ...row, uuid: `w${String(i).padStart(2, "0")}` })));
+}
+
+/** `late`: what an older build writes between a gated migration's two deploys. */
+export function scriptOf(planned: Plan, mode: Mode, late: JsonObject[] = []): Script {
   // The application's layout declares the indexes the migration leaves, unique ones aside: declared
   // over data that still holds duplicates (its contract not yet released), IndexedDB fails the next
   // operation once to say so, by design. The migration's own `addIndex` steps cover unique indexes.
@@ -272,6 +284,13 @@ export function scriptOf(planned: Plan, mode: Mode): Script {
       return {
         deploys: [
           (b, o) => runMigrations(b, [migration], { ...o, models: after, schemaVersion: 2, minSupportedSchemaVersion: 1 }),
+          // An older build, still serving during the window, writes under the layout it knows. The
+          // window keeps every field it writes in place until the release adopts them.
+          // Not with a retype: older builds write the old type into the retyped field, which no store
+          // adopts the same way yet (docs/MIGRATIONS.md, "What this does not protect you from").
+          async (b) => {
+            if (late.length && !planned.describe.some((step) => step.startsWith("retypeField"))) await seed(b, planned.initial, late);
+          },
           (b, o) => runMigrations(b, [migration], { ...o, models: after, schemaVersion: 2, minSupportedSchemaVersion: 2, applyContracts: true })
         ],
         read: planned.final

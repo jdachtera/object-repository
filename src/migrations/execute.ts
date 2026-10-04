@@ -19,7 +19,8 @@
  *     correctly and a filtered query does not — a divergence §11 forbids.
  */
 import type { Backend, FieldSpec, IndexSpec } from "../core/Backend.ts";
-import { isSchemaAware } from "../core/Backend.ts";
+import { isModelProbing, isSchemaAware } from "../core/Backend.ts";
+import { UniqueConstraintError, uniqueKey } from "../backends/util/unique.ts";
 import type { Context, JsonObject, JsonValue } from "../core/types.ts";
 import { MigrationNotSupportedError, SchemaUnknownError } from "./errors.ts";
 import { everything, pageByUuid } from "./paging.ts";
@@ -53,6 +54,11 @@ export interface ExecuteOptions {
    * page over its successor's work before finding out.
    */
   holdLease?: () => Promise<void>;
+  /**
+   * Unique indexes (`model\0name`) an op of this run has already built. A pass keeps enforcing these:
+   * they exist on the store, and every store but the reference would refuse a duplicate anyway.
+   */
+  built?: ReadonlySet<string>;
   /**
    * Called before a page's writes are queued, with the cursor it starts after and its last uuid. The
    * runner records the page as in flight here when the store can't persist it with its marker.
@@ -357,7 +363,7 @@ async function reregister(
   // indexes out. A unique index is a contract, created by an explicit `addIndex` behind the gate;
   // building it here, over data the migration may be about to de-duplicate, would block the very
   // migration that makes it valid. The runner restores the full registration when the run ends.
-  const indexes = withUnique ? schema.indexes : schema.indexes.filter((index) => !index.unique);
+  const indexes = withUnique ? schema.indexes : schema.indexes.filter((index) => !index.unique || options.built?.has(`${model}\0${index.name}`));
   options.registered?.add(model);
   // Physical columns the model has stopped declaring stay visible to the pass (a transform reading the
   // old column must see its values, not `undefined`); the declared type wins where both exist.
@@ -375,6 +381,32 @@ async function reregister(
   // The first hint for a field wins: the op's own knowledge before the runner's reconstruction.
   fields = fields.map((field) => hints.find((hint) => hint.name === field.name) ?? field);
   await register(backend, model, fields, indexes);
+}
+
+/**
+ * Refuse a unique index the data already violates, before any store tries to build it. Each store
+ * fails differently on its own — a driver error naming its own index, an IndexedDB upgrade that has to
+ * be undone, or (the in-memory reference) nothing at all — so the same migration would stop on one
+ * store and quietly succeed on another. A key with a null or absent part isn't enforced, as in SQL.
+ * The model is registered as it stands at this step first: read under another build's layout, a
+ * columnar store wouldn't return the field at all.
+ */
+export async function assertUniqueBuildable(backend: Backend, op: MigrationOp & { kind: "addIndex" }, options: ExecuteOptions): Promise<void> {
+  if (isModelProbing(backend) && !(await backend.hasModel(op.model))) return;
+  if (options.models[op.model]) {
+    const known = [...(options.typesAfter ?? [])].map(([name, type]) => ({ name, type }));
+    await reregister(backend, op.model, options, false, known);
+  }
+  const fields = op.index.fields.map((field) => field.path);
+  const seen = new Set<string>();
+  for await (const page of pageByUuid(backend, op.model, everything(), options.batchSize, options.ctx)) {
+    for (const row of page.rows) {
+      const key = uniqueKey(row, fields);
+      if (key === null) continue;
+      if (seen.has(key)) throw new UniqueConstraintError(op.model, fields);
+      seen.add(key);
+    }
+  }
 }
 
 async function register(backend: Backend, model: string, fields: FieldSpec[], indexes: IndexSpec[]): Promise<void> {

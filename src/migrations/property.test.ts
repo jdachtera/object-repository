@@ -36,6 +36,7 @@ import {
   exceeds15Digits,
   intentArb,
   layoutArb,
+  lateRowsOf,
   plan,
   readBack,
   recordsOf,
@@ -53,17 +54,27 @@ const SEED = process.env.PROPERTY_SEED === undefined ? undefined : Number(proces
 type Outcome = { refused: string } | { rows: JsonObject[] };
 
 /** Every deploy of the scenario's script in turn; the first refusal ends it. */
-async function outcome(backend: Backend, initial: FieldSpec[], rows: JsonObject[], planned: Plan, mode: Mode): Promise<Outcome> {
+async function outcome(backend: Backend, initial: FieldSpec[], rows: JsonObject[], planned: Plan, mode: Mode, late: JsonObject[]): Promise<Outcome> {
   await seed(backend, initial, rows);
-  const script = scriptOf(planned, mode);
+  const script = scriptOf(planned, mode, late);
   for (const deploy of script.deploys) {
     try {
       await deploy(backend, { skipLock: true });
     } catch (error) {
-      return { refused: (error as Error).name };
+      return { refused: refusal(error as Error) };
     }
   }
   return { rows: await readBack(backend, script.read) };
+}
+
+/**
+ * The kind of refusal. A write that breaks a unique index is refused by the store's own index, with
+ * its driver's error (documented: SQL surfaces it as it is); the reference raises UniqueConstraintError.
+ * Either way the migration was refused for the same reason.
+ */
+function refusal(error: Error): string {
+  if (["UniqueConstraintError", "ConstraintError"].includes(error.name) || /duplicate (key|entry)|unique constraint/i.test(error.message)) return "unique violation";
+  return error.name;
 }
 
 // --- backends -----------------------------------------------------------------------------------
@@ -158,7 +169,7 @@ const BACKENDS: Array<[string, () => Promise<Backend | null>]> = [
 // documents, and real Postgres covers the same lowering.
 void newDb;
 
-type Scenario = { initial: FieldSpec[]; rows: JsonObject[]; intents: Intent[]; mode: Mode };
+type Scenario = { initial: FieldSpec[]; rows: JsonObject[]; intents: Intent[]; mode: Mode; late: JsonObject[] };
 const I = (kind: Intent["kind"], pick: number, pick2: number, type: StoredType = "text", overwrite = false): Intent => ({
   kind,
   pick,
@@ -168,7 +179,7 @@ const I = (kind: Intent["kind"], pick: number, pick2: number, type: StoredType =
   overwrite,
   seed: 0
 });
-const plain = (scenario: Omit<Scenario, "mode">): Scenario => ({ ...scenario, mode: "plain" });
+const plain = (scenario: Omit<Scenario, "mode" | "late">): Scenario => ({ ...scenario, mode: "plain", late: [] });
 /** Every counterexample these properties have found, shrunk: run first, on every run. */
 const REGRESSIONS: Scenario[] = ([
   // float → json: MySQL renders 1e15 its own way
@@ -202,14 +213,50 @@ const REGRESSIONS: Scenario[] = ([
     rows: [{ uuid: "r0", g: 0 }],
     intents: [I("rename", 0, 0), I("copy", 1782889749, 642242670), I("drop", 517760001, 0)]
   }
-] as Array<Omit<Scenario, "mode">>).map(plain);
+] as Array<Omit<Scenario, "mode" | "late">>)
+  .map(plain)
+  .concat([
+    // a unique index over duplicates: each store failed its own way, the reference not at all
+    {
+      initial: [{ name: "d", type: "float" }, { name: "f", type: "boolean" }, { name: "h", type: "json" }, { name: "b", type: "float" }],
+      rows: [{ uuid: "r00", b: 1e15 }, { uuid: "r01", b: 1e15 }, { uuid: "r02" }],
+      intents: [I("index", 309236534, 0, "text", true), I("add", 0, 0)],
+      mode: "plain",
+      late: []
+    },
+    // a copy into a field a unique index of the same run covers: refused by every store but the reference
+    {
+      initial: [{ name: "g", type: "float" }, { name: "d", type: "array" }, { name: "f", type: "float" }],
+      rows: [{ uuid: "r00", f: 1e15 }, { uuid: "r01", f: 1e15 }, { uuid: "r02" }],
+      intents: [I("index", 0, 0, "text", true), I("copy", 515470652, 0)],
+      mode: "plain",
+      late: []
+    },
+    // a gated rename's release re-copied a scalar read as text: 0 became "0"
+    {
+      initial: [{ name: "b", type: "boolean" }, { name: "e", type: "json" }, { name: "a", type: "scalar" }, { name: "g", type: "text" }, { name: "h", type: "json" }],
+      rows: [{ uuid: "r00", a: 0 }],
+      intents: [I("rename", 12, 0), I("copy", 0, 0)],
+      mode: "gated",
+      late: []
+    },
+    // the pre-check read under an older build's registration and saw no values
+    {
+      initial: [{ name: "h", type: "json" }, { name: "e", type: "text" }, { name: "f", type: "json" }, { name: "d", type: "scalar" }],
+      rows: [{ uuid: "r00" }, { uuid: "r01" }],
+      intents: [{ ...I("add", 0, 0), fill: true }, I("index", 332534235, 0, "text", true)],
+      mode: "gated",
+      late: [{ uuid: "w00" }]
+    }
+  ]);
 
 const scenarioArb = layoutArb.chain((initial) =>
   fc.record({
     initial: fc.constant(initial),
     rows: recordsOf(initial),
     intents: fc.array(intentArb(ALL_KINDS), { minLength: 1, maxLength: 5 }),
-    mode: fc.constantFrom(...MODES)
+    mode: fc.constantFrom(...MODES),
+    late: lateRowsOf(initial)
   })
 );
 
@@ -219,14 +266,14 @@ describe("random migrations over random records", () => {
       const probe = await make();
       if (!probe) return context.skip();
       await fc.assert(
-        fc.asyncProperty(scenarioArb, async ({ initial, rows, intents, mode }) => {
+        fc.asyncProperty(scenarioArb, async ({ initial, rows, intents, mode, late }) => {
           const planned = plan(initial, intents);
           const description = [`(${mode})`, ...planned.describe];
           if (!planned.steps.length) return;
-          fc.pre(!(name === "MySQL (real)" && mariaDb && exceeds15Digits(rows)));
-          const expected = await outcome(new InMemoryBackend(), initial, rows, planned, mode);
+          fc.pre(!(name === "MySQL (real)" && mariaDb && exceeds15Digits([...rows, ...late])));
+          const expected = await outcome(new InMemoryBackend(), initial, rows, planned, mode, late);
           const backend = (await make())!;
-          const actual = await outcome(backend, initial, rows, planned, mode);
+          const actual = await outcome(backend, initial, rows, planned, mode, late);
           (backend as Partial<{ close(): void }>).close?.();
           expect({ steps: description, ...actual }).toEqual({ steps: description, ...expected });
         }),

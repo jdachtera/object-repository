@@ -646,7 +646,9 @@ function requestResult<T>(request: IDBRequest<T>): Promise<T> {
 function transactionDone(tx: IDBTransaction): Promise<void> {
   return new Promise((resolve, reject) => {
     tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error ?? new Error("IndexedDB transaction failed"));
+    // The transaction's own `error` isn't set until it aborts; the request that failed carries the
+    // cause (a `ConstraintError` for a write a unique index refused), which is what the caller needs.
+    tx.onerror = (event) => reject((event.target as IDBRequest | null)?.error ?? tx.error ?? new Error("IndexedDB transaction failed"));
     tx.onabort = () => reject(tx.error ?? new Error("IndexedDB transaction aborted"));
   });
 }

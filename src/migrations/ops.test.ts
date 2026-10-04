@@ -313,6 +313,9 @@ describe("a versioned migration whose split would reorder it", () => {
     // A transform sees whole records: anything withheld on the model before it would still be there.
     expect(codes([drop("x"), { kind: "transform", model: "U", transform: "t", fields: ["y"], phase: "expand" }])).toEqual(["PHASE_REORDER"]);
     expect(codes([{ kind: "addIndex", model: "U", index: { name: "i", fields: [{ path: "x" }], unique: true } }, add("x")])).toEqual(["PHASE_REORDER"]);
+    // A rename's own expand half runs early too: into a name dropped or renamed away before it.
+    expect(codes([drop("x"), rename("y", "x")])).toEqual(["PHASE_REORDER"]);
+    expect(codes([rename("x", "z"), rename("y", "x")])).toEqual(["PHASE_REORDER"]);
   });
 
   it("allows steps the split leaves in order", () => {

@@ -276,8 +276,10 @@ export function phaseReorders(migration: string, ops: MigrationOp[]): MigrationB
   const deferred: Array<{ op: MigrationOp; touches: string[] }> = [];
   for (const op of ops) {
     const touches = touched(op);
-    if (classify(op) === "expand") {
-      const earlier = deferred.find((entry) => overlaps(entry.touches, touches));
+    // A rename is contract, but its expand half (create the target, copy into it) runs in place.
+    const early = op.kind === "renameField" ? touched({ kind: "copyField", model: op.model, from: op.from, to: op.to, type: op.type, overwrite: false }) : touches;
+    if (classify(op) === "expand" || op.kind === "renameField") {
+      const earlier = deferred.find((entry) => overlaps(entry.touches, early));
       if (earlier) {
         blockers.push({
           code: "PHASE_REORDER",
@@ -285,9 +287,8 @@ export function phaseReorders(migration: string, ops: MigrationOp[]): MigrationB
           message: `"${migration}" has a ${describeOp(earlier.op)} before a ${describeOp(op)} on the same field. With a schemaVersion the first is a contract step, withheld until released, so it would run after the second rather than before. Reorder them, or move the second into a later migration.`
         });
       }
-    } else {
-      deferred.push({ op, touches });
     }
+    if (classify(op) !== "expand") deferred.push({ op, touches });
   }
   return blockers;
 }
