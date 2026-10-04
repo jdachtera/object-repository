@@ -57,7 +57,15 @@ jobs:
       # place they gate anything.
       # The github-actions reporter turns each failing test into a check annotation, readable through the
       # API, where the job log is buried under the service containers' shutdown output.
-      - run: pnpm exec vitest run --coverage --coverage.reporter=text --reporter=default --reporter=github-actions
+      - run: |
+          set -o pipefail
+          pnpm exec vitest run --coverage --coverage.reporter=text --reporter=default --reporter=github-actions 2>&1 | tee vitest.log
+      # What fails outside any one test (a coverage threshold, an unhandled error) gets no annotation of
+      # its own: post vitest's error lines and its tail as one.
+      - if: failure()
+        run: |
+          { grep -aE "ERROR|Unhandled|FAIL |Error:" vitest.log | head -40; echo ---; tail -n 30 vitest.log; } > summary.txt || true
+          echo "::error title=vitest output::$(sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g' summary.txt | cut -c1-60000)"
       - run: pnpm run build
 
   # Deeper, slower checks than every push needs: every dependency audited, and the property-based
