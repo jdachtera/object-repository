@@ -311,7 +311,7 @@ Honest limits, designed for up front:
 ## 12. Current limitations
 
 Implemented and tested: indexes (unique/compound/partial/TTL/text), Standard-Schema validation +
-typed codecs, schema migrations, transactions (both the atomic `transaction(fn)` and interactive
+typed codecs, portable version-gated schema migrations (§13), transactions (both the atomic `transaction(fn)` and interactive
 `tx.repository(...)` forms), dirty/field-level change tracking, soft deletes, computed/virtual fields,
 seeding factories, an opt-in pre-write unique check, and opt-in field-level sync (per-field LWW).
 
@@ -327,3 +327,63 @@ saved instance against a per-uuid write baseline and passes the changed field na
 `Backend.save()`, which the SQL/Mongo backends use to write only the changed columns/fields. One layer
 up, `SyncBackend({ fieldLevel: true })` carries per-field HLC versions (`_fieldVersions`) so concurrent
 edits to different fields merge instead of clobbering; default off preserves whole-record LWW.
+
+## 13. Schema migrations: portable operations, gated destruction
+
+Two ideas, both direct consequences of principles already stated here.
+
+**A migration is a list of classified, serializable operations — not DDL.** §2 says the `Backend`
+interface is the spine and §11 says a capable backend pushes an operation down while everything else
+falls back to a shared reference. Migrations obey the same law. One reference executor, written against
+nothing but `query`/`save`/`persist`, defines what each operation *means* on every store; a backend
+implementing `MigrationLoweringBackend` may realize one natively — SQL turns a rename into an O(1)
+`ALTER TABLE … RENAME COLUMN` instead of rewriting every row. **A backend changes a migration's cost,
+never its effect on the record set.** That is what makes `src/migrations/conformance.test.ts` possible:
+every backend is held to producing the same records as the in-memory reference, so a schemaless store
+can no longer silently do nothing where a columnar one does the work.
+
+Operations carry no closures — a record transform is named by id and looked up on the migration. That
+is what lets an operation be printed in a plan, hashed to detect an edit after the fact, and journalled
+so a deferred destructive step survives the migration being rewritten or deleted months later.
+
+**Destruction waits for an explicit decision.** Every operation classifies as `expand` (nothing
+pre-existing is disturbed) or `contract` (destroys the old shape). Expands apply immediately. A
+contract declared at schema version N applies only once the deployment raises
+`minSupportedSchemaVersion` to N — and even then only when the caller passes `applyContracts`, so a
+bare `migrate()` in a deploy script can never destroy anything a versioned migration declares.
+Deferred contracts are always reported, never silently skipped, since a silent skip is the failure this
+exists to prevent. Every refusal (drift, a narrowing retype, a bad version, an unpayable debt) is
+decided in a pre-flight pass before any operation runs, and `plan()` runs that same pass.
+
+The two version numbers move independently on purpose: a developer bumps `schemaVersion` when adding a
+migration; an operator bumps `minSupportedSchemaVersion` once they know no still-running build and no
+returning offline client depends on the old shape. `minSupportedSchemaVersion` defaults to
+`schemaVersion - 1`, so shipping a migration and destroying what it replaced are never the same deploy.
+
+A rename decomposes across both phases: expand adds the new field and back-fills it *without*
+clobbering; contract re-copies *with* clobbering and then drops. The re-copy is the step that is easy
+to omit and expensive to omit — old writers keep writing the legacy field for the entire window, so
+dropping without it destroys everything they wrote. The `overwrite` polarity flip between the halves is
+that argument in one line.
+
+**During the window the legacy field stays authoritative** and the new one is a maintained mirror
+(`mirrors` / `deprecatedSince` on a property; `src/repository/mirror.ts`). The direction is forced:
+mirroring is one-way because only the newer build knows both names, so if the canonical field were
+authoritative an older build's update would leave it present but stale with nothing to say which was
+fresher. Queries naming the canonical field are rewritten to name the legacy one — a pure name
+substitution, which is exact for every comparator and preserves index push-down, where a coalesce would
+downgrade a comparison to an opaque computed expression and lose the index.
+
+**Across a connection, versions replace fingerprint equality.** §4 compares a schema fingerprint at
+connect time to turn silent client/server drift into a clear error. Equality is the wrong test once
+windows exist, because a window is *defined by* the two ends differing — it would refuse exactly the
+deploys the gate makes safe. So when both ends advertise a version (`src/core/schema.ts`), the server
+serves any client from its floor up to its own version and the fingerprint becomes advisory; when
+either end declares none, equality still rules and nothing changes for anyone not using versions. The
+same check runs on the sync path. A server declaring a version enforces it on every request, not only
+at the handshake, so a long-offline client, or one connected across a redeploy that raised the floor,
+is told to upgrade rather than silently exchanging records neither side can interpret. A client
+advertising no version counts as version 0. The server must lead a rollout: a client ahead of the
+server is refused.
+
+See [docs/MIGRATIONS.md](docs/MIGRATIONS.md) for the operator's guide.

@@ -1,4 +1,5 @@
 import type { Context, JsonObject, Uuid } from "./types.ts";
+import type { SchemaAdvertisement, SchemaCompatibility } from "./schema.ts";
 
 /**
  * The remote end of a sync relationship (ARCHITECTURE.md §9).
@@ -14,6 +15,16 @@ export interface SyncTarget<_T = JsonObject> {
 
   /** Push the client's queued local changes. Idempotent: replays upsert by uuid (§9). */
   push(changes: SyncChange[], ctx: Context): Promise<SyncPushResult>;
+
+  /**
+   * Check this client's schema against the server's before syncing (ARCHITECTURE.md §13).
+   *
+   * Optional, because a target may have no notion of a remote schema — an in-process one, say. When
+   * present, `SyncBackend.reconcile` calls it once per session. Without it a client months out of date
+   * silently pulls records in a shape it cannot interpret and pushes records the server no longer
+   * understands, which is the failure mode this exists to turn into a clear error.
+   */
+  handshake?(client: SchemaAdvertisement, ctx: Context): Promise<SchemaCompatibility>;
 }
 
 /** Opaque, target-defined checkpoint (a server seq, an HLC timestamp, a token, ...). */

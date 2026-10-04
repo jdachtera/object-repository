@@ -19,6 +19,11 @@ export class QueryCache<T> {
   private readonly results = new Map<string, T[]>();
   private readonly baseline = new Map<Uuid, JsonObject>();
 
+  /** Every cached instance, by uuid. */
+  instanceEntries(): IterableIterator<[Uuid, T]> {
+    return this.instances.entries();
+  }
+
   getInstance(uuid: Uuid): T | undefined {
     return this.instances.get(uuid);
   }
@@ -45,6 +50,17 @@ export class QueryCache<T> {
   }
   setBaseline(uuid: Uuid, record: JsonObject): void {
     this.baseline.set(uuid, { ...record });
+  }
+  /** Apply an out-of-band change of the stored shape to every baseline (a migration dropped a field). */
+  editBaselines(edit: (record: JsonObject) => void): void {
+    for (const record of this.baseline.values()) edit(record);
+  }
+  /** The uuids that have a write baseline. */
+  baselineUuids(): Uuid[] {
+    return [...this.baseline.keys()];
+  }
+  clearBaselines(): void {
+    this.baseline.clear();
   }
   deleteBaseline(uuid: Uuid): void {
     this.baseline.delete(uuid);

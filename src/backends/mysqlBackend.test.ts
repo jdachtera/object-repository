@@ -46,11 +46,9 @@ describe("MySqlBackend emits columnar MySQL SQL and adapts the driver shape", ()
 
     be.save("Users", { uuid: "u1", name: "Ann", age: 30 }, ctx);
     await be.persist(ctx);
+    // A new uuid is plainly inserted: no ON DUPLICATE KEY UPDATE, which would fire on *any* unique key.
     const insert = conn.find("INSERT");
-    expect(insert.sql).toBe(
-      "INSERT INTO `Users` (`uuid`, `name`, `age`, `_extra`) VALUES (?, ?, ?, ?) " +
-        "ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), `age` = VALUES(`age`), `_extra` = VALUES(`_extra`)"
-    );
+    expect(insert.sql).toBe("INSERT INTO `Users` (`uuid`, `name`, `age`, `_extra`) VALUES (?, ?, ?, ?)");
     expect(insert.params).toEqual(["u1", "Ann", 30, null]); // no extra fields → overflow is NULL
   });
 

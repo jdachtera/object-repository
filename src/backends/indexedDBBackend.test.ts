@@ -119,3 +119,14 @@ describe("IndexedDBBackend", () => {
     expect(backend.capabilities.ranges).toBe(true);
   });
 });
+
+describe("a write a unique index refuses", () => {
+  it("rejects with the cause, not a bare 'transaction failed'", async () => {
+    const backend = makeBackend();
+    backend.registerModel("User", [{ name: "email", fields: [{ path: "email" }], unique: true }]);
+    backend.save("User", { uuid: "u1", email: "a@x" }, ctx);
+    await backend.persist(ctx);
+    backend.save("User", { uuid: "u2", email: "a@x" }, ctx);
+    await expect(backend.persist(ctx)).rejects.toMatchObject({ name: "ConstraintError" });
+  });
+});

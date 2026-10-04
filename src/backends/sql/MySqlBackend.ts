@@ -25,6 +25,26 @@ export interface MySqlConnection {
   rollback?(): Promise<void>;
 }
 
+/**
+ * mysql2's text-protocol parser reads some DOUBLEs one unit in the last place off: the server sends
+ * `911.3604573597045`, and the row holds 911.3604573597044. JavaScript's own `Number()` parses the same
+ * text exactly, so DOUBLE and FLOAT columns are read through it. DECIMAL is left as mysql2 returns it.
+ */
+const exactFloats = (field: { type: string; string(): string | null }, next: () => unknown): unknown => {
+  if (field.type !== "DOUBLE" && field.type !== "FLOAT") return next();
+  const text = field.string();
+  return text === null ? null : Number(text);
+};
+
+/** A mysql2 pool or connection takes per-query options; a bare `{ query }` shim is called as before. */
+function query(target: Pick<MySqlConnection, "query">, sql: string, params: unknown[]): Promise<[Record<string, unknown>[], unknown]> {
+  const native = target as { pool?: unknown; connection?: unknown };
+  if (typeof native.pool === "object" || typeof native.connection === "object") {
+    return target.query({ sql, values: params, typeCast: exactFloats } as never, undefined as never);
+  }
+  return target.query(sql, params);
+}
+
 export class MySqlBackend extends SqlBackend {
   /** `resilience` adds a per-call timeout + safe retry-with-backoff (reads/transactions) — see `resilientExecutor`.
    *  `options` carries backend-level flags such as `uniquePreCheck`. */
@@ -33,14 +53,14 @@ export class MySqlBackend extends SqlBackend {
     // `{ query }` shim just gets a non-atomic persist.
     const canTransact = typeof connection.getConnection === "function" || typeof connection.beginTransaction === "function";
     const executor: SqlExecutor = {
-      run: async (sql, params) => (await connection.query(sql, params))[0],
+      run: async (sql, params) => (await query(connection, sql, params))[0],
       transaction: canTransact
         ? async (fn) => {
             const pooled = typeof connection.getConnection === "function";
             const conn = pooled ? await connection.getConnection!() : connection;
             try {
               await conn.beginTransaction!();
-              const result = await fn({ run: async (sql, params) => (await conn.query(sql, params))[0] });
+              const result = await fn({ run: async (sql, params) => (await query(conn, sql, params))[0] });
               await conn.commit!();
               return result;
             } catch (error) {

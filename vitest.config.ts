@@ -12,6 +12,7 @@ export default defineConfig({
       include: ["src/**/*.ts"],
       exclude: [
         "src/**/*.test.ts",
+        "src/**/*.testutil.ts",
         "src/**/index.ts",
         "src/**/types.ts",
         "src/core/QueryPlan.ts",
@@ -22,10 +23,12 @@ export default defineConfig({
         "src/properties/infer.ts",
         "src/properties/infer.types.ts"
       ],
-      // A regression ratchet just below the current numbers (~96.8 / 91.7 / 95.4 / ~96.8 in the
-      // offline pre-commit run). The pre-commit hook enforces these, so coverage can't silently drop.
-      // Raise them as coverage climbs; bypass a commit with `git commit --no-verify` when necessary.
-      thresholds: { statements: 96, branches: 91, functions: 95, lines: 96 }
+      // A regression ratchet just below the current numbers (93.9 / 86.6 / 94.8 / 95.8 in the offline
+      // pre-commit run). The pre-commit hook enforces these, so coverage can't silently drop. Raise them
+      // as coverage climbs; bypass a commit with `git commit --no-verify` when necessary. Vitest 4
+      // counts statements and branches from the syntax tree, so the same tests measure lower than
+      // under vitest 3 (where these read ~96.8 / 91.7 / 95.4 / 96.8).
+      thresholds: { statements: 93.5, branches: 86, functions: 94.5, lines: 95.5 }
     }
   }
 });
