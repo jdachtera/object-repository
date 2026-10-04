@@ -275,11 +275,15 @@ const STORES: Store[] = [
       return {
         backend(crasher) {
           if (!crasher) return new MySqlBackend(pool);
+          // Marked as mysql2's own (`pool`, `connection`), so the backend passes its per-query options
+          // through, as it does to a real pool.
           return new MySqlBackend({
+            pool: {},
             query: (sql: string, params: unknown[]) => crasher.around(() => pool.query(sql, params)),
             getConnection: async () => {
               const conn = await pool.getConnection();
               return {
+                connection: {},
                 query: (sql: string, params: unknown[]) => crasher.around(() => conn.query(sql, params)),
                 beginTransaction: () => crasher.around(() => conn.beginTransaction()),
                 commit: () => crasher.around(() => conn.commit()),
@@ -391,6 +395,14 @@ const REGRESSIONS: Scenario[] = [
     rows: [{ uuid: "r00", g: "" }],
     intents: [I("transform", 0), I("rename", 0), I("rename", 0)],
     mode: "plain"
+  },
+  // MySQL 8: a float an older build wrote during the window came back one unit in the last place off
+  {
+    initial: [{ name: "f", type: "boolean" }, { name: "h", type: "integer" }, { name: "b", type: "scalar" }, { name: "e", type: "float" }],
+    rows: [{ uuid: "r00" }],
+    intents: [I("add", 0)],
+    mode: "gated",
+    late: [{ uuid: "w00", e: 911.3604573597045 }, { uuid: "w01" }]
   }
 ];
 

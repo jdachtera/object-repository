@@ -651,7 +651,7 @@ describe("MySQL (real engine)", () => {
   beforeAll(async () => {
     try {
       pool = createPool(MYSQL_URL);
-      for (const t of ["int_person_my", "nested_m", "uniq_my", "upsert_my", "mig_my", "types_my", "_object_repository_migrations", "emb_my", "win_my", "cd_my", "dirty_my", "null_my", "longtext_my", "idxtext_my", "prechk_my"]) await pool.query(`DROP TABLE IF EXISTS \`${t}\``);
+      for (const t of ["int_person_my", "nested_m", "uniq_my", "upsert_my", "mig_my", "types_my", "_object_repository_migrations", "emb_my", "win_my", "cd_my", "dirty_my", "null_my", "longtext_my", "idxtext_my", "prechk_my", "float_my"]) await pool.query(`DROP TABLE IF EXISTS \`${t}\``);
     } catch (error) {
       requireLiveDb(error);
       pool = undefined;
@@ -675,6 +675,19 @@ describe("MySQL (real engine)", () => {
     const byCity = await people.all().groupBy("city", (a) => ({ n: a.count(), avg: a.avg("age") }));
     const us = byCity.find((g) => g.key === "us")!;
     expect([us.n, us.avg]).toEqual([2, 32]); // (45 + 19) / 2
+  });
+
+  it("reads a float back exactly as it was written, where mysql2's text parser is off by one ULP", async () => {
+    if (!pool) return;
+    const [[server]] = (await pool.query("SELECT VERSION() AS v")) as unknown as [[{ v: string }]];
+    if (/mariadb/i.test(server.v)) return; // renders 15 significant digits: such a float can't survive there
+    const orm = new RepositoryManager({ backend: new MySqlBackend(pool) });
+    const rows = orm.define({ name: "float_my", properties: { x: float() } });
+    const value = 911.3604573597045; // the server sends this text; mysql2 parses it as …044
+    await rows.save(rows.createInstance({ uuid: "f1", x: value })).persist();
+    const fresh = new RepositoryManager({ backend: new MySqlBackend(pool) }).define({ name: "float_my", properties: { x: float() } });
+    expect((await fresh.get("f1"))!.x).toBe(value);
+    expect((await fresh.all().filter(eq("x", value)).list()).map((row) => row.uuid)).toEqual(["f1"]);
   });
 
   it("nested-path eq/in pushes down to JSON_EXTRACT and matches the in-memory reference", async () => {
